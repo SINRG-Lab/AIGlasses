@@ -12,6 +12,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <dirent.h>
+#include <sys/stat.h>
 
 // FreeRTOS components
 #include "freertos/FreeRTOS.h"
@@ -53,6 +54,7 @@ void init_spiffs(void)
     
     esp_err_t ret = esp_vfs_spiffs_register(&conf);
     
+    // Check that the spiffs partition was registered correctly
     if (ret != ESP_OK) {
         if (ret == ESP_FAIL) {
             ESP_LOGE(TAG, "Failed to mount or format filesystem");
@@ -86,6 +88,47 @@ void list_spiffs_files(void)
         ESP_LOGI(TAG, "  - %s", entry->d_name);
     }
     closedir(dir);
+}
+
+uint8_t* read_wav_file(const char* filename, size_t* file_size)
+{
+    FILE* f = fopen(filename, "rb");
+    if (f == NULL) {
+        ESP_LOGE(TAG, "Failed to open file: %s", filename);
+        return NULL;
+    }
+    
+    // Get file size
+    struct stat st;
+    if (stat(filename, &st) != 0) {
+        ESP_LOGE(TAG, "Failed to get file stats");
+        fclose(f);
+        return NULL;
+    }
+    
+    *file_size = st.st_size;
+    ESP_LOGI(TAG, "File size: %d bytes", *file_size);
+    
+    // Allocate memory
+    uint8_t* buffer = (uint8_t*)malloc(*file_size);
+    if (buffer == NULL) {
+        ESP_LOGE(TAG, "Failed to allocate memory");
+        fclose(f);
+        return NULL;
+    }
+    
+    // Read file
+    size_t bytes_read = fread(buffer, 1, *file_size, f);
+    if (bytes_read != *file_size) {
+        ESP_LOGE(TAG, "Failed to read complete file");
+        free(buffer);
+        fclose(f);
+        return NULL;
+    }
+    
+    fclose(f);
+    ESP_LOGI(TAG, "Successfully read %d bytes from %s", bytes_read, filename);
+    return buffer;
 }
 
 /**
@@ -164,13 +207,25 @@ extern "C" void app_main(void)
     ESP_LOGE(TAG, "Failed to configure HTTPS profile");
   }
 
-  // TODO Read in audio from partitioned file
-  
+  // Read in audio from partitioned file
+  size_t wav_size;
+  uint8_t* wav_data = read_wav_file("/spiffs/msg.wav", &wav_size);
 
-  // Open WebRTC connection
+  if(wav_data == NULL) {
+    ESP_LOGE(TAG, "ERROR: WAV file not read");
+    ESP_LOGI(TAG, "exiting ...");
+
+    free(wav_data);
+
+    return;
+  }
+
+  // Open WebSocket connection
   
 
   // Send audio to OpenAI
 
-
+  
+  //Destructors
+  free(wav_data);
 }
