@@ -1,68 +1,165 @@
 /**
- * @brief Header file for HTTPS and LTE connect functions derived from the DPTechnics 
- * Arduino demo of HTTPS. See WalterHTTPS.cpp for copyright.
+ * === Communications library for the Walter Board ===
+ * @file WalterCOMM.h
+ * @author Ryder Paulson <paulson.r@northeastern.edu>
+ * @brief Header file for communications tools for the Walter Board
  */
 
- namespace comm{
-  // Modem Object
-  extern WalterModem modem;
+#ifndef WALTER_COMM_H
+#define WALTER_COMM_H
 
+#include "WalterModem.h"
+#include <stdint.h>
+#include <stddef.h>
+
+namespace comm {
+  
+  // Global modem instance
+  extern WalterModem modem;
+  
+  // ========================================
+  // LTE Network Functions
+  // ========================================
+  
   /**
-   * @brief This function checks if we are connected to the LTE network
-   *
+   * @brief Check if connected to the LTE network
    * @return true when connected, false otherwise
    */
   bool lteConnected();
-
+  
   /**
-   * @brief This function waits for the modem to be connected to the LTE network.
-   *
-   * @param timeout_sec The amount of seconds to wait before returning a time-out.
-   *
-   * @return true if connected, false on time-out.
+   * @brief Wait for the modem to connect to the LTE network
+   * @param timeout_sec Maximum seconds to wait before timeout
+   * @return true if connected, false on timeout
    */
   bool waitForNetwork(int timeout_sec);
-
+  
   /**
-   * @brief Disconnect from the LTE network.
-   *
-   * This function will disconnect the modem from the LTE network and block until
-   * the network is actually disconnected. After the network is disconnected the
-   * GNSS subsystem can be used.
-   *
-   * @return true on success, false on error.
-   */
-  bool lteDisconnect();
-
-  /**
-   * @brief This function tries to connect the modem to the cellular network.
-   *
-   * @return true on success, false on error.
+   * @brief Connect the modem to the cellular network
+   * @return true on success, false on error
    */
   bool lteConnect();
-
+  
   /**
-   * @brief Writes TLS credentials to the modem's NVS and configures the TLS profile.
-   *
-   * This function stores the provided TLS certificates and private keys into the modem's
-   * non-volatile storage (NVS), and then sets up a TLS profile for secure communication.
-   * These configuration changes are persistent across reboots.
-   *
-   * @note
-   * - Certificate indexes 0-10 are reserved for Sequans and BlueCherry internal usage.
-   * - Private key index 1 is reserved for BlueCherry internal usage.
-   * - Do not attempt to override or use these reserved indexes.
-   *
-   * @return
-   * - true if the credentials were successfully written and the profile configured.
-   * - false otherwise.
+   * @brief Disconnect from the LTE network
+   * @return true on success, false on error
+   */
+  bool lteDisconnect();
+  
+  // ========================================
+  // HTTPS Functions
+  // ========================================
+  
+  /**
+   * @brief Setup TLS profile for HTTPS communication
+   * @param https_tls_profile TLS profile number to configure
+   * @return true on success, false on error
    */
   bool setupTLSProfile(int https_tls_profile);
-
+  
   /**
-   * @brief Perform an HTTPS POST request with a body.
+   * @brief Perform an HTTPS POST request
+   * @param path URL path for the request
+   * @param body Request body data
+   * @param bodyLen Length of body data
+   * @param mimeType MIME type of the body (e.g., "application/json")
+   * @param modem_https_profile HTTPS profile ID to use
+   * @param https_host Host name for the request
+   * @return true on success, false on error
    */
-  bool httpsPost(const char* path, const uint8_t* body, size_t bodyLen,
-                const char* mimeType, int modem_https_profile, 
-                const char* https_host);
-}
+  bool httpsPost(
+      const char* path,
+      const uint8_t* body,
+      size_t bodyLen,
+      const char* mimeType,
+      int modem_https_profile,
+      const char* https_host);
+  
+  // ========================================
+  // WebSocket Functions
+  // ========================================
+  
+  /**
+   * @brief Setup TLS profile for WebSocket connections
+   * @param tls_profile TLS profile number to configure
+   * @return true on success, false on error
+   */
+  bool setupWebSocketTLS(int tls_profile);
+  
+  /**
+   * @brief Send a WebSocket message
+   * @param payload Message payload
+   * @param payload_len Length of payload
+   * @param opcode WebSocket opcode (default: TEXT frame)
+   * @return true on success, false on error
+   */
+  bool wsSend(const uint8_t* payload, size_t payload_len, uint8_t opcode = 0x1);
+  
+  /**
+   * @brief Receive a WebSocket message
+   * @param buffer Buffer to store received message
+   * @param buffer_size Size of receive buffer
+   * @param received_len Pointer to store actual received length
+   * @return true if message received, false otherwise
+   */
+  bool wsReceive(uint8_t* buffer, size_t buffer_size, size_t* received_len);
+  
+  // ========================================
+  // OpenAI Realtime API Functions
+  // ========================================
+  
+  /**
+   * @brief Connect to OpenAI Realtime API via WebSocket
+   * @param api_key Your OpenAI API key
+   * @param model Model name (e.g., "gpt-4o-realtime-preview-2024-12-17")
+   * @return true on success, false on error
+   * 
+   * @note This establishes a WebSocket connection to api.openai.com
+   * @note Requires TLS to be configured via setupWebSocketTLS()
+   */
+  bool realtimeConnect(const char* api_key, const char* model);
+  
+  /**
+   * @brief Send audio data to OpenAI Realtime API
+   * @param audio_data PCM16 audio data buffer (mono, 24kHz)
+   * @param audio_len Length of audio data in bytes
+   * @return true on success, false on error
+   * 
+   * @note Audio format: PCM16, mono channel, 24kHz sample rate
+   * @note Audio is automatically base64 encoded before transmission
+   */
+  bool realtimeSendAudio(const uint8_t* audio_data, size_t audio_len);
+  
+  /**
+   * @brief Commit the audio buffer and trigger response generation
+   * @return true on success, false on error
+   * 
+   * @note Call this after sending all audio chunks to signal completion
+   */
+  bool realtimeCommitAudio();
+  
+  /**
+   * @brief Send a text message to the Realtime API
+   * @param text Text message to send
+   * @return true on success, false on error
+   */
+  bool realtimeSendText(const char* text);
+  
+  /**
+   * @brief Request a response generation from the API
+   * @return true on success, false on error
+   * 
+   * @note Call this after sending text or committing audio
+   */
+  bool realtimeGenerateResponse();
+  
+  /**
+   * @brief Disconnect from OpenAI Realtime API
+   * 
+   * @note Sends a WebSocket close frame and closes the socket
+   */
+  void realtimeDisconnect();
+  
+} // namespace comm
+
+#endif // WALTER_COMM_H
