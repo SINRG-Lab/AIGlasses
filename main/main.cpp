@@ -352,12 +352,16 @@ extern "C" void app_main(void)
     const char* network_password = WIFI_PASSWORD;
     const int timeout_ms = 30000;
 
-    // Connect to internet
-    if(!comm::wifi_connect(network_ssid, network_password, timeout_ms)) {
-        ESP_LOGE(TAG, "Could not connect to WiFi");
-        ESP_LOGE(TAG, "Attempting to connect to LTE");
-        if(!comm::lteConnect()) {
-            ESP_LOGE(TAG, "Could not connect to LTE");
+    if(!comm::lteConnect()) {
+        ESP_LOGE(TAG, "Could not connect to LTE");
+        ESP_LOGI(TAG, "Attempting to connect to WiFi");
+        if(!comm::wifi_connect(network_ssid, network_password, timeout_ms)) {
+            ESP_LOGE(TAG, "Could not connect to WiFi");
+            return;
+        } else {
+            // WiFi connects successfully
+            ESP_LOGI(TAG, "WiFi connected");
+            ESP_LOGE(TAG, "Necessary code to connect to OpenAI API by Websocket not implemented for WiFi");
             return;
         }
     }

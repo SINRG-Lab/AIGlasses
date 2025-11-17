@@ -256,7 +256,29 @@ namespace comm{
       return false;
     }
 
-    return waitForNetwork(300);
+    // Wait for network registration
+    if(!waitForNetwork(300)) {
+        ESP_LOGE(TAG, "Network registration timeout");
+        return false;
+    }
+
+    // Aattach to network
+    if(!modem.setNetworkAttachmentState(true)) {
+        ESP_LOGE(TAG, "Could not attach to network");
+        return false;
+    }
+
+    // Wait for attachment to complete
+    vTaskDelay(pdMS_TO_TICKS(3000));
+    
+    // Verify PDP context is active
+    if(modem.getPDPAddress(&rsp, NULL, NULL, 1)) {
+        ESP_LOGI(TAG, "PDP context active with IP: %s", rsp.data.pdpAddressList.pdpAddress);
+        return true;
+    }
+
+    ESP_LOGE(TAG, "No IP address assigned");
+    return false;
   }
 
   // ========================================
