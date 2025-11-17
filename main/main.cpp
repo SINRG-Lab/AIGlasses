@@ -36,6 +36,9 @@
 // Unique component to this project
 #include "WalterCOMM.h"
 
+// Include local WiFi credentials file (not tracked by git)
+#include "WiFiCredentials.h"
+
 // The TLS profile to use for the application
 static const int HTTPS_TLS_PROFILE = 2;
 
@@ -344,10 +347,19 @@ extern "C" void app_main(void)
         return;
     }
 
-    // Connect the modem to the lte network
-    if(!comm::lteConnect()) {
-        ESP_LOGE(TAG, "Could not Connect to LTE");
-        return;
+    // Network connection characteristics 
+    const char* network_ssid = WIFI_SSID;
+    const char* network_password = WIFI_PASSWORD;
+    const int timeout_ms = 30000;
+
+    // Connect to internet
+    if(!comm::wifi_connect(network_ssid, network_password, timeout_ms)) {
+        ESP_LOGE(TAG, "Could not connect to WiFi");
+        ESP_LOGE(TAG, "Attempting to connect to LTE");
+        if(!comm::lteConnect()) {
+            ESP_LOGE(TAG, "Could not connect to LTE");
+            return;
+        }
     }
 
     // Check the quality of the network connection
