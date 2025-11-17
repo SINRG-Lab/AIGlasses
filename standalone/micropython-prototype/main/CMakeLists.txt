@@ -6,4 +6,7 @@ idf_component_register(
         esp-adf-libs
         spiffs
         json
+    PRIV_REQUIRES
+        esp_wifi
+        nvs_flash
 )
