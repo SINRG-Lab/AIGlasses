@@ -1,5 +1,5 @@
 idf_component_register(
-    SRCS "WalterCOMM.h" "WalterCOMM.cpp" "main.cpp" 
+    SRCS "walter_spiffs.cpp" "walter_com.cpp" "audio_agent.cpp" "walter_spiffs.h" "audio_agent.h" "walter_com.h" "main.cpp" 
     INCLUDE_DIRS "."
     REQUIRES 
         audio_pipeline
