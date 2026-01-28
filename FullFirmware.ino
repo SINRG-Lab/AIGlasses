@@ -1,15 +1,4 @@
 /*
- * ESP32-S3 DevKitC N16R8 OpenAI Voice Assistant
- * ==============================================
- *
- * HARDWARE REQUIREMENTS:
- * - ESP32-S3-DevKitC N16R8 (16MB Flash, 8MB PSRAM)
- * - INMP441 I2S MEMS Microphone
- * - MAX98357A I2S Class-D Amplifier + Speaker
- *
- * IMPORTANT: N16R8 uses Octal SPI for PSRAM, so GPIOs 33-37 are NOT available!
- * Also avoid: GPIO 0 (boot), GPIO 19-20 (USB), GPIO 26-32 (flash on some boards)
- *
  * WIRING DIAGRAM:
  *
  *   INMP441 Microphone:
@@ -31,23 +20,10 @@
  *   GAIN -> unconnected (9dB default) or GND (12dB) or VIN (15dB)
  *   SD   -> unconnected or HIGH to enable (has internal pull-up)
  *
- *   Optional Button (Push-to-Talk):
+ *    Button (Push-to-Talk):
  *   -------------------------------
  *   One side -> GPIO 0 (BOOT button on board) or GPIO 18
  *   Other side -> GND
- *
- * CONFIGURATION:
- * - Update WIFI_SSID and WIFI_PASSWORD below
- * - Update OPENAI_API_KEY with your API key
- * - Optionally set BUTTON_PIN for push-to-talk (default: Serial trigger)
- * - Optionally set LED_PIN for status indication (GPIO 48 is the onboard RGB)
- *
- * USAGE:
- * 1. Flash the firmware to ESP32-S3
- * 2. Open Serial Monitor at 115200 baud
- * 3. Press Enter (or button if configured) to start recording
- * 4. Speak for 3 seconds
- * 5. Wait for transcription, AI response, and audio playback
  */
 
 #include <Arduino.h>
@@ -59,8 +35,8 @@
 
 // ==================== USER CONFIGURATION ====================
 // WiFi credentials - UPDATE THESE
-const char* WIFI_SSID     = "Ayoub";
-const char* WIFI_PASSWORD = "12345678";
+const char* WIFI_SSID     = "";
+const char* WIFI_PASSWORD = "";
 
 // OpenAI API - UPDATE YOUR API KEY
 const char* OPENAI_HOST = "api.openai.com";
