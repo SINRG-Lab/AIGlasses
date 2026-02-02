@@ -1,0 +1,18 @@
+{
+  "majd_gemini_api_key": "",
+  "ryder_gemini_api_key": "",
+  "cell_apn": "",
+  "apn_username": "",
+  "apn_password": "",
+  "sim_pin": null,
+  "mic_sd": 12,
+  "mic_ws": 14,
+  "mic_sck": 13,
+  "spk_rc": 18,
+  "spk_bclk": 17,
+  "spk_din": 16,
+  "spk_sd": 15,
+  "num_iterations": 1,
+  "wav_file": "/msg_tiny.wav",
+  "audio_prompt": "Listen to this audio and respond to the user's question or request. If it's a question, answer it directly. If it's a statement, acknowledge and respond appropriately. Keep your response concise and helpful."
+}

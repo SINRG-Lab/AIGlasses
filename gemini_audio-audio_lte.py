@@ -13,6 +13,7 @@ import asyncio
 import sys
 import time
 import ubinascii
+from machine import Pin
 import ujson as json
 from walter_modem import Modem
 from walter_modem.mixins.default_sim_network import *
@@ -23,21 +24,6 @@ from walter_modem.coreEnums import *
 from walter_modem.coreStructs import *
 from walter_modem.mixins.socket import WalterModemSocketRingMode
 
-# ============== CONFIGURATION ==============
-GEMINI_API_KEY = ""  # Majd's key
-# GEMINI_API_KEY = "" # Ryder's key
-CELL_APN = ""
-APN_USERNAME = ""
-APN_PASSWORD = ""
-SIM_PIN = None
-
-NUM_ITERATIONS = 1
-WAV_FILE = "/msg_tiny.wav"
-
-# Prompt for audio processing
-AUDIO_PROMPT = """Listen to this audio and respond to the user's question or request. 
-If it's a question, answer it directly. If it's a statement, acknowledge and respond appropriately.
-Keep your response concise and helpful."""
 
 # ============== INITIALIZE MODEM ==============
 modem = Modem(SocketMixin, TLSCertsMixin, load_default_power_saving_mixin=False)
@@ -45,6 +31,47 @@ modem_rsp = WalterModemRsp()
 
 
 # ============== HELPER FUNCTIONS ==============
+def load_config(filename='config.json', api_key="majd"):
+    """Load configuration from JSON file into global variables."""
+    global GEMINI_API_KEY, CELL_APN, APN_USERNAME, APN_PASSWORD, SIM_PIN
+    global MIC_SD, MIC_WS, MIC_SCK
+    global SPK_RC, SPK_BCLK, SPK_DIN, SPK_SD
+    global NUM_ITERATIONS, WAV_FILE, AUDIO_PROMPT
+
+    with open(filename, 'r') as f:
+        config = json.load(f)
+
+    # API and network config
+    majd_key = config['majd_gemini_api_key']
+    ryder_key = config['ryder_gemini_api_key']
+    if api_key == "majd":
+        GEMINI_API_KEY = majd_key
+    else:
+        GEMINI_API_KEY = ryder_key
+
+    CELL_APN = config['cell_apn']
+    APN_USERNAME = config['apn_username']
+    APN_PASSWORD = config['apn_password']
+    SIM_PIN = config['sim_pin']
+
+    # Mic config
+    MIC_SD = config['mic_sd']
+    MIC_WS = config['mic_ws']
+    MIC_SCK = config['mic_sck']
+
+    # Speaker config
+    SPK_RC = config['spk_rc']
+    SPK_BCLK = config['spk_bclk']
+    SPK_DIN = config['spk_din']
+    SPK_SD = config['spk_sd']
+
+    # Other settings
+    NUM_ITERATIONS = config['num_iterations']
+    WAV_FILE = config['wav_file']
+    AUDIO_PROMPT = config['audio_prompt']
+
+    print("Configuration loaded successfully")
+
 async def wait_for_network(timeout=180):
     for _ in range(timeout):
         state = modem.get_network_reg_state()
@@ -87,7 +114,7 @@ async def lte_connect():
     if await modem.get_rat(rsp=modem_rsp):
         print(f"Connected on: {WalterModemRat.get_value_name(modem_rsp.rat)}")
 
-    print("Connected!")
+    print("Connected")
     return True
 
 
@@ -339,17 +366,18 @@ async def setup_tls_socket(socket_id, server, port, tts=False):
     ):
         print("Socket config failed")
         return False
-    #     if tts:
-    #         if not await modem.socket_config_extended(
-    #             ctx_id=socket_id,
-    #             ring_mode=WalterModemSocketRingMode.NORMAL,  # Only ctx_id, no length parsing
-    #             recv_mode=WalterModemSocketRecvMode.TEXT_OR_RAW,
-    #             keepalive=60,
-    #             listen_auto_resp=False,
-    #             send_mode=WalterModemSocketSendMode.TEXT_OR_RAW
-    #         ):
-    #             print("Socket extended config failed")
-    #             return False
+
+    if tts:
+        if not await modem.socket_config_extended(
+            ctx_id=socket_id,
+            ring_mode=WalterModemSocketRingMode.NORMAL,  # Only ctx_id, no length parsing
+            recv_mode=WalterModemSocketRecvMode.TEXT_OR_RAW,
+            keepalive=60,
+            listen_auto_resp=False,
+            send_mode=WalterModemSocketSendMode.TEXT_OR_RAW
+        ):
+            print("Socket extended config failed")
+            return False
 
     if not await modem.socket_config_secure(
             ctx_id=socket_id,
@@ -731,6 +759,9 @@ async def save_tts_audio(wav_bytes, filepath="/tts_output.wav"):
 
 # ============== SETUP ==============
 async def setup():
+    print("Loading Config")
+    load_config()
+
     print("\n" + "=" * 50)
     print("Walter - Gemini Audio-to-Text (LTE-M Optimized)")
     print("=" * 50)
