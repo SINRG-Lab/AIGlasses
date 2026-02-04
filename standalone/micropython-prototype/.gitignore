@@ -35,3 +35,8 @@ spiffs_data/config.json
 
 # Misc temp project files
 /extras/
+/misc/project_structure.txt
+/misc/read.txt
+/misc/server_stt1.txt
+/misc/speech_to_text_transcipt1.ino
+/misc/speech_to_text_transcipt_ngrok_1__1__copy_20260129122230.zip
