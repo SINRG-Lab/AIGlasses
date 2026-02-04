@@ -12,6 +12,7 @@ micropython.opt_level(1)
 import asyncio
 import sys
 import time
+
 import ubinascii
 from machine import Pin
 import ujson as json
@@ -348,6 +349,9 @@ async def send_and_receive(socket_id, http_request, timeout=120):
 async def setup_tls_socket(socket_id, server, port, tts=False):
     """Configure and connect a TLS socket optimized for LTE-M latency"""
 
+    # TODO Remove once done debugging
+    tts=False
+
     if not await modem.tls_config_profile(
             profile_id=1,
             tls_version=WalterModemTlsVersion.TLS_VERSION_12,
@@ -367,16 +371,25 @@ async def setup_tls_socket(socket_id, server, port, tts=False):
         print("Socket config failed")
         return False
 
+
+
     if tts:
         if not await modem.socket_config_extended(
             ctx_id=socket_id,
-            ring_mode=WalterModemSocketRingMode.NORMAL,  # Only ctx_id, no length parsing
+            ring_mode=WalterModemSocketRingMode.NORMAL,
             recv_mode=WalterModemSocketRecvMode.TEXT_OR_RAW,
             keepalive=60,
             listen_auto_resp=False,
             send_mode=WalterModemSocketSendMode.TEXT_OR_RAW
         ):
             print("Socket extended config failed")
+            return False
+    else:
+        # Set extended config back to default settings.
+        if not await modem.socket_config_extended(
+                ctx_id=socket_id
+        ):
+            print("Socked extended config failed")
             return False
 
     if not await modem.socket_config_secure(
@@ -760,7 +773,7 @@ async def save_tts_audio(wav_bytes, filepath="/tts_output.wav"):
 # ============== SETUP ==============
 async def setup():
     print("Loading Config")
-    load_config()
+    load_config(api_key="ryder")
 
     print("\n" + "=" * 50)
     print("Walter - Gemini Audio-to-Text (LTE-M Optimized)")
@@ -835,6 +848,11 @@ async def main():
                 break
 
             await asyncio.sleep(1)  # Reduced cooldown between iterations
+
+        if len(latencies)/NUM_ITERATIONS < 0.3:
+            print("Fewer than 30% of runs were successful\nTest FAILED")
+            return None
+
 
         # Print results + CDF plotting code
         print("\n" + "=" * 50)
