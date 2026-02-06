@@ -1,3 +1,4 @@
 import machine
 
-machine.soft_reset()
+if __name__ == "__main__":
+    machine.soft_reset()
