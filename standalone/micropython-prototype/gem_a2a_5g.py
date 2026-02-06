@@ -706,7 +706,9 @@ async def _check_socket_closed(socket_id, response_data, verbose=False):
         if not modem.socket_context_states[socket_id].connected:
             if verbose:
                 print(f"  Socket no longer connected")
-            return try_parse_tts_response(response_data)
+
+            result = try_parse_tts_response(response_data)
+            return result
     except Exception as e:
         if verbose:
             print(f"  Socket status check error: {e}")
@@ -724,6 +726,10 @@ async def tts_send_and_receive(socket_id, http_request, timeout=500, verbose=Tru
     content_length = -1
     header_end_pos = -1
     no_data_count = 0
+
+    data_wait = 0.5
+    no_data_wait = 0.5
+
     start = time.ticks_ms()
 
     while time.ticks_diff(time.ticks_ms(), start) < (timeout * 1000):
@@ -740,7 +746,11 @@ async def tts_send_and_receive(socket_id, http_request, timeout=500, verbose=Tru
                     if result:
                         return result
 
-                await asyncio.sleep(0.1)
+                    if no_data_count > 30:
+                        print("TTS timeout - no more data received")
+                        break
+
+                await asyncio.sleep(no_data_wait)
                 continue
 
             # Process one ring
@@ -762,7 +772,7 @@ async def tts_send_and_receive(socket_id, http_request, timeout=500, verbose=Tru
                 return result
 
             no_data_count = 0
-            await asyncio.sleep(0.01)
+            await asyncio.sleep(data_wait)
 
         except Exception as e:
             print(f"  TTS error: {e}")
@@ -941,6 +951,50 @@ async def setup():
 
     return True
 
+def make_fast(msg: str) -> str:
+    return "[extremely fast]" + msg
+
+async def audio_to_text() -> str:
+    print("\nReady for Gemini audio queries!")
+
+    # Load audio file
+    if AUDIO_FILE[-3:] == "mp3":
+        audio_b64, mime_type = load_mp3_file(AUDIO_FILE)
+    elif AUDIO_FILE[-3:] == "wav":
+        audio_b64, mime_type = load_wav_file(AUDIO_FILE)
+    else:
+        raise RuntimeError(f"{AUDIO_FILE} is in an invalid format to be loaded as audio.")
+
+    if not audio_b64:
+        raise RuntimeError(f"Cannot load {AUDIO_FILE}")
+
+    print("\n" + "=" * 50)
+    print(f"Gemini Audio to Text")
+    print("=" * 50)
+
+    response, latency = await query_gemini_audio(audio_b64, mime_type, AUDIO_PROMPT)
+
+    if response and latency > 0:
+        print(f"\n--- RESULT ---")
+        print(f"Gemini: {response[:200]}..." if len(response) > 200 else f"Gemini: {response}")
+        print(f"Latency: {latency} ms")
+        await asyncio.sleep(1)
+
+    return response
+
+async def text_to_audio(msg) -> bool:
+    tts_audio, latency = await gemini_tts(msg)
+
+    if tts_audio is not None and latency > 1:
+        print(f"Audio received from Gemini")
+        await save_tts_audio(tts_audio, "/tts_output.wav")
+    else:
+        print("TTS Query FAILED")
+        return False
+
+    return True
+
+
 
 # ============== MAIN ==============
 async def main():
@@ -948,60 +1002,14 @@ async def main():
         if not await setup():
             raise RuntimeError("Setup failed")
 
-        print("\nReady for Gemini audio queries!")
+        # a2t_rsp = await audio_to_text()
 
-        # Load audio file
-        if AUDIO_FILE[-3:] == "mp3":
-            audio_b64, mime_type = load_mp3_file(AUDIO_FILE)
-        elif AUDIO_FILE[-3:] == "wav":
-            audio_b64, mime_type = load_wav_file(AUDIO_FILE)
-        else:
-            raise RuntimeError(f"{AUDIO_FILE} is in an invalid format to be loaded as audio.")
+        # TODO Remove hard coded message
+        hard_coded_msg = "Hi!"
+        fast_msg = make_fast(hard_coded_msg)
+        t2a_status = await text_to_audio(fast_msg)
 
-        if not audio_b64:
-            raise RuntimeError(f"Cannot load {AUDIO_FILE}")
-
-        print(f"\nRunning {NUM_ITERATIONS} iterations...")
-
-        latencies = []
-
-        for i in range(NUM_ITERATIONS):
-            print("\n" + "=" * 50)
-            print(f"Gemini Audio Query - Iteration {i + 1}/{NUM_ITERATIONS}")
-            print("=" * 50)
-
-            response, latency = await query_gemini_audio(audio_b64, mime_type, AUDIO_PROMPT)
-
-            if response and latency > 0:
-                latencies.append(latency)
-                print(f"\n--- RESULT ---")
-                print(f"Gemini: {response[:200]}..." if len(response) > 200 else f"Gemini: {response}")
-                print(f"Latency: {latency} ms")
-                await asyncio.sleep(1)
-                tts_audio, latency = await gemini_tts(response)
-                if tts_audio is not None and latency > 1:
-                    print(f"Audio recieved from Gemini")
-                else:
-                    print("TTS Query FAILED")
-                    break
-            else:
-                print("Query FAILED")
-                break
-
-            await asyncio.sleep(1)  # Reduced cooldown between iterations
-
-        if len(latencies)/NUM_ITERATIONS < 0.3:
-            print("Fewer than 30% of runs were successful\nTest FAILED")
-            return None
-
-
-        # Print results + CDF plotting code
-        print("\n" + "=" * 50)
-        print("BENCHMARK COMPLETE")
-        print("=" * 50)
-        print(f"Success: {len(latencies)}/{NUM_ITERATIONS}")
-        print("=" * 50)
-        print("Exiting...")
+        print("Program finished...\n\n\n")
 
     except Exception as err:
         print("ERROR:")
