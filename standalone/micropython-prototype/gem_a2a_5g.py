@@ -1,5 +1,5 @@
 """
-Walter ESP32-S3 MicroPython - Gemini Audio-to-Text (LTE-M Optimized)
+Walter ESP32-S3 MicroPython - Gemini Audio-to-Audio (LTE-M Optimized)
 Sends audio directly to Gemini API for transcription/response
 Forces LTE-M connection and optimized for minimum latency
 Includes latency measurement + CDF output
@@ -37,14 +37,14 @@ def load_config(filename='config.json', api_key="majd"):
     global GEMINI_API_KEY, CELL_APN, APN_USERNAME, APN_PASSWORD, SIM_PIN
     global MIC_SD, MIC_WS, MIC_SCK
     global SPK_RC, SPK_BCLK, SPK_DIN, SPK_SD
-    global NUM_ITERATIONS, WAV_FILE, AUDIO_PROMPT
+    global NUM_ITERATIONS, AUDIO_FILE, AUDIO_PROMPT
 
     with open(filename, 'r') as f:
         config = json.load(f)
 
     # API and network config
     majd_key = config['majd_gemini_api_key']
-    ryder_key = config['ryder_gemini_api_key']
+    ryder_key = config['ryder_gemini_api_key1']
     if api_key == "majd":
         GEMINI_API_KEY = majd_key
     else:
@@ -68,7 +68,7 @@ def load_config(filename='config.json', api_key="majd"):
 
     # Other settings
     NUM_ITERATIONS = config['num_iterations']
-    WAV_FILE = config['wav_file']
+    AUDIO_FILE = config['audio_file']
     AUDIO_PROMPT = config['audio_prompt']
 
     print("Configuration loaded successfully")
@@ -191,6 +191,58 @@ def load_wav_file(filepath):
         sys.print_exception(e)
         return None, None
 
+def load_mp3_file(filepath):
+    """Load MP3 file and return audio data with base64 encoding"""
+    import os
+
+    if filepath.startswith(".."):
+        cwd = os.getcwd()
+        print(f"Current directory: {cwd}")
+        filepath = filepath.replace("../", "/")
+
+    if not filepath.startswith("/"):
+        filepath = "/" + filepath
+
+    print(f"Attempting to load: {filepath}")
+
+    try:
+        stat = os.stat(filepath)
+        file_size = stat[6]
+        print(f"File found: {file_size} bytes")
+    except OSError as e:
+        print(f"File not found: {filepath}")
+        print(f"Error: {e}")
+        list_files("/")
+        return None, None
+
+    try:
+        with open(filepath, 'rb') as f:
+            mp3_data = f.read()
+
+        print(f"Read {len(mp3_data)} bytes")
+
+        if len(mp3_data) < 4:
+            print("File too small for MP3")
+            return None, None
+
+        # Validate MP3: check for ID3 tag or MPEG frame sync
+        has_id3 = mp3_data[:3] == b'ID3'
+        has_sync = (mp3_data[0] == 0xFF and (mp3_data[1] & 0xE0) == 0xE0)
+        if not has_id3 and not has_sync:
+            print(f"Invalid MP3 format. Header bytes: {mp3_data[:4].hex()}")
+            return None, None
+
+        print(f"MP3 detected ({'ID3 tag' if has_id3 else 'frame sync'})")
+
+        audio_b64 = ubinascii.b2a_base64(mp3_data).decode('utf-8').strip()
+        print(f"Base64 encoded: {len(audio_b64)} chars")
+
+        return audio_b64, "audio/mpeg"
+
+    except Exception as e:
+        print(f"Error reading MP3: {e}")
+        sys.print_exception(e)
+        return None, None
 
 # ============== RESPONSE PARSER ==============
 def try_parse_response(response_data):
@@ -540,98 +592,181 @@ def try_parse_tts_response(response_data):
         print(f"TTS parse error: {e}")
         return None
 
-
-async def tts_send_and_receive(socket_id, http_request, timeout=500, verbose=False):
-    """Socket send/receive for TTS, returns base64 audio data"""
-
+async def _tts_send_request(socket_id, http_request):
+    """Send the HTTP request over the socket. Returns True on success."""
     request_bytes = http_request if isinstance(http_request, bytes) else http_request.encode('utf-8')
-
     chunk_size = 4096
     delay = 0.005
-
     total_size = len(request_bytes)
+
     print(f"Sending TTS request {total_size} bytes...")
 
     for i in range(0, total_size, chunk_size):
         chunk = request_bytes[i:i + chunk_size]
+
         if not await modem.socket_send(ctx_id=socket_id, data=chunk):
             print(f"Send failed at byte {i}")
-            return None
+            return False
+
         if i > 0 and i % 40000 == 0:
             pct = (i * 100) // total_size
             print(f"  Sent {i}/{total_size} bytes ({pct}%)...")
+
         await asyncio.sleep(delay)
 
     print(f"TTS request sent, waiting for audio response...")
+    return True
+
+
+def _extract_content_length(response_data, header_end_pos, verbose=False):
+    """Parse Content-Length from headers. Returns (content_length, header_end_pos)."""
+    if b'\r\n\r\n' not in response_data:
+        return -1, -1
+
+    header_end_pos = response_data.find(b'\r\n\r\n')
+    headers = response_data[:header_end_pos].decode('utf-8', 'ignore').lower()
+
+    for line in headers.split('\r\n'):
+        if line.startswith('content-length:'):
+            cl = int(line.split(':')[1].strip())
+
+            if verbose:
+                print(f"  Content-Length: {cl}")
+
+            return cl, header_end_pos
+
+    return -1, header_end_pos
+
+
+def _check_body_complete(response_data, content_length, header_end_pos, verbose=False):
+    """If Content-Length is known, check whether the full body has arrived and try to parse."""
+    if content_length <= 0 or header_end_pos < 0:
+        return None
+
+    body_received = len(response_data) - (header_end_pos + 4)
+
+    if body_received >= content_length:
+
+        if verbose:
+            print(f"  Full body received: {body_received}/{content_length}")
+
+        return try_parse_tts_response(response_data)
+
+    return None
+
+
+async def _read_ring_data(socket_id, ring, verbose=False):
+    """Read payload from a single ring notification. Returns bytes or None."""
+    data_length = ring.length if ring.length else 1500
+
+    if verbose:
+        print(f"  Ring data_length={data_length}, ring.length={ring.length}")
+        print(f"  Calling socket_receive_data for socket {socket_id} with {data_length} bytes...")
+
+    try:
+        await modem.socket_receive_data(
+            ctx_id=socket_id,
+            length=data_length,
+            max_bytes=min(data_length, 1500),
+            rsp=modem_rsp
+        )
+
+        if verbose:
+            print(f"  socket_receive_data returned")
+
+        if modem_rsp.socket_rcv_response and modem_rsp.socket_rcv_response.payload:
+            return bytes(modem_rsp.socket_rcv_response.payload)
+
+        if ring.data:
+            return bytes(ring.data)
+    except ValueError:
+        print(f"  ValueError in receive, using ring.data directly")
+
+        if ring.data:
+            return bytes(ring.data)
+
+    return None
+
+
+async def _check_socket_closed(socket_id, response_data, verbose=False):
+    """Actively query socket status; if closed, attempt to parse the response."""
+    try:
+        status_rsp = WalterModemRsp()
+        await modem.socket_status(ctx_id=socket_id, rsp=status_rsp)
+
+        if status_rsp.socket_status:
+            sock_state = status_rsp.socket_status.state
+            if verbose:
+                print(f"  Socket status: {sock_state}")
+            if sock_state == WalterModemSocketState.CLOSED or sock_state == 0:
+                if verbose:
+                    print(f"  Server closed connection, parsing response")
+                return try_parse_tts_response(response_data)
+
+        if not modem.socket_context_states[socket_id].connected:
+            if verbose:
+                print(f"  Socket no longer connected")
+            return try_parse_tts_response(response_data)
+    except Exception as e:
+        if verbose:
+            print(f"  Socket status check error: {e}")
+
+    return None
+
+async def tts_send_and_receive(socket_id, http_request, timeout=500, verbose=True):
+    """Socket send/receive for TTS, returns base64 audio data."""
+    if not await _tts_send_request(socket_id, http_request):
+        return None
+
     await asyncio.sleep(0.5)
 
     response_data = b''
+    content_length = -1
+    header_end_pos = -1
     no_data_count = 0
+    start = time.ticks_ms()
 
-    for i in range(timeout):
+    while time.ticks_diff(time.ticks_ms(), start) < (timeout * 1000):
         try:
             rings = modem.socket_context_states[socket_id].rings
             print(f"Rings available: {len(rings) if rings else 0} | no_data_count: {no_data_count}")
 
-            if rings:
-                ring = rings.pop(0)
-                data_length = ring.length if ring.length else 1500
-                try:
-                    if verbose:
-                        print(f"  Ring data_length={data_length}, ring.length={ring.length}")
-                        print(f"  Calling socket_receive_data for socket {socket_id} with {data_length} bytes...")
-
-                    result = await modem.socket_receive_data(
-                        ctx_id=socket_id,
-                        length=data_length,
-                        max_bytes=min(data_length, 1500),
-                        rsp=modem_rsp
-                    )
-                    if verbose:
-                        print(f"  socket_receive_data returned")
-
-                    if modem_rsp.socket_rcv_response:
-                        payload = modem_rsp.socket_rcv_response.payload
-                        if payload:
-                            response_data += bytes(payload)
-                            print(f"  +{len(payload)} bytes (total: {len(response_data)})")
-                    elif ring.data:
-                        response_data += bytes(ring.data)
-
-                    if b'\r\n0\r\n' in response_data:
-                        if verbose:
-                            print("Parsing TTS response due to terminator detected")
-                        result = try_parse_tts_response(response_data)
-                        if result:
-                            return result
-                except ValueError as e:
-                    print(f"  ValueError in receive, using ring.data directly")
-                    if ring.data:
-                        response_data += bytes(ring.data)
-                        print(f"  +{len(ring.data)} bytes from ring.data (total: {len(response_data)})")
-
-                no_data_count = 0
-                await asyncio.sleep(0.01)
-            else:
+            if not rings:
                 no_data_count += 1
-                await asyncio.sleep(0.5)
 
-            if response_data and no_data_count > 2:
-                if verbose:
-                    print("Parsing TTS response due to no_data_count {no_data_count}")
-                result = try_parse_tts_response(response_data)
-                if result:
-                    return result
+                if response_data and no_data_count > 5:
+                    result = await _check_socket_closed(socket_id, response_data, verbose)
 
-            if no_data_count > 40 and len(response_data) > 0:
-                print(f"Breaking due to no_data_count={no_data_count} with {len(response_data)} bytes")
-                break
-            elif no_data_count > 60:
-                print("TTS timeout")
-                break
+                    if result:
+                        return result
+
+                await asyncio.sleep(0.1)
+                continue
+
+            # Process one ring
+            ring = rings.pop(0)
+            payload = await _read_ring_data(socket_id, ring, verbose)
+            if payload:
+                response_data += payload
+                print(f"  +{len(payload)} bytes (total: {len(response_data)})")
+
+            # Detect content-length once headers arrive
+            if content_length < 0:
+                content_length, header_end_pos = _extract_content_length(
+                    response_data, header_end_pos, verbose
+                )
+
+            # Check if full body received
+            result = _check_body_complete(response_data, content_length, header_end_pos, verbose)
+            if result:
+                return result
+
+            no_data_count = 0
+            await asyncio.sleep(0.01)
 
         except Exception as e:
             print(f"  TTS error: {e}")
+            await asyncio.sleep(0.5)
 
     if response_data:
         print(f"Raw TTS response ({len(response_data)} bytes)")
@@ -740,7 +875,7 @@ async def gemini_tts(text, voice="Kore", verbose=False):
     print("Connected to Gemini TTS, sending request...")
 
     start_time = time.ticks_ms()
-    audio_b64 = await tts_send_and_receive(socket_id, http_request, timeout=120, verbose=True)
+    audio_b64 = await tts_send_and_receive(socket_id, http_request, timeout=1000, verbose=True)
     latency = time.ticks_diff(time.ticks_ms(), start_time)
 
     try:
@@ -776,7 +911,7 @@ async def setup():
     load_config(api_key="ryder")
 
     print("\n" + "=" * 50)
-    print("Walter - Gemini Audio-to-Text (LTE-M Optimized)")
+    print("Walter - Gemini Audio-to-Audio (LTE-M Optimized)")
     print("=" * 50)
     print("Settings: chunk=4096, delay=5ms, send_delay=0ms")
 
@@ -815,10 +950,16 @@ async def main():
 
         print("\nReady for Gemini audio queries!")
 
-        # Load and encode WAV file once
-        audio_b64, mime_type = load_wav_file(WAV_FILE)
+        # Load audio file
+        if AUDIO_FILE[-3:] == "mp3":
+            audio_b64, mime_type = load_mp3_file(AUDIO_FILE)
+        elif AUDIO_FILE[-3:] == "wav":
+            audio_b64, mime_type = load_wav_file(AUDIO_FILE)
+        else:
+            raise RuntimeError(f"{AUDIO_FILE} is in an invalid format to be loaded as audio.")
+
         if not audio_b64:
-            raise RuntimeError(f"Cannot load {WAV_FILE}")
+            raise RuntimeError(f"Cannot load {AUDIO_FILE}")
 
         print(f"\nRunning {NUM_ITERATIONS} iterations...")
 
@@ -859,49 +1000,8 @@ async def main():
         print("BENCHMARK COMPLETE")
         print("=" * 50)
         print(f"Success: {len(latencies)}/{NUM_ITERATIONS}")
-
-        print("\n" + "=" * 50)
-        print("COPY EVERYTHING BELOW TO PLOT CDF ON LAPTOP:")
         print("=" * 50)
-        print("""
-import numpy as np
-import matplotlib.pyplot as plt
-
-# ESP32 Gemini Audio-to-Text Latencies (LTE-M) - in milliseconds
-latencies = [""")
-        print("    " + ", ".join(str(lat) for lat in latencies))
-        print("""]
-
-# Compute CDF
-sorted_data = np.sort(latencies)
-cdf = np.arange(1, len(sorted_data) + 1) / len(sorted_data)
-
-# Plot
-fig, ax = plt.subplots(figsize=(10, 6))
-ax.plot(sorted_data, cdf, 'm-', linewidth=2, label='ESP32 (LTE-M) - Gemini Audio-to-Text')
-ax.scatter(sorted_data, cdf, c='purple', s=30, alpha=0.6)
-ax.axhline(y=0.5, color='gray', linestyle=':', alpha=0.5)
-ax.axhline(y=0.95, color='gray', linestyle=':', alpha=0.5)
-ax.set_xlabel('Latency (ms)', fontsize=12)
-ax.set_ylabel('CDF', fontsize=12)
-ax.set_title('ESP32 Gemini Audio-to-Text Latency CDF (over LTE-M)', fontsize=14)
-ax.legend(loc='lower right')
-ax.grid(True, alpha=0.3)
-ax.set_ylim(0, 1.05)
-
-# Stats
-print(f"Mean: {np.mean(latencies):.1f} ms")
-print(f"Median: {np.median(latencies):.1f} ms")
-print(f"P95: {np.percentile(latencies, 95):.1f} ms")
-print(f"Std: {np.std(latencies):.1f} ms")
-
-plt.tight_layout()
-plt.savefig('cdf_esp32_gemini_audio_ltem.png', dpi=150)
-plt.show()
-""")
-        print("=" * 50)
-
-        print("\nDone!")
+        print("Exiting...")
 
     except Exception as err:
         print("ERROR:")
