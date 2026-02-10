@@ -21,7 +21,7 @@ class OpenAIService(private val apiKey: String) {
 
     companion object {
         private const val WHISPER_URL = "https://api.openai.com/v1/audio/transcriptions"
-        private const val RESPONSES_URL = "https://api.openai.com/v1/responses"
+        private const val CHAT_URL = "https://api.openai.com/v1/chat/completions"
         private const val SYSTEM_PROMPT =
             "You are a helpful voice assistant for smart glasses. " +
             "Keep answers short (1-2 sentences). " +
@@ -80,12 +80,12 @@ class OpenAIService(private val apiKey: String) {
         }
 
         val json = JSONObject().apply {
-            put("model", "gpt-4.1-mini")
-            put("input", input)
+            put("model", "gpt-4o-mini")
+            put("messages", input)
         }
 
         val request = Request.Builder()
-            .url(RESPONSES_URL)
+            .url(CHAT_URL)
             .header("Authorization", "Bearer $apiKey")
             .header("Content-Type", "application/json")
             .post(json.toString().toRequestBody("application/json".toMediaType()))
@@ -98,6 +98,11 @@ class OpenAIService(private val apiKey: String) {
             throw Exception("Chat API error ${response.code}: $body")
         }
 
-        return JSONObject(body).getString("output_text").trim()
+        return JSONObject(body)
+            .getJSONArray("choices")
+            .getJSONObject(0)
+            .getJSONObject("message")
+            .getString("content")
+            .trim()
     }
 }
