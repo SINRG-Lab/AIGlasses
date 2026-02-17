@@ -1,6 +1,5 @@
 #include <NimBLEDevice.h>
 #include <driver/i2s.h>
-
 // ════════════════════════════════════════════════════════════════
 //  BLE GATT Service UUIDs (must match Android BleVoiceService)
 // ════════════════════════════════════════════════════════════════
