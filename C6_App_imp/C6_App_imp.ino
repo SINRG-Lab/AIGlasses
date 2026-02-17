@@ -416,13 +416,6 @@ void setup() {
 //  Loop
 // ════════════════════════════════════════════════════════════════
 void loop() {
-  // Debug: print button state every 200ms
-  static uint32_t lastBtnPrint = 0;
-  if (millis() - lastBtnPrint >= 200) {
-    lastBtnPrint = millis();
-    Serial.printf("[BTN] %d\n", digitalRead(PTT_PIN) == LOW ? 1 : 0);
-  }
-
   // Play audio if ready (TTS response from Android)
   if (playAudio) {
     playSpeaker();
