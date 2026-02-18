@@ -44,7 +44,7 @@ def load_config(filename='config.json', api_key="majd"):
 
     # API and network config
     majd_key = config['majd_gemini_api_key']
-    ryder_key = config['ryder_gemini_api_key1']
+    ryder_key = config['ryder_gemini_api_key']
     if api_key == "majd":
         GEMINI_API_KEY = majd_key
     else:
@@ -247,6 +247,7 @@ def load_mp3_file(filepath):
 # ============== RESPONSE PARSER ==============
 def try_parse_response(response_data):
     """Parse HTTP response with chunked encoding support"""
+    data = None
     try:
         header_end = response_data.find(b'\r\n\r\n')
         if header_end < 0:
@@ -277,6 +278,7 @@ def try_parse_response(response_data):
                     break
                 decoded_body += chunk_data[chunk_start:chunk_end]
                 chunk_data = chunk_data[chunk_end + 2:]
+
             body = decoded_body
 
         json_start = body.find(b'{')
@@ -296,7 +298,7 @@ def try_parse_response(response_data):
     except KeyError as e:
         print(f"Parse error - missing key: {e}")
         try:
-            print(f"Response data: {json.dumps(data)[:500]}")
+            print(f"Response data: {json.dumps(data if data else response_data)[:500]}")
         except:
             pass
         return None
@@ -552,7 +554,7 @@ def try_parse_tts_response(response_data):
                     break
                 try:
                     chunk_size = int(size_str, 16)
-                except:
+                except Exception as e:
                     break
                 if chunk_size == 0:
                     break
@@ -563,33 +565,55 @@ def try_parse_tts_response(response_data):
                     break
                 decoded_body += chunk_data[chunk_start:chunk_end]
                 chunk_data = chunk_data[chunk_end + 2:]
+
             body = decoded_body
 
-        json_start = body.find(b'{')
-        if json_start < 0:
-            return None
+            json_start = body.find(b'{')
+            if json_start < 0:
+                return None
 
-        json_bytes = body[json_start:]
-        json_str = json_bytes.decode('utf-8')
-        data = json.loads(json_str)
+            json_bytes = body[json_start:]
+            json_str = json_bytes.decode('utf-8')
 
-        if "error" in data:
-            print(f"Gemini TTS error: {data['error'].get('message', data['error'])}")
-            return None
+            # Try full JSON parse first
+            try:
+                data = json.loads(json_str)
+                if "error" in data:
+                    print(f"Gemini TTS error: {data['error'].get('message', data['error'])}")
+                    return None
+                return data["candidates"][0]["content"]["parts"][0]["inlineData"]["data"]
+            except Exception as e:
+                print(f"Parsing error: {e}\nFalling back to raw audio data.")
+                pass
 
-        # Extract base64 audio data from response
-        audio_b64 = data["candidates"][0]["content"]["parts"][0]["inlineData"]["data"]
-        return audio_b64
+            # Fallback: extract base64 data directly via string search
+            # (handles truncated trailing metadata)
+            marker = '"data": "'
+            idx = json_str.find(marker)
+            if idx < 0:
+                marker = '"data":"'
+                idx = json_str.find(marker)
+            if idx >= 0:
+                start = idx + len(marker)
+                end = json_str.find('"', start)
+                if end > start:
+                    print("Extracted audio via string search fallback")
+                    return json_str[start:end]
 
-    except KeyError as e:
-        print(f"TTS parse error - missing key: {e}")
-        try:
-            print(f"Response data: {json.dumps(data)[:500]}")
-        except:
-            pass
-        return None
+                raw = json_str[start:]
+                # Trim trailing non-base64 characters
+                valid = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/='
+                while raw and raw[-1] not in valid:
+                    raw = raw[:-1]
+                # Trim to valid base64 length (multiple of 4)
+                raw = raw[:len(raw) - (len(raw) % 4)]
+                if len(raw) > 100:
+                    print(f"Extracted truncated audio fallback ({len(raw)} chars)")
+                    return raw
+
+                return None
     except Exception as e:
-        print(f"TTS parse error: {e}")
+        print(f"Unexpected error occurred while parsing TTS response: {e}")
         return None
 
 async def _tts_send_request(socket_id, http_request):
@@ -727,6 +751,7 @@ async def tts_send_and_receive(socket_id, http_request, timeout=500, verbose=Tru
     header_end_pos = -1
     no_data_count = 0
 
+    # TODO Fix sporadic failure when polling for rings faster than ~0.1 seconds
     data_wait = 0.5
     no_data_wait = 0.5
 
@@ -746,7 +771,7 @@ async def tts_send_and_receive(socket_id, http_request, timeout=500, verbose=Tru
                     if result:
                         return result
 
-                    if no_data_count > 30:
+                    if no_data_count > (10/no_data_wait):
                         print("TTS timeout - no more data received")
                         break
 
@@ -776,7 +801,7 @@ async def tts_send_and_receive(socket_id, http_request, timeout=500, verbose=Tru
 
         except Exception as e:
             print(f"  TTS error: {e}")
-            await asyncio.sleep(0.5)
+            await asyncio.sleep(0.3)
 
     if response_data:
         print(f"Raw TTS response ({len(response_data)} bytes)")
@@ -837,12 +862,16 @@ async def gemini_tts(text, voice="Kore", verbose=False):
     """
 
     print("\n--- Gemini TTS API ---")
-    print(f"Text: {text[:100]}..." if len(text) > 100 else f"Text: {text}")
     print(f"Voice: {voice}")
 
     server = "generativelanguage.googleapis.com"
     port = 443
     uri = f"/v1beta/models/gemini-2.5-flash-preview-tts:generateContent?key={GEMINI_API_KEY}"
+
+    print("=" * 50)
+    print("TTS QUERY TEXT:\n")
+    print(f"{text}")
+    print("=" * 50)
 
     # Build TTS payload
     payload_dict = {
@@ -890,8 +919,8 @@ async def gemini_tts(text, voice="Kore", verbose=False):
 
     try:
         await modem.socket_close(ctx_id=socket_id)
-    except:
-        pass
+    except Exception as e:
+        print(f"Failed to close socket: {e}")
 
     if audio_b64:
         print(f"Received audio data: {len(audio_b64)} base64 chars")
@@ -951,9 +980,6 @@ async def setup():
 
     return True
 
-def make_fast(msg: str) -> str:
-    return "[extremely fast]" + msg
-
 async def audio_to_text() -> str:
     print("\nReady for Gemini audio queries!")
 
@@ -983,7 +1009,13 @@ async def audio_to_text() -> str:
     return response
 
 async def text_to_audio(msg) -> bool:
-    tts_audio, latency = await gemini_tts(msg)
+    # prompt = ("Say the following message in a fast but still comprehensible manner. "
+    #           "For example, how the side effects of drugs are read in an infomercial:\n")
+    prompt = "Say the following message in an extremely fast manner:\n"
+
+    text = prompt + msg
+
+    tts_audio, latency = await gemini_tts(text)
 
     if tts_audio is not None and latency > 1:
         print(f"Audio received from Gemini")
@@ -1002,12 +1034,9 @@ async def main():
         if not await setup():
             raise RuntimeError("Setup failed")
 
-        # a2t_rsp = await audio_to_text()
-
-        # TODO Remove hard coded message
-        hard_coded_msg = "Hi!"
-        fast_msg = make_fast(hard_coded_msg)
-        t2a_status = await text_to_audio(fast_msg)
+        a2t_rsp = await audio_to_text()
+        # a2t_rsp = "Hi, I am your agent here to help you."
+        t2a_status = await text_to_audio(a2t_rsp) # See tts_output.wav for result
 
         print("Program finished...\n\n\n")
 
