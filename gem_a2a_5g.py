@@ -403,9 +403,6 @@ async def send_and_receive(socket_id, http_request, timeout=120):
 async def setup_tls_socket(socket_id, server, port, tts=False):
     """Configure and connect a TLS socket optimized for LTE-M latency"""
 
-    # TODO Remove once done debugging
-    tts=False
-
     if not await modem.tls_config_profile(
             profile_id=1,
             tls_version=WalterModemTlsVersion.TLS_VERSION_12,
@@ -424,27 +421,6 @@ async def setup_tls_socket(socket_id, server, port, tts=False):
     ):
         print("Socket config failed")
         return False
-
-
-
-    if tts:
-        if not await modem.socket_config_extended(
-            ctx_id=socket_id,
-            ring_mode=WalterModemSocketRingMode.NORMAL,
-            recv_mode=WalterModemSocketRecvMode.TEXT_OR_RAW,
-            keepalive=60,
-            listen_auto_resp=False,
-            send_mode=WalterModemSocketSendMode.TEXT_OR_RAW
-        ):
-            print("Socket extended config failed")
-            return False
-    else:
-        # Set extended config back to default settings.
-        if not await modem.socket_config_extended(
-                ctx_id=socket_id
-        ):
-            print("Socked extended config failed")
-            return False
 
     if not await modem.socket_config_secure(
             ctx_id=socket_id,
@@ -739,7 +715,7 @@ async def _check_socket_closed(socket_id, response_data, verbose=False):
 
     return None
 
-async def tts_send_and_receive(socket_id, http_request, timeout=500, verbose=True):
+async def tts_send_and_receive(socket_id, http_request, timeout=500, verbose=False):
     """Socket send/receive for TTS, returns base64 audio data."""
     if not await _tts_send_request(socket_id, http_request):
         return None
@@ -751,16 +727,14 @@ async def tts_send_and_receive(socket_id, http_request, timeout=500, verbose=Tru
     header_end_pos = -1
     no_data_count = 0
 
-    # TODO Fix sporadic failure when polling for rings faster than ~0.1 seconds
-    data_wait = 0.5
-    no_data_wait = 0.5
+    data_wait = 0.0005
+    no_data_wait = 0.3
 
     start = time.ticks_ms()
 
     while time.ticks_diff(time.ticks_ms(), start) < (timeout * 1000):
         try:
             rings = modem.socket_context_states[socket_id].rings
-            print(f"Rings available: {len(rings) if rings else 0} | no_data_count: {no_data_count}")
 
             if not rings:
                 no_data_count += 1
@@ -783,7 +757,6 @@ async def tts_send_and_receive(socket_id, http_request, timeout=500, verbose=Tru
             payload = await _read_ring_data(socket_id, ring, verbose)
             if payload:
                 response_data += payload
-                print(f"  +{len(payload)} bytes (total: {len(response_data)})")
 
             # Detect content-length once headers arrive
             if content_length < 0:
@@ -914,7 +887,7 @@ async def gemini_tts(text, voice="Kore", verbose=False):
     print("Connected to Gemini TTS, sending request...")
 
     start_time = time.ticks_ms()
-    audio_b64 = await tts_send_and_receive(socket_id, http_request, timeout=1000, verbose=True)
+    audio_b64 = await tts_send_and_receive(socket_id, http_request, timeout=1000, verbose=verbose)
     latency = time.ticks_diff(time.ticks_ms(), start_time)
 
     try:
@@ -952,9 +925,8 @@ async def setup():
     print("\n" + "=" * 50)
     print("Walter - Gemini Audio-to-Audio (LTE-M Optimized)")
     print("=" * 50)
-    print("Settings: chunk=4096, delay=5ms, send_delay=0ms")
 
-    await modem.begin()
+    await modem.begin(uart_debug=False)
 
     if not await modem.check_comm():
         print("Modem failed!")
@@ -1035,7 +1007,7 @@ async def main():
             raise RuntimeError("Setup failed")
 
         a2t_rsp = await audio_to_text()
-        # a2t_rsp = "Hi, I am your agent here to help you."
+        # a2t_rsp = ("Hi, I'm your AI agent here to help you. This is an extended message to test long responses.")
         t2a_status = await text_to_audio(a2t_rsp) # See tts_output.wav for result
 
         print("Program finished...\n\n\n")
