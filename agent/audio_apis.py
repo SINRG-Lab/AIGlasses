@@ -170,7 +170,7 @@ class Gemini:
         _console.print("Connected to Gemini TTS, sending request...")
 
         t0 = time.ticks_ms()
-        audio_b64 = await self._tts_send_and_receive(sid, http_req, timeout=1000)
+        audio_b64 = await self._tts_send_and_receive(sid, http_req)
         latency = time.ticks_diff(time.ticks_ms(), t0)
 
         await self._safe_close(sid)
@@ -383,7 +383,7 @@ class Gemini:
             if recv_ms > 0:
                 _console.print(
                     f"Downloaded {response_len} bytes in {recv_ms}ms "
-                    f"({response_len * 8e-6 / (recv_ms / 1000):.3f} mbps)"
+                    f"({response_len * 8e-3 / (recv_ms / 1000):.1f} kbps)"
                 )
 
         if response_len:
@@ -393,6 +393,9 @@ class Gemini:
 
         del response_buf
         return None
+
+    async def _tts_send_and_receive_http(self):
+        pass
 
     # ============== SHARED SOCKET PRIMITIVES ==============
 

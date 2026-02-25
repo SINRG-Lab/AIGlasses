@@ -71,7 +71,7 @@ async def main():
     if not await lte_connect():
         raise RuntimeError("LTE-M connection failed")
 
-    gemini = Gemini(modem, modem_rsp, api_key=config['gemini_api_key'], verbosity=2)
+    gemini = Gemini(modem, modem_rsp, api_key=config['gemini_api_key'], verbosity=1)
 
     # text, latency = await gemini.a2t(config['audio_file'], config['audio_prompt'])
     # print(f"Transcription: {text} ({latency}ms)")
