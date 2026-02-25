@@ -126,7 +126,10 @@ void i2sSpkInit() {
   cfg.mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX);
   cfg.sample_rate = SPK_SR;
   cfg.bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT;
-  cfg.channel_format = I2S_CHANNEL_FMT_ONLY_LEFT;  // single amp wired with GAIN/LR=GND (left channel)
+  // Dual-speaker: AMP1 has LR/GAIN=GND (left slot), AMP2 has LR/GAIN=3.3V (right slot).
+  // RIGHT_LEFT sends both slots so each amp gets its channel.
+  // playSpeaker() interleaves mono samples as L=R so both amps play the same audio.
+  cfg.channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT;
   cfg.communication_format = I2S_COMM_FORMAT_I2S;
   cfg.intr_alloc_flags = ESP_INTR_FLAG_LEVEL1;
   // Larger DMA buffers prevent underruns (buzzing/clicks from buffer starvation).
@@ -172,13 +175,20 @@ void disableAmp() {
 }
 
 // ════════════════════════════════════════════════════════════════
-//  Play speaker (unchanged from WebSocket version)
+//  Stereo interleave chunk size (mono samples per pass)
+//  512 mono samples → 1024 int16 stereo values → 2048 bytes
+// ════════════════════════════════════════════════════════════════
+#define STEREO_CHUNK_MONO 512
+static int16_t stereoChunk[STEREO_CHUNK_MONO * 2];  // L+R interleaved
+
+// ════════════════════════════════════════════════════════════════
+//  Play speaker — dual-amp stereo (L=R=mono sample)
 // ════════════════════════════════════════════════════════════════
 void playSpeaker() {
   if (audioBufferLen == 0) return;
 
   float duration = (float)audioBufferLen / (SPK_SR * 2);
-  Serial.printf("[AUDIO] Playing %u bytes (%.2fs @ %dHz)\n",
+  Serial.printf("[AUDIO] Playing %u bytes (%.2fs @ %dHz) — dual speaker\n",
                 audioBufferLen, duration, SPK_SR);
 
   // Switch to speaker mode
@@ -186,28 +196,47 @@ void playSpeaker() {
   enableAmp();
   delay(50);
 
+  // audioBuffer holds 16-bit mono PCM. We must expand it to interleaved stereo
+  // (L sample, R sample) so both amps receive the audio:
+  //   AMP1 (LR/GAIN=GND)  reads the LEFT  slot → WS=LOW
+  //   AMP2 (LR/GAIN=3.3V) reads the RIGHT slot → WS=HIGH
+  // With I2S_CHANNEL_FMT_ONLY_LEFT only the left slot was driven; the right
+  // slot stayed at zero, giving AMP2 silence.
+  const int16_t* src = (const int16_t*)audioBuffer;
+  size_t totalMono = audioBufferLen / 2;  // number of 16-bit mono samples
   size_t offset = 0;
   size_t totalChunks = 0;
-  while (offset < audioBufferLen) {
-    size_t chunk = min((size_t)2048, audioBufferLen - offset);
+
+  while (offset < totalMono) {
+    size_t monoCount = min((size_t)STEREO_CHUNK_MONO, totalMono - offset);
+
+    // Interleave: stereoChunk[2i] = L, stereoChunk[2i+1] = R (same value)
+    for (size_t i = 0; i < monoCount; i++) {
+      int16_t s = src[offset + i];
+      stereoChunk[2 * i]     = s;  // LEFT  channel
+      stereoChunk[2 * i + 1] = s;  // RIGHT channel
+    }
+
+    size_t bytesToWrite = monoCount * 2 * sizeof(int16_t);
     size_t written = 0;
-    i2s_write(I2S_NUM_0, audioBuffer + offset, chunk, &written, portMAX_DELAY);
-    offset += chunk;
+    i2s_write(I2S_NUM_0, stereoChunk, bytesToWrite, &written, portMAX_DELAY);
+
+    offset += monoCount;
     totalChunks++;
 
     // Progress every 20%
-    if (totalChunks % ((audioBufferLen / 2048 / 5) + 1) == 0) {
-      float progress = (float)offset / audioBufferLen * 100.0f;
-      Serial.printf("[AUDIO] Playing... %.1f%% (%u/%u bytes)\n",
-                    progress, offset, audioBufferLen);
+    if (totalChunks % ((totalMono / STEREO_CHUNK_MONO / 5) + 1) == 0) {
+      float progress = (float)offset / totalMono * 100.0f;
+      Serial.printf("[AUDIO] Playing... %.1f%% (%u/%u samples)\n",
+                    progress, offset, totalMono);
     }
   }
 
   delay(100);
   disableAmp();
 
-  Serial.printf("[AUDIO] Playback complete! (%u bytes, %u chunks)\n",
-                audioBufferLen, totalChunks);
+  Serial.printf("[AUDIO] Playback complete! (%u mono samples, %u chunks)\n",
+                totalMono, totalChunks);
 
   // Switch back to mic
   i2sMicInit();
