@@ -444,11 +444,14 @@ class ModemCore:
                             self.__parser_data.raw_chunk_size = 0
 
                         if self.__parser_data.raw_chunk_size:
-                            self.__parser_data.line += b'\r'
-                            self.__parser_data.state = WalterModemRspParserState.RAW
-                        else:
-                            self.__parser_data.state = WalterModemRspParserState.START_CR
-                            await self._queue_rx_buffer()
+                            if (self.__parser_data.line.startswith(b'+SQNSRECV:')
+                                    or self.__parser_data.line.startswith(b'+SQNCOAPRCV:')
+                                    or self.__parser_data.line.startswith(b'<<<')):
+                                self.__parser_data.line += b'\r'
+                                self.__parser_data.state = WalterModemRspParserState.RAW
+                            else:
+                                self.__parser_data.state = WalterModemRspParserState.START_CR
+                                await self._queue_rx_buffer()
                     else:
                         # only now we know the \r was thrown away for no good reason
                         self.__parser_data.line += b'\r'
