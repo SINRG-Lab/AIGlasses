@@ -35,12 +35,15 @@
 static const int MIC_SR = 16000;
 static const int SPK_SR = 22050;
 static const int SAMPLES_PER_CHUNK = 512;
+// 32-bit read buffer: INMP441 packs 24-bit audio in upper bits of 32-bit I2S slot
+static int32_t micBuf32[SAMPLES_PER_CHUNK];
+// 16-bit output buffer sent over BLE
 static int16_t micBuf[SAMPLES_PER_CHUNK];
 
 // ════════════════════════════════════════════════════════════════
 //  Speaker buffer (accumulates TTS audio from Android)
 // ════════════════════════════════════════════════════════════════
-#define MAX_AUDIO_BUFFER (200 * 1024)
+#define MAX_AUDIO_BUFFER (160 * 1024)  // 160KB = ~3.6s @ 22050Hz 16-bit (ESP32-C6 RAM limit)
 static uint8_t audioBuffer[MAX_AUDIO_BUFFER];
 static volatile size_t audioBufferLen = 0;
 static volatile bool playAudio = false;
@@ -74,8 +77,11 @@ void i2sMicInit() {
   i2s_config_t cfg = {};
   cfg.mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX);
   cfg.sample_rate = MIC_SR;
-  cfg.bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT;
-  cfg.channel_format = I2S_CHANNEL_FMT_ONLY_RIGHT;  // INMP441 L/R=GND → right slot
+  // INMP441: 24-bit data packed in upper bits of 32-bit I2S slot.
+  // Read as 32-bit so we get the full slot, then shift down in software.
+  cfg.bits_per_sample = I2S_BITS_PER_SAMPLE_32BIT;
+  // INMP441 L/R pin tied to GND → outputs on LEFT channel (WS=LOW).
+  cfg.channel_format = I2S_CHANNEL_FMT_ONLY_LEFT;
   cfg.communication_format = I2S_COMM_FORMAT_I2S;
   cfg.intr_alloc_flags = ESP_INTR_FLAG_LEVEL1;
   cfg.dma_buf_count = 8;
@@ -113,20 +119,22 @@ void i2sMicInit() {
 void i2sSpkInit() {
   if (currentI2SMode != MODE_NONE) {
     i2s_driver_uninstall(I2S_NUM_0);
-    delay(50);
+    delay(20);
   }
 
   i2s_config_t cfg = {};
   cfg.mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX);
   cfg.sample_rate = SPK_SR;
   cfg.bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT;
-  cfg.channel_format = I2S_CHANNEL_FMT_ONLY_LEFT;
+  cfg.channel_format = I2S_CHANNEL_FMT_ONLY_LEFT;  // single amp wired with GAIN/LR=GND (left channel)
   cfg.communication_format = I2S_COMM_FORMAT_I2S;
   cfg.intr_alloc_flags = ESP_INTR_FLAG_LEVEL1;
-  cfg.dma_buf_count = 8;
-  cfg.dma_buf_len = 512;
-  cfg.use_apll = false;
-  cfg.tx_desc_auto_clear = true;
+  // Larger DMA buffers prevent underruns (buzzing/clicks from buffer starvation).
+  // 16 bufs × 1024 samples = 16384 samples @ 22050Hz ≈ 743ms headroom.
+  cfg.dma_buf_count = 16;
+  cfg.dma_buf_len = 1024;
+  cfg.use_apll = true;   // APLL gives a cleaner, jitter-free I2S clock → less distortion
+  cfg.tx_desc_auto_clear = true;  // Fill underrun slots with silence, not garbage
   cfg.fixed_mclk = 0;
 
   i2s_pin_config_t pins = {};
@@ -178,14 +186,13 @@ void playSpeaker() {
   enableAmp();
   delay(50);
 
-  // Play audio with progress reporting
   size_t offset = 0;
   size_t totalChunks = 0;
   while (offset < audioBufferLen) {
     size_t chunk = min((size_t)2048, audioBufferLen - offset);
     size_t written = 0;
     i2s_write(I2S_NUM_0, audioBuffer + offset, chunk, &written, portMAX_DELAY);
-    offset += written;
+    offset += chunk;
     totalChunks++;
 
     // Progress every 20%
@@ -379,10 +386,10 @@ void setup() {
     NIMBLE_PROPERTY::NOTIFY
   );
 
-  // Audio RX: Android TTS → ESP32 speaker (WRITE without response for speed)
+  // Audio RX: Android TTS → ESP32 speaker (WRITE with response for reliable pacing)
   pAudioRxChar = pService->createCharacteristic(
     CHAR_AUDIO_RX_UUID,
-    NIMBLE_PROPERTY::WRITE_NR
+    NIMBLE_PROPERTY::WRITE
   );
   pAudioRxChar->setCallbacks(new AudioRxCallbacks());
 
@@ -456,13 +463,35 @@ void loop() {
   }
   wasPressed = true;
 
-  // Read mic audio via I2S
-  size_t bytesRead = 0;
-  esp_err_t ok = i2s_read(I2S_NUM_0, micBuf, sizeof(micBuf), &bytesRead, 20 / portTICK_PERIOD_MS);
-  if (ok != ESP_OK || bytesRead == 0) return;
+  // Read mic audio via I2S as 32-bit (INMP441 packs 24-bit in upper bits of 32-bit slot)
+  size_t bytesRead32 = 0;
+  esp_err_t ok = i2s_read(I2S_NUM_0, micBuf32, sizeof(micBuf32), &bytesRead32, 20 / portTICK_PERIOD_MS);
+  if (ok != ESP_OK || bytesRead32 == 0) return;
 
-  // Send mic audio to Android via BLE NOTIFY
-  sendMicChunkViaBLE((uint8_t*)micBuf, bytesRead);
+  // Downshift: take bits [31:16] of each 32-bit sample → 16-bit signed PCM
+  int samples = bytesRead32 / 4;
+  for (int i = 0; i < samples; i++) {
+    micBuf[i] = (int16_t)(micBuf32[i] >> 16);
+  }
+  size_t bytesOut = samples * 2;  // 16-bit output size
+
+  // Debug: print mic amplitude every 20 chunks to check signal
+  static int debugChunk = 0;
+  if (++debugChunk % 20 == 0) {
+    int16_t minVal = 32767, maxVal = -32768;
+    long sum = 0;
+    for (int i = 0; i < samples; i++) {
+      int16_t s = micBuf[i];
+      if (s < minVal) minVal = s;
+      if (s > maxVal) maxVal = s;
+      sum += abs(s);
+    }
+    Serial.printf("[MIC] min=%d max=%d avgAmp=%ld (samples=%d)\n",
+                  minVal, maxVal, sum / samples, samples);
+  }
+
+  // Send 16-bit PCM to Android via BLE NOTIFY
+  sendMicChunkViaBLE((uint8_t*)micBuf, bytesOut);
 
   delay(1);
 }
