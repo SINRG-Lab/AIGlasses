@@ -1,4 +1,7 @@
 import asyncio
+
+import micropython
+
 from walter_modem import Modem
 from walter_modem.mixins.socket import SocketMixin
 from walter_modem.mixins.tls_certs import TLSCertsMixin
@@ -8,7 +11,9 @@ from walter_modem.mixins.default_pdp import *
 from walter_modem.coreEnums import WalterModemNetworkRegState, WalterModemOpState
 
 from helpers import load_config, save_wav
-from audio_apis import Gemini
+from audio_apis import Gemini, Deepgram
+
+micropython.opt_level(1)
 
 modem = Modem(SocketMixin, TLSCertsMixin, load_default_power_saving_mixin=False)
 modem_rsp = WalterModemRsp()
@@ -71,17 +76,31 @@ async def main():
     if not await lte_connect():
         raise RuntimeError("LTE-M connection failed")
 
-    gemini = Gemini(modem, modem_rsp, api_key=config['gemini_api_key'], verbosity=1)
+    deepgram = Deepgram(
+        modem=modem,
+        modem_rsp=modem_rsp,
+        api_key=config["deepgram_api_key"],
+        verbosity=1,
+        socket_id=3,
+    )
 
-    # text, latency = await gemini.a2t(config['audio_file'], config['audio_prompt'])
-    # print(f"Transcription: {text} ({latency}ms)")
-    text = "Who was the first president of the United States of America?"
-    wav_bytes, latency = await gemini.t2a(f"Say this fast:\n{text}")
-    print("Audio received\n"
-        f"    Data:                {len(wav_bytes)}B\n"
-        f"    Latency:             {latency}ms\n"
+    wav_bytes, latency = await deepgram.a2a(
+        audio_file="msg_tiny.wav",
+        prompt="You are a helpful assistant. Be concise.",
+        voice="aura-2-thalia-en",
+        think_provider="open_ai",
+        think_model="gpt-4o-mini",
+        input_sample_rate=16000,
+        output_sample_rate=8000,
+        output_encoding="mulaw"
     )
     if wav_bytes:
+        print("Audio received\n"
+              f"    Data:                {len(wav_bytes)}B\n"
+              f"    Latency:             {latency}ms\n"
+              )
         await save_wav(wav_bytes, "/tts_output.wav")
+    else:
+        print(f"No audio received (latency: {latency}ms)")
 
 asyncio.run(main())
