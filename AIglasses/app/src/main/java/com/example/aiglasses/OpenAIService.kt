@@ -22,6 +22,7 @@ class OpenAIService(private val apiKey: String) {
     companion object {
         private const val WHISPER_URL = "https://api.openai.com/v1/audio/transcriptions"
         private const val CHAT_URL = "https://api.openai.com/v1/chat/completions"
+        private const val TTS_URL = "https://api.openai.com/v1/audio/speech"
         private const val SYSTEM_PROMPT =
             "You are a helpful voice assistant for smart glasses. " +
             "Keep answers short (1-2 sentences). " +
@@ -104,5 +105,34 @@ class OpenAIService(private val apiKey: String) {
             .getJSONObject("message")
             .getString("content")
             .trim()
+    }
+
+    /**
+     * Synthesize speech using OpenAI TTS API.
+     * @param text The text to speak
+     * @return Raw MP3 bytes
+     */
+    fun speak(text: String): ByteArray {
+        val json = JSONObject().apply {
+            put("model", "tts-1")
+            put("input", text)
+            put("voice", "nova")
+        }
+
+        val request = Request.Builder()
+            .url(TTS_URL)
+            .header("Authorization", "Bearer $apiKey")
+            .header("Content-Type", "application/json")
+            .post(json.toString().toRequestBody("application/json".toMediaType()))
+            .build()
+
+        val response = client.newCall(request).execute()
+
+        if (!response.isSuccessful) {
+            val errorBody = response.body?.string() ?: "no body"
+            throw Exception("TTS API error ${response.code}: $errorBody")
+        }
+
+        return response.body?.bytes() ?: throw Exception("Empty TTS response")
     }
 }

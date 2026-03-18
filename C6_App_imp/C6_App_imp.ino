@@ -110,6 +110,14 @@ void i2sMicInit() {
   }
 
   i2s_zero_dma_buffer(I2S_NUM_0);
+
+  // AMP_DIN is not driven by I2S in RX mode — pin floats.
+  // MAX98357A still sees BCLK/WS (shared bus) so it stays awake
+  // and reads random noise from the floating DIN → buzzing.
+  // Force DIN LOW so the amp reads silence while mic is active.
+  pinMode(AMP_DIN, OUTPUT);
+  digitalWrite(AMP_DIN, LOW);
+
   currentI2SMode = MODE_MIC;
 }
 
@@ -196,30 +204,48 @@ void playSpeaker() {
   enableAmp();
   delay(50);
 
-  // audioBuffer holds 16-bit mono PCM. We must expand it to interleaved stereo
-  // (L sample, R sample) so both amps receive the audio:
-  //   AMP1 (LR/GAIN=GND)  reads the LEFT  slot → WS=LOW
-  //   AMP2 (LR/GAIN=3.3V) reads the RIGHT slot → WS=HIGH
-  // With I2S_CHANNEL_FMT_ONLY_LEFT only the left slot was driven; the right
-  // slot stayed at zero, giving AMP2 silence.
   const int16_t* src = (const int16_t*)audioBuffer;
-  size_t totalMono = audioBufferLen / 2;  // number of 16-bit mono samples
+  size_t totalMono = audioBufferLen / 2;
   size_t offset = 0;
   size_t totalChunks = 0;
+
+  // Debug: check first 8 mono samples for DC offset / clipping
+  {
+    int16_t minVal = 32767, maxVal = -32768;
+    long sum = 0;
+    size_t checkCount = min(totalMono, (size_t)1000);
+    for (size_t i = 0; i < checkCount; i++) {
+      int16_t s = src[i];
+      if (s < minVal) minVal = s;
+      if (s > maxVal) maxVal = s;
+      sum += s;  // signed sum for DC offset check
+    }
+    long dcOffset = sum / (long)checkCount;
+    Serial.printf("[DEBUG] First %u samples: min=%d max=%d DC_offset=%ld\n",
+                  checkCount, minVal, maxVal, dcOffset);
+    if (abs(dcOffset) > 500) {
+      Serial.println("[DEBUG] WARNING: significant DC offset detected — may cause buzzing!");
+    }
+  }
 
   while (offset < totalMono) {
     size_t monoCount = min((size_t)STEREO_CHUNK_MONO, totalMono - offset);
 
-    // Interleave: stereoChunk[2i] = L, stereoChunk[2i+1] = R (same value)
+    // Interleave: L=R for dual MAX98357A
     for (size_t i = 0; i < monoCount; i++) {
       int16_t s = src[offset + i];
-      stereoChunk[2 * i]     = s;  // LEFT  channel
-      stereoChunk[2 * i + 1] = s;  // RIGHT channel
+      stereoChunk[2 * i]     = s;  // LEFT  channel (AMP1)
+      stereoChunk[2 * i + 1] = s;  // RIGHT channel (AMP2)
     }
 
     size_t bytesToWrite = monoCount * 2 * sizeof(int16_t);
     size_t written = 0;
     i2s_write(I2S_NUM_0, stereoChunk, bytesToWrite, &written, portMAX_DELAY);
+
+    if (totalChunks == 0 && written != bytesToWrite) {
+      Serial.printf("[DEBUG] First chunk: requested %u bytes, wrote %u\n",
+                    bytesToWrite, written);
+    }
 
     offset += monoCount;
     totalChunks++;
