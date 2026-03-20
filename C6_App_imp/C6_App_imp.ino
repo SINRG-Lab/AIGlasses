@@ -41,13 +41,84 @@ static int32_t micBuf32[SAMPLES_PER_CHUNK];
 static int16_t micBuf[SAMPLES_PER_CHUNK];
 
 // ════════════════════════════════════════════════════════════════
-//  Speaker buffer (accumulates TTS audio from Android)
+//  Ring Buffer for streaming playback
+//  BLE callback (NimBLE task) writes → main loop reads → I2S
+//  Single producer, single consumer = lock-free with volatile indices
 // ════════════════════════════════════════════════════════════════
-#define MAX_AUDIO_BUFFER (160 * 1024)  // 160KB = ~3.7s @ 22050Hz 16-bit (C6 RAM limit)
-static uint8_t audioBuffer[MAX_AUDIO_BUFFER];
-static volatile size_t audioBufferLen = 0;
-static volatile bool playAudio = false;
-static unsigned int chunkCount = 0;
+#define RING_SIZE (160 * 1024)   // 160KB ring buffer
+static uint8_t ringBuffer[RING_SIZE];
+static volatile size_t ringHead = 0;   // Write position (BLE task)
+static volatile size_t ringTail = 0;   // Read position  (main loop)
+
+// How much data is available to read
+static inline size_t ringAvailable() {
+  size_t h = ringHead;
+  size_t t = ringTail;
+  return (h >= t) ? (h - t) : (RING_SIZE - t + h);
+}
+
+// How much free space for writing
+static inline size_t ringFree() {
+  return RING_SIZE - 1 - ringAvailable();  // -1 to distinguish full from empty
+}
+
+// Write data into ring buffer (called from BLE task)
+static size_t ringWrite(const uint8_t* data, size_t len) {
+  size_t free = ringFree();
+  if (len > free) len = free;  // Drop excess if ring is full
+  if (len == 0) return 0;
+
+  size_t h = ringHead;
+  size_t firstPart = RING_SIZE - h;
+  if (firstPart >= len) {
+    memcpy(ringBuffer + h, data, len);
+  } else {
+    memcpy(ringBuffer + h, data, firstPart);
+    memcpy(ringBuffer, data + firstPart, len - firstPart);
+  }
+  ringHead = (h + len) % RING_SIZE;
+  return len;
+}
+
+// Read data from ring buffer (called from main loop)
+static size_t ringRead(uint8_t* dst, size_t maxLen) {
+  size_t avail = ringAvailable();
+  size_t len = (maxLen < avail) ? maxLen : avail;
+  if (len == 0) return 0;
+
+  size_t t = ringTail;
+  size_t firstPart = RING_SIZE - t;
+  if (firstPart >= len) {
+    memcpy(dst, ringBuffer + t, len);
+  } else {
+    memcpy(dst, ringBuffer + t, firstPart);
+    memcpy(dst + firstPart, ringBuffer, len - firstPart);
+  }
+  ringTail = (t + len) % RING_SIZE;
+  return len;
+}
+
+// Reset ring buffer
+static void ringReset() {
+  ringHead = 0;
+  ringTail = 0;
+}
+
+// ════════════════════════════════════════════════════════════════
+//  Streaming playback state machine
+// ════════════════════════════════════════════════════════════════
+enum StreamState {
+  STREAM_IDLE,       // Waiting — mic mode active
+  STREAM_BUFFERING,  // Start marker received, accumulating initial data
+  STREAM_PLAYING,    // I2S speaker active, playing from ring buffer
+  STREAM_DRAINING    // End marker received, playing remaining data
+};
+static volatile StreamState streamState = STREAM_IDLE;
+static volatile bool endMarkerReceived = false;
+
+// Minimum bytes before starting playback (~185ms of audio at 22050Hz)
+// Gives headroom for I2S mode switch (~70ms) + jitter
+#define STREAM_START_THRESHOLD  8192
 
 // ════════════════════════════════════════════════════════════════
 //  I2S mode tracking (ESP32-C6 has only 1 I2S peripheral)
@@ -66,13 +137,18 @@ static volatile bool deviceConnected = false;
 static uint8_t txSeqNum = 0;
 
 // ════════════════════════════════════════════════════════════════
+//  Stats for debugging
+// ════════════════════════════════════════════════════════════════
+static unsigned int rxChunkCount = 0;
+static unsigned int rxTotalBytes = 0;
+static unsigned int rxDroppedBytes = 0;
+static unsigned int rxLostPackets = 0;
+
+// ════════════════════════════════════════════════════════════════
 //  I2S init: Mic (RX) on I2S0
 // ════════════════════════════════════════════════════════════════
 void i2sMicInit() {
-  // CRITICAL: Force AMP_DIN LOW *before* tearing down I2S driver.
-  // When i2s_driver_uninstall() releases the I2S pin mux, AMP_DIN would
-  // float for ~50ms. The MAX98357A reads that as noise → loud buzz.
-  // By claiming the pin as GPIO OUTPUT LOW first, it stays silent during teardown.
+  // Force AMP_DIN LOW before teardown to prevent floating pin buzz
   pinMode(AMP_DIN, OUTPUT);
   digitalWrite(AMP_DIN, LOW);
 
@@ -84,10 +160,7 @@ void i2sMicInit() {
   i2s_config_t cfg = {};
   cfg.mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX);
   cfg.sample_rate = MIC_SR;
-  // INMP441: 24-bit data packed in upper bits of 32-bit I2S slot.
-  // Read as 32-bit so we get the full slot, then shift down in software.
   cfg.bits_per_sample = I2S_BITS_PER_SAMPLE_32BIT;
-  // INMP441 L/R pin tied to GND → outputs on LEFT channel (WS=LOW).
   cfg.channel_format = I2S_CHANNEL_FMT_ONLY_LEFT;
   cfg.communication_format = I2S_COMM_FORMAT_I2S;
   cfg.intr_alloc_flags = ESP_INTR_FLAG_LEVEL1;
@@ -105,22 +178,15 @@ void i2sMicInit() {
 
   Serial.println("[I2S] Installing MIC driver...");
   esp_err_t e = i2s_driver_install(I2S_NUM_0, &cfg, 0, NULL);
-  if (e != ESP_OK) {
-    Serial.printf("[I2S] MIC install failed: %d\n", (int)e);
-  }
+  if (e != ESP_OK) Serial.printf("[I2S] MIC install failed: %d\n", (int)e);
 
   e = i2s_set_pin(I2S_NUM_0, &pins);
-  if (e != ESP_OK) {
-    Serial.printf("[I2S] MIC pins failed: %d\n", (int)e);
-  } else {
-    Serial.println("[I2S] MIC configured OK");
-  }
+  if (e != ESP_OK) Serial.printf("[I2S] MIC pins failed: %d\n", (int)e);
+  else Serial.println("[I2S] MIC configured OK");
 
   i2s_zero_dma_buffer(I2S_NUM_0);
 
-  // Re-assert AMP_DIN LOW after mic I2S install (belt-and-suspenders).
-  // The primary protection is at the top of this function, but the
-  // i2s_set_pin call above may have briefly touched AMP_DIN's mux.
+  // Re-assert AMP_DIN LOW after pin mux setup
   pinMode(AMP_DIN, OUTPUT);
   digitalWrite(AMP_DIN, LOW);
 
@@ -140,18 +206,13 @@ void i2sSpkInit() {
   cfg.mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX);
   cfg.sample_rate = SPK_SR;
   cfg.bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT;
-  // Dual-speaker: AMP1 has LR/GAIN=GND (left slot), AMP2 has LR/GAIN=3.3V (right slot).
-  // RIGHT_LEFT sends both slots so each amp gets its channel.
-  // playSpeaker() interleaves mono samples as L=R so both amps play the same audio.
   cfg.channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT;
   cfg.communication_format = I2S_COMM_FORMAT_I2S;
   cfg.intr_alloc_flags = ESP_INTR_FLAG_LEVEL1;
-  // Larger DMA buffers prevent underruns (buzzing/clicks from buffer starvation).
-  // 16 bufs × 1024 samples = 16384 samples @ 22050Hz ≈ 743ms headroom.
   cfg.dma_buf_count = 16;
   cfg.dma_buf_len = 1024;
-  cfg.use_apll = false;  // APLL disabled — C6 APLL can buzz at 22050Hz; test without
-  cfg.tx_desc_auto_clear = true;  // Fill underrun slots with silence, not garbage
+  cfg.use_apll = false;
+  cfg.tx_desc_auto_clear = true;
   cfg.fixed_mclk = 0;
 
   i2s_pin_config_t pins = {};
@@ -162,16 +223,11 @@ void i2sSpkInit() {
 
   Serial.println("[I2S] Installing SPEAKER driver...");
   esp_err_t e = i2s_driver_install(I2S_NUM_0, &cfg, 0, NULL);
-  if (e != ESP_OK) {
-    Serial.printf("[I2S] SPK install failed: %d\n", (int)e);
-  }
+  if (e != ESP_OK) Serial.printf("[I2S] SPK install failed: %d\n", (int)e);
 
   e = i2s_set_pin(I2S_NUM_0, &pins);
-  if (e != ESP_OK) {
-    Serial.printf("[I2S] SPK pins failed: %d\n", (int)e);
-  } else {
-    Serial.println("[I2S] SPEAKER configured OK");
-  }
+  if (e != ESP_OK) Serial.printf("[I2S] SPK pins failed: %d\n", (int)e);
+  else Serial.println("[I2S] SPEAKER configured OK");
 
   i2s_zero_dma_buffer(I2S_NUM_0);
   currentI2SMode = MODE_SPEAKER;
@@ -180,136 +236,125 @@ void i2sSpkInit() {
 // ════════════════════════════════════════════════════════════════
 //  Amplifier control (no SD_MODE pin — amp always on)
 // ════════════════════════════════════════════════════════════════
-void enableAmp() {
-  Serial.println("[AMP] Ready");
-}
-
-void disableAmp() {
-  // No SD_MODE pin wired — amp stays on
-}
+void enableAmp() { Serial.println("[AMP] Ready"); }
+void disableAmp() { /* No SD_MODE pin wired */ }
 
 // ════════════════════════════════════════════════════════════════
-//  Stereo interleave chunk size (mono samples per pass)
-//  512 mono samples → 1024 int16 stereo values → 2048 bytes
+//  Stereo interleave buffer
+//  512 mono samples → 1024 int16 stereo → 2048 bytes per I2S write
 // ════════════════════════════════════════════════════════════════
 #define STEREO_CHUNK_MONO 512
-static int16_t stereoChunk[STEREO_CHUNK_MONO * 2];  // L+R interleaved
+static int16_t stereoChunk[STEREO_CHUNK_MONO * 2];
+// Temp buffer to read mono PCM bytes from ring buffer
+static uint8_t monoReadBuf[STEREO_CHUNK_MONO * 2];  // 1024 bytes
 
 // ════════════════════════════════════════════════════════════════
-//  Play speaker — dual-amp stereo (L=R=mono sample)
+//  Streaming playback — called repeatedly from loop()
+//  Reads from ring buffer, interleaves to stereo, writes to I2S
 // ════════════════════════════════════════════════════════════════
-void playSpeaker() {
-  if (audioBufferLen == 0) return;
+void streamPlaybackTick() {
+  size_t avail = ringAvailable();
 
-  // Safety: ensure buffer length is even (16-bit sample alignment)
-  if (audioBufferLen % 2 != 0) {
-    Serial.printf("[AUDIO] WARNING: odd buffer length %u — trimming 1 byte\n",
-                  (unsigned int)audioBufferLen);
-    audioBufferLen--;
+  // ── BUFFERING: wait for enough data before switching to speaker ──
+  if (streamState == STREAM_BUFFERING) {
+    if (avail >= STREAM_START_THRESHOLD || (endMarkerReceived && avail > 0)) {
+      Serial.printf("[STREAM] Starting playback (%u bytes buffered)\n", avail);
+
+      // Switch I2S to speaker mode
+      i2sSpkInit();
+      enableAmp();
+      delay(30);  // Let amp stabilize
+
+      streamState = STREAM_PLAYING;
+    }
+    return;
   }
 
-  float duration = (float)audioBufferLen / (SPK_SR * 2);
-  Serial.printf("[AUDIO] Playing %u bytes (%.2fs @ %dHz) — dual speaker\n",
-                audioBufferLen, duration, SPK_SR);
+  // ── PLAYING / DRAINING: feed ring buffer data to I2S ──
+  if (streamState == STREAM_PLAYING || streamState == STREAM_DRAINING) {
 
-  // Switch to speaker mode
-  i2sSpkInit();
-  enableAmp();
-  delay(50);
-
-  const int16_t* src = (const int16_t*)audioBuffer;
-  size_t totalMono = audioBufferLen / 2;
-  size_t offset = 0;
-  size_t totalChunks = 0;
-
-  // Debug: check first 8 mono samples for DC offset / clipping
-  {
-    int16_t minVal = 32767, maxVal = -32768;
-    long sum = 0;
-    size_t checkCount = min(totalMono, (size_t)1000);
-    for (size_t i = 0; i < checkCount; i++) {
-      int16_t s = src[i];
-      if (s < minVal) minVal = s;
-      if (s > maxVal) maxVal = s;
-      sum += s;  // signed sum for DC offset check
-    }
-    long dcOffset = sum / (long)checkCount;
-    Serial.printf("[DEBUG] First %u samples: min=%d max=%d DC_offset=%ld\n",
-                  checkCount, minVal, maxVal, dcOffset);
-    if (abs(dcOffset) > 500) {
-      Serial.println("[DEBUG] WARNING: significant DC offset detected — may cause buzzing!");
-    }
-  }
-
-  // Apply fade-out to last ~50ms of audio to avoid abrupt cutoff → pop/buzz.
-  // 50ms @ 22050Hz = 1102 samples. Linearly ramp down to zero.
-  {
-    const size_t FADE_SAMPLES = min(totalMono, (size_t)1102);
-    int16_t* mutSrc = (int16_t*)src;  // safe — audioBuffer is ours
-    size_t fadeStart = totalMono - FADE_SAMPLES;
-    for (size_t i = 0; i < FADE_SAMPLES; i++) {
-      float gain = 1.0f - ((float)i / (float)FADE_SAMPLES);
-      mutSrc[fadeStart + i] = (int16_t)(mutSrc[fadeStart + i] * gain);
-    }
-    Serial.printf("[AUDIO] Applied fade-out on last %u samples (~%dms)\n",
-                  FADE_SAMPLES, (int)(FADE_SAMPLES * 1000 / SPK_SR));
-  }
-
-  while (offset < totalMono) {
-    size_t monoCount = min((size_t)STEREO_CHUNK_MONO, totalMono - offset);
-
-    // Interleave: L=R for dual MAX98357A
-    for (size_t i = 0; i < monoCount; i++) {
-      int16_t s = src[offset + i];
-      stereoChunk[2 * i]     = s;  // LEFT  channel (AMP1)
-      stereoChunk[2 * i + 1] = s;  // RIGHT channel (AMP2)
+    // If end marker received, transition to draining
+    if (streamState == STREAM_PLAYING && endMarkerReceived) {
+      streamState = STREAM_DRAINING;
+      Serial.printf("[STREAM] End marker received — draining %u remaining bytes\n", avail);
     }
 
-    size_t bytesToWrite = monoCount * 2 * sizeof(int16_t);
+    // Read a chunk of mono PCM from ring buffer
+    size_t wantBytes = STEREO_CHUNK_MONO * 2;  // 1024 bytes = 512 mono samples
+
+    if (avail >= wantBytes) {
+      // Full chunk available
+      ringRead(monoReadBuf, wantBytes);
+    } else if (streamState == STREAM_DRAINING && avail > 0) {
+      // Partial final chunk — pad remainder with silence
+      size_t got = avail & ~1;  // Ensure even byte count (16-bit alignment)
+      if (got == 0) goto finish;
+      ringRead(monoReadBuf, got);
+      memset(monoReadBuf + got, 0, wantBytes - got);  // Silence pad
+      wantBytes = got;  // Only interleave actual + padded data
+      // We'll mark this as the last chunk below
+    } else if (streamState == STREAM_DRAINING && avail == 0) {
+      // All data played — finish up
+      goto finish;
+    } else {
+      // Waiting for more data from BLE — write silence to prevent DMA underrun
+      memset(stereoChunk, 0, sizeof(stereoChunk));
+      size_t written = 0;
+      i2s_write(I2S_NUM_0, stereoChunk, sizeof(stereoChunk), &written, 10 / portTICK_PERIOD_MS);
+      return;
+    }
+
+    // Interleave mono → stereo (L=R for dual MAX98357A)
+    const int16_t* monoSrc = (const int16_t*)monoReadBuf;
+    size_t monoSamples = wantBytes / 2;
+    for (size_t i = 0; i < monoSamples; i++) {
+      stereoChunk[2 * i]     = monoSrc[i];  // LEFT
+      stereoChunk[2 * i + 1] = monoSrc[i];  // RIGHT
+    }
+
+    // Write stereo data to I2S (blocking — DMA will pace us)
+    size_t bytesToWrite = monoSamples * 2 * sizeof(int16_t);
     size_t written = 0;
     i2s_write(I2S_NUM_0, stereoChunk, bytesToWrite, &written, portMAX_DELAY);
 
-    if (totalChunks == 0 && written != bytesToWrite) {
-      Serial.printf("[DEBUG] First chunk: requested %u bytes, wrote %u\n",
-                    bytesToWrite, written);
+    // If this was a partial chunk in drain mode, we're done
+    if (streamState == STREAM_DRAINING && ringAvailable() == 0) {
+      goto finish;
     }
-
-    offset += monoCount;
-    totalChunks++;
-
-    // Progress every 20%
-    if (totalChunks % ((totalMono / STEREO_CHUNK_MONO / 5) + 1) == 0) {
-      float progress = (float)offset / totalMono * 100.0f;
-      Serial.printf("[AUDIO] Playing... %.1f%% (%u/%u samples)\n",
-                    progress, offset, totalMono);
-    }
+    return;
   }
+  return;
 
-  // Flush DMA: write 8 silence chunks to fully drain the DMA pipeline,
-  // then stop I2S cleanly before switching to mic mode.
+finish:
+  // ── Playback complete — flush DMA with silence, switch to mic ──
+  Serial.printf("[STREAM] Playback complete! (received %u bytes, %u chunks, dropped %u, lost pkts %u)\n",
+                rxTotalBytes, rxChunkCount, rxDroppedBytes, rxLostPackets);
+
+  // Fade would be ideal but we've already written the data — instead,
+  // flush with silence to drain the DMA pipeline cleanly
   memset(stereoChunk, 0, sizeof(stereoChunk));
   for (int i = 0; i < 8; i++) {
     size_t written = 0;
     i2s_write(I2S_NUM_0, stereoChunk, sizeof(stereoChunk), &written, portMAX_DELAY);
   }
-  delay(200);        // Let the silence play out through DMA
-  i2s_stop(I2S_NUM_0);  // Stop I2S cleanly before teardown
+  delay(200);
+  i2s_stop(I2S_NUM_0);
 
-  // Immediately claim AMP_DIN as GPIO LOW after stopping I2S.
-  // This prevents the pin from floating when i2sMicInit() uninstalls the driver.
+  // Claim AMP_DIN LOW before driver teardown
   pinMode(AMP_DIN, OUTPUT);
   digitalWrite(AMP_DIN, LOW);
-  disableAmp();
-
-  Serial.printf("[AUDIO] Playback complete! (%u mono samples, %u chunks)\n",
-                totalMono, totalChunks);
 
   // Switch back to mic
   i2sMicInit();
 
-  // Clear buffer
-  audioBufferLen = 0;
-  chunkCount = 0;
+  // Reset state
+  streamState = STREAM_IDLE;
+  endMarkerReceived = false;
+  ringReset();
+  rxChunkCount = 0;
+  rxTotalBytes = 0;
+  rxDroppedBytes = 0;
+  rxLostPackets = 0;
 }
 
 // ════════════════════════════════════════════════════════════════
@@ -319,20 +364,16 @@ class ServerCallbacks : public NimBLEServerCallbacks {
   void onConnect(NimBLEServer* pServer, NimBLEConnInfo& connInfo) override {
     deviceConnected = true;
     Serial.println("\n[BLE] Android connected!");
-
-    // Request fast connection parameters for audio streaming
-    // Min interval=7.5ms(6), Max=15ms(12), Latency=0, Timeout=5s(500)
     pServer->updateConnParams(connInfo.getConnHandle(), 6, 12, 0, 500);
     Serial.println("[BLE] Requested fast connection parameters");
   }
 
   void onDisconnect(NimBLEServer* pServer, NimBLEConnInfo& connInfo, int reason) override {
     deviceConnected = false;
-    audioBufferLen = 0;
-    chunkCount = 0;
+    streamState = STREAM_IDLE;
+    endMarkerReceived = false;
+    ringReset();
     Serial.printf("[BLE] Android disconnected (reason=%d)\n", reason);
-
-    // Restart advertising so Android can reconnect
     NimBLEDevice::startAdvertising();
     Serial.println("[BLE] Advertising restarted, waiting for reconnection...");
   }
@@ -344,10 +385,10 @@ class ServerCallbacks : public NimBLEServerCallbacks {
 
 // ════════════════════════════════════════════════════════════════
 //  Audio RX Callback (Android → ESP32 speaker data)
+//  Runs on NimBLE task — writes to ring buffer
 // ════════════════════════════════════════════════════════════════
 class AudioRxCallbacks : public NimBLECharacteristicCallbacks {
   uint8_t expectedSeq = 0;
-  unsigned int lostPackets = 0;
 
   void onWrite(NimBLECharacteristic* pChar, NimBLEConnInfo& connInfo) override {
     NimBLEAttValue val = pChar->getValue();
@@ -362,32 +403,32 @@ class AudioRxCallbacks : public NimBLECharacteristicCallbacks {
 
     if (tag == 'A' && payloadLen > 0) {
       // Sequence number tracking — detect packet loss from WRITE_NR
-      if (chunkCount > 0 && seq != expectedSeq) {
-        uint8_t gap = (seq - expectedSeq);  // wraps correctly for uint8_t
-        lostPackets += gap;
-        Serial.printf("[BLE-RX] SEQ gap: expected %u got %u (lost ~%u pkts, total lost: %u)\n",
-                      expectedSeq, seq, gap, lostPackets);
+      if (rxChunkCount > 0 && seq != expectedSeq) {
+        uint8_t gap = (seq - expectedSeq);
+        rxLostPackets += gap;
+        Serial.printf("[BLE-RX] SEQ gap: expected %u got %u (lost ~%u pkts)\n",
+                      expectedSeq, seq, (unsigned int)gap);
       }
       expectedSeq = seq + 1;
 
-      // Append audio fragment to speaker buffer
-      if (audioBufferLen + payloadLen <= MAX_AUDIO_BUFFER) {
-        memcpy(audioBuffer + audioBufferLen, payload, payloadLen);
-        audioBufferLen += payloadLen;
-        chunkCount++;
+      // Write to ring buffer
+      size_t written = ringWrite(payload, payloadLen);
+      rxChunkCount++;
+      rxTotalBytes += written;
 
-        // Progress every 20 chunks
-        if (chunkCount % 20 == 0) {
-          Serial.printf("[BLE-RX] Received %u chunks, %u bytes\n",
-                        chunkCount, (unsigned int)audioBufferLen);
+      if (written < payloadLen) {
+        rxDroppedBytes += (payloadLen - written);
+        if (rxDroppedBytes % 5000 < payloadLen) {
+          Serial.printf("[BLE-RX] Ring buffer full — dropped %u bytes total\n", rxDroppedBytes);
         }
-      } else if (!playAudio) {
-        // Buffer full — play what we have now, discard the rest
-        Serial.printf("[BLE-RX] Buffer full at %u bytes (%u chunks, lost: %u) — playing truncated audio\n",
-                      (unsigned int)audioBufferLen, chunkCount, lostPackets);
-        playAudio = true;
       }
-      // Once playAudio is set, all further 'A' packets are silently dropped
+
+      // Progress every 50 chunks
+      if (rxChunkCount % 50 == 0) {
+        Serial.printf("[BLE-RX] %u chunks, %u bytes, ring: %u/%u\n",
+                      rxChunkCount, rxTotalBytes,
+                      (unsigned int)ringAvailable(), RING_SIZE);
+      }
     }
   }
 };
@@ -404,17 +445,22 @@ class ControlCallbacks : public NimBLECharacteristicCallbacks {
 
     uint8_t tag = data[0];
 
-    if (tag == 'E') {
-      Serial.printf("[BLE-CTRL] End marker received - %u bytes buffered (%u chunks)\n",
-                    (unsigned int)audioBufferLen, chunkCount);
-      if (audioBufferLen > 0) {
-        playAudio = true;
-      }
-    } else if (tag == 'S') {
-      Serial.println("[BLE-CTRL] Start marker - clearing buffer");
-      audioBufferLen = 0;
-      chunkCount = 0;
-      playAudio = false;  // Reset in case previous overflow set this
+    if (tag == 'S') {
+      // Start marker — begin buffering audio
+      Serial.println("[BLE-CTRL] Start marker — buffering audio");
+      ringReset();
+      endMarkerReceived = false;
+      rxChunkCount = 0;
+      rxTotalBytes = 0;
+      rxDroppedBytes = 0;
+      rxLostPackets = 0;
+      streamState = STREAM_BUFFERING;
+
+    } else if (tag == 'E') {
+      // End marker — signal playback to drain remaining data
+      Serial.printf("[BLE-CTRL] End marker — %u bytes received (%u chunks)\n",
+                    rxTotalBytes, rxChunkCount);
+      endMarkerReceived = true;
     }
   }
 };
@@ -429,17 +475,16 @@ void sendMicChunkViaBLE(uint8_t* pcmData, size_t pcmLen) {
   while (offset < pcmLen) {
     size_t fragSize = min((size_t)BLE_MAX_PAYLOAD, pcmLen - offset);
 
-    // Build packet: [TAG][SEQ][audio data]
     uint8_t pkt[BLE_HEADER_SIZE + fragSize];
-    pkt[0] = 'A';           // Audio tag
-    pkt[1] = txSeqNum++;    // Sequence number (wraps at 255)
+    pkt[0] = 'A';
+    pkt[1] = txSeqNum++;
     memcpy(pkt + BLE_HEADER_SIZE, pcmData + offset, fragSize);
 
     pAudioTxChar->setValue(pkt, BLE_HEADER_SIZE + fragSize);
     pAudioTxChar->notify();
 
     offset += fragSize;
-    delay(2);  // Small yield for BLE stack
+    delay(2);
   }
 }
 
@@ -451,29 +496,24 @@ void setup() {
   delay(1000);
 
   Serial.println("\n\n============================================================");
-  Serial.println("  ESP32-C6 VOICE ASSISTANT (BLE + Shared I2S Bus)");
+  Serial.println("  ESP32-C6 VOICE ASSISTANT — Streaming Playback");
   Serial.println("============================================================");
   Serial.println("BCLK=GPIO18, WS=GPIO22 (shared mic & speaker)");
   Serial.println("MIC_SD=GPIO16, AMP_DIN=GPIO20");
   Serial.printf("PTT Button=GPIO%d\n", PTT_PIN);
-  Serial.println("Transport: Bluetooth Low Energy (BLE)");
+  Serial.println("Transport: BLE (WRITE_NR) + Streaming Ring Buffer");
   Serial.println("============================================================\n");
 
   // Push-to-talk button
   pinMode(PTT_PIN, INPUT_PULLUP);
-  delay(100);  // Let pull-up settle
+  delay(100);
 
-  // Debug: show button state at boot
   int btnState = digitalRead(PTT_PIN);
   Serial.printf("[PTT] GPIO%d initial state: %s (%d)\n",
                 PTT_PIN, btnState == HIGH ? "HIGH (not pressed)" : "LOW (pressed!)", btnState);
   if (btnState == LOW) {
     Serial.println("[PTT] WARNING: Button reads LOW at boot! Check wiring.");
-    Serial.println("[PTT] Button should connect GPIO23 to GND when pressed.");
-    Serial.println("[PTT] Waiting for button to be released...");
-    while (digitalRead(PTT_PIN) == LOW) {
-      delay(100);
-    }
+    while (digitalRead(PTT_PIN) == LOW) delay(100);
     Serial.println("[PTT] Button released, continuing...");
   }
 
@@ -484,12 +524,11 @@ void setup() {
   Serial.println("\n[BLE] Initializing...");
   NimBLEDevice::init("AIGlasses-ESP32C6");
   NimBLEDevice::setMTU(BLE_MTU);
-  NimBLEDevice::setPower(ESP_PWR_LVL_P9);  // Max TX power for range
+  NimBLEDevice::setPower(ESP_PWR_LVL_P9);
 
   pServer = NimBLEDevice::createServer();
   pServer->setCallbacks(new ServerCallbacks());
 
-  // Create GATT service
   NimBLEService* pService = pServer->createService(SERVICE_UUID);
 
   // Audio TX: ESP32 mic → Android (NOTIFY)
@@ -512,10 +551,8 @@ void setup() {
   );
   pControlChar->setCallbacks(new ControlCallbacks());
 
-  // Start service
   pService->start();
 
-  // Start advertising
   NimBLEAdvertising* pAdvertising = NimBLEDevice::getAdvertising();
   pAdvertising->addServiceUUID(SERVICE_UUID);
   pAdvertising->start();
@@ -526,8 +563,7 @@ void setup() {
   Serial.println();
   Serial.println("============================================================");
   Serial.printf("  READY! Hold GPIO%d to talk, release to send\n", PTT_PIN);
-  Serial.println("  Open the AIGlasses app and tap 'Scan & Connect'");
-  Serial.println("  No WiFi hotspot needed — uses BLE directly!");
+  Serial.println("  Audio plays AS it arrives — no more buffer overflow!");
   Serial.println("============================================================\n");
 }
 
@@ -535,10 +571,10 @@ void setup() {
 //  Loop
 // ════════════════════════════════════════════════════════════════
 void loop() {
-  // Play audio if ready (TTS response from Android)
-  if (playAudio) {
-    playSpeaker();
-    playAudio = false;
+  // ── Streaming playback state machine ──
+  if (streamState != STREAM_IDLE) {
+    streamPlaybackTick();
+    return;  // Don't read mic while playing
   }
 
   // Wait for BLE connection
@@ -547,17 +583,16 @@ void loop() {
     return;
   }
 
-  // Debounced button read: read twice with a small gap
+  // Debounced button read
   bool raw1 = (digitalRead(PTT_PIN) == LOW);
   delay(10);
   bool raw2 = (digitalRead(PTT_PIN) == LOW);
-  bool pressed = raw1 && raw2;  // Only count as pressed if both reads agree
+  bool pressed = raw1 && raw2;
 
   static bool wasPressed = false;
 
   if (!pressed) {
     if (wasPressed) {
-      // Send END marker via Control characteristic
       uint8_t endPkt[BLE_HEADER_SIZE] = {'E', 0};
       pControlChar->setValue(endPkt, BLE_HEADER_SIZE);
       pControlChar->notify();
@@ -570,24 +605,22 @@ void loop() {
 
   // Button is pressed
   if (!wasPressed) {
-    txSeqNum = 0;  // Reset sequence for new utterance
+    txSeqNum = 0;
     Serial.println("[PTT] Pressed -> Streaming audio via BLE...");
   }
   wasPressed = true;
 
-  // Read mic audio via I2S as 32-bit (INMP441 packs 24-bit in upper bits of 32-bit slot)
+  // Read mic audio
   size_t bytesRead32 = 0;
   esp_err_t ok = i2s_read(I2S_NUM_0, micBuf32, sizeof(micBuf32), &bytesRead32, 20 / portTICK_PERIOD_MS);
   if (ok != ESP_OK || bytesRead32 == 0) return;
 
-  // Downshift: take bits [31:16] of each 32-bit sample → 16-bit signed PCM
   int samples = bytesRead32 / 4;
   for (int i = 0; i < samples; i++) {
     micBuf[i] = (int16_t)(micBuf32[i] >> 16);
   }
-  size_t bytesOut = samples * 2;  // 16-bit output size
+  size_t bytesOut = samples * 2;
 
-  // Debug: print mic amplitude every 20 chunks to check signal
   static int debugChunk = 0;
   if (++debugChunk % 20 == 0) {
     int16_t minVal = 32767, maxVal = -32768;
@@ -602,8 +635,6 @@ void loop() {
                   minVal, maxVal, sum / samples, samples);
   }
 
-  // Send 16-bit PCM to Android via BLE NOTIFY
   sendMicChunkViaBLE((uint8_t*)micBuf, bytesOut);
-
   delay(1);
 }
