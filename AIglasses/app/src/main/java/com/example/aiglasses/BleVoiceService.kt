@@ -382,7 +382,10 @@ class BleVoiceService(
         val g = gatt ?: return
         if (!isConnected) return
 
-        val maxPayload = negotiatedMtu - 3 - HEADER_SIZE
+        // Round payload down to EVEN bytes so each packet carries whole 16-bit samples.
+        // Without this, lost packets (WRITE_NR has no ACK) shift the audio buffer by an
+        // odd byte count, misaligning every subsequent 16-bit sample → buzzing/noise.
+        val maxPayload = (negotiatedMtu - 3 - HEADER_SIZE) and 0x7FFFFFFE.toInt()
         val dur = pcm.size / (22050.0 * 2)
         Log.i(TAG, "Sending ${pcm.size} bytes (${String.format("%.2f", dur)}s)")
         onEvent(BleEvent.SendingAudio(pcm.size))

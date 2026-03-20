@@ -43,7 +43,7 @@ static int16_t micBuf[SAMPLES_PER_CHUNK];
 // ════════════════════════════════════════════════════════════════
 //  Speaker buffer (accumulates TTS audio from Android)
 // ════════════════════════════════════════════════════════════════
-#define MAX_AUDIO_BUFFER (160 * 1024)  // 160KB = ~3.6s @ 22050Hz 16-bit (ESP32-C6 RAM limit)
+#define MAX_AUDIO_BUFFER (160 * 1024)  // 160KB = ~3.7s @ 22050Hz 16-bit (C6 RAM limit)
 static uint8_t audioBuffer[MAX_AUDIO_BUFFER];
 static volatile size_t audioBufferLen = 0;
 static volatile bool playAudio = false;
@@ -69,6 +69,13 @@ static uint8_t txSeqNum = 0;
 //  I2S init: Mic (RX) on I2S0
 // ════════════════════════════════════════════════════════════════
 void i2sMicInit() {
+  // CRITICAL: Force AMP_DIN LOW *before* tearing down I2S driver.
+  // When i2s_driver_uninstall() releases the I2S pin mux, AMP_DIN would
+  // float for ~50ms. The MAX98357A reads that as noise → loud buzz.
+  // By claiming the pin as GPIO OUTPUT LOW first, it stays silent during teardown.
+  pinMode(AMP_DIN, OUTPUT);
+  digitalWrite(AMP_DIN, LOW);
+
   if (currentI2SMode != MODE_NONE) {
     i2s_driver_uninstall(I2S_NUM_0);
     delay(50);
@@ -111,10 +118,9 @@ void i2sMicInit() {
 
   i2s_zero_dma_buffer(I2S_NUM_0);
 
-  // AMP_DIN is not driven by I2S in RX mode — pin floats.
-  // MAX98357A still sees BCLK/WS (shared bus) so it stays awake
-  // and reads random noise from the floating DIN → buzzing.
-  // Force DIN LOW so the amp reads silence while mic is active.
+  // Re-assert AMP_DIN LOW after mic I2S install (belt-and-suspenders).
+  // The primary protection is at the top of this function, but the
+  // i2s_set_pin call above may have briefly touched AMP_DIN's mux.
   pinMode(AMP_DIN, OUTPUT);
   digitalWrite(AMP_DIN, LOW);
 
@@ -144,7 +150,7 @@ void i2sSpkInit() {
   // 16 bufs × 1024 samples = 16384 samples @ 22050Hz ≈ 743ms headroom.
   cfg.dma_buf_count = 16;
   cfg.dma_buf_len = 1024;
-  cfg.use_apll = true;   // APLL gives a cleaner, jitter-free I2S clock → less distortion
+  cfg.use_apll = false;  // APLL disabled — C6 APLL can buzz at 22050Hz; test without
   cfg.tx_desc_auto_clear = true;  // Fill underrun slots with silence, not garbage
   cfg.fixed_mclk = 0;
 
@@ -195,6 +201,13 @@ static int16_t stereoChunk[STEREO_CHUNK_MONO * 2];  // L+R interleaved
 void playSpeaker() {
   if (audioBufferLen == 0) return;
 
+  // Safety: ensure buffer length is even (16-bit sample alignment)
+  if (audioBufferLen % 2 != 0) {
+    Serial.printf("[AUDIO] WARNING: odd buffer length %u — trimming 1 byte\n",
+                  (unsigned int)audioBufferLen);
+    audioBufferLen--;
+  }
+
   float duration = (float)audioBufferLen / (SPK_SR * 2);
   Serial.printf("[AUDIO] Playing %u bytes (%.2fs @ %dHz) — dual speaker\n",
                 audioBufferLen, duration, SPK_SR);
@@ -228,6 +241,20 @@ void playSpeaker() {
     }
   }
 
+  // Apply fade-out to last ~50ms of audio to avoid abrupt cutoff → pop/buzz.
+  // 50ms @ 22050Hz = 1102 samples. Linearly ramp down to zero.
+  {
+    const size_t FADE_SAMPLES = min(totalMono, (size_t)1102);
+    int16_t* mutSrc = (int16_t*)src;  // safe — audioBuffer is ours
+    size_t fadeStart = totalMono - FADE_SAMPLES;
+    for (size_t i = 0; i < FADE_SAMPLES; i++) {
+      float gain = 1.0f - ((float)i / (float)FADE_SAMPLES);
+      mutSrc[fadeStart + i] = (int16_t)(mutSrc[fadeStart + i] * gain);
+    }
+    Serial.printf("[AUDIO] Applied fade-out on last %u samples (~%dms)\n",
+                  FADE_SAMPLES, (int)(FADE_SAMPLES * 1000 / SPK_SR));
+  }
+
   while (offset < totalMono) {
     size_t monoCount = min((size_t)STEREO_CHUNK_MONO, totalMono - offset);
 
@@ -258,7 +285,20 @@ void playSpeaker() {
     }
   }
 
-  delay(100);
+  // Flush DMA: write 8 silence chunks to fully drain the DMA pipeline,
+  // then stop I2S cleanly before switching to mic mode.
+  memset(stereoChunk, 0, sizeof(stereoChunk));
+  for (int i = 0; i < 8; i++) {
+    size_t written = 0;
+    i2s_write(I2S_NUM_0, stereoChunk, sizeof(stereoChunk), &written, portMAX_DELAY);
+  }
+  delay(200);        // Let the silence play out through DMA
+  i2s_stop(I2S_NUM_0);  // Stop I2S cleanly before teardown
+
+  // Immediately claim AMP_DIN as GPIO LOW after stopping I2S.
+  // This prevents the pin from floating when i2sMicInit() uninstalls the driver.
+  pinMode(AMP_DIN, OUTPUT);
+  digitalWrite(AMP_DIN, LOW);
   disableAmp();
 
   Serial.printf("[AUDIO] Playback complete! (%u mono samples, %u chunks)\n",
@@ -306,6 +346,9 @@ class ServerCallbacks : public NimBLEServerCallbacks {
 //  Audio RX Callback (Android → ESP32 speaker data)
 // ════════════════════════════════════════════════════════════════
 class AudioRxCallbacks : public NimBLECharacteristicCallbacks {
+  uint8_t expectedSeq = 0;
+  unsigned int lostPackets = 0;
+
   void onWrite(NimBLECharacteristic* pChar, NimBLEConnInfo& connInfo) override {
     NimBLEAttValue val = pChar->getValue();
     const uint8_t* data = val.data();
@@ -313,11 +356,20 @@ class AudioRxCallbacks : public NimBLECharacteristicCallbacks {
     if (len < BLE_HEADER_SIZE) return;
 
     uint8_t tag = data[0];
-    // uint8_t seq = data[1];  // Available for loss detection
+    uint8_t seq = data[1];
     const uint8_t* payload = data + BLE_HEADER_SIZE;
     size_t payloadLen = len - BLE_HEADER_SIZE;
 
     if (tag == 'A' && payloadLen > 0) {
+      // Sequence number tracking — detect packet loss from WRITE_NR
+      if (chunkCount > 0 && seq != expectedSeq) {
+        uint8_t gap = (seq - expectedSeq);  // wraps correctly for uint8_t
+        lostPackets += gap;
+        Serial.printf("[BLE-RX] SEQ gap: expected %u got %u (lost ~%u pkts, total lost: %u)\n",
+                      expectedSeq, seq, gap, lostPackets);
+      }
+      expectedSeq = seq + 1;
+
       // Append audio fragment to speaker buffer
       if (audioBufferLen + payloadLen <= MAX_AUDIO_BUFFER) {
         memcpy(audioBuffer + audioBufferLen, payload, payloadLen);
@@ -329,9 +381,13 @@ class AudioRxCallbacks : public NimBLECharacteristicCallbacks {
           Serial.printf("[BLE-RX] Received %u chunks, %u bytes\n",
                         chunkCount, (unsigned int)audioBufferLen);
         }
-      } else {
-        Serial.println("[BLE-RX] Audio buffer full!");
+      } else if (!playAudio) {
+        // Buffer full — play what we have now, discard the rest
+        Serial.printf("[BLE-RX] Buffer full at %u bytes (%u chunks, lost: %u) — playing truncated audio\n",
+                      (unsigned int)audioBufferLen, chunkCount, lostPackets);
+        playAudio = true;
       }
+      // Once playAudio is set, all further 'A' packets are silently dropped
     }
   }
 };
@@ -358,6 +414,7 @@ class ControlCallbacks : public NimBLECharacteristicCallbacks {
       Serial.println("[BLE-CTRL] Start marker - clearing buffer");
       audioBufferLen = 0;
       chunkCount = 0;
+      playAudio = false;  // Reset in case previous overflow set this
     }
   }
 };
@@ -441,10 +498,10 @@ void setup() {
     NIMBLE_PROPERTY::NOTIFY
   );
 
-  // Audio RX: Android TTS → ESP32 speaker (WRITE with response for reliable pacing)
+  // Audio RX: Android TTS → ESP32 speaker (WRITE_NR for max throughput)
   pAudioRxChar = pService->createCharacteristic(
     CHAR_AUDIO_RX_UUID,
-    NIMBLE_PROPERTY::WRITE
+    NIMBLE_PROPERTY::WRITE_NR
   );
   pAudioRxChar->setCallbacks(new AudioRxCallbacks());
 
