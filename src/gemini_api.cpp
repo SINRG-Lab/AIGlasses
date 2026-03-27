@@ -5,6 +5,8 @@
 #include <WalterModem.h>
 #include <ArduinoJson.h>
 
+namespace gemini {
+
 static const char* GEMINI_HOST = "generativelanguage.googleapis.com";
 static const uint16_t GEMINI_PORT = 443;
 
@@ -433,7 +435,7 @@ String audioToText(const char* audioPath, const char* prompt)
     }
 }
 
-bool textToAudio(const char* text, const char* outputPath)
+bool textToAudio(const char* text, uint8_t** outWav, size_t* outWavLen)
 {
     Serial.println("\n--- Text to Audio (TTS) ---");
 
@@ -559,17 +561,16 @@ bool textToAudio(const char* text, const char* outputPath)
         return false;
     }
 
-    // Step 7: Build WAV and save
-    size_t wavLen = 0;
-    uint8_t* wavData = buildWavFromPcm(pcmData, pcmLen, &wavLen);
+    // Step 7: Build WAV and return to caller
+    uint8_t* wavData = buildWavFromPcm(pcmData, pcmLen, outWavLen);
     free(pcmData);
 
     if (!wavData) {
         return false;
     }
 
-    bool saved = saveWavFile(outputPath, wavData, wavLen);
-    free(wavData);
-
-    return saved;
+    *outWav = wavData;
+    return true;
 }
+
+} // namespace gemini
