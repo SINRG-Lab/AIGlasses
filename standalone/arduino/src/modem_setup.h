@@ -19,6 +19,11 @@ extern volatile unsigned long lastRingMs;
 // Timestamp of the first byte written into responseBuffer (0 until data arrives)
 extern volatile unsigned long firstByteMs;
 
+// Timestamp of the first ring event after the caller resets it to 0.
+// Used to measure when Deepgram's response actually arrives at the modem
+// (which can happen during upload, before we parse WS frames).
+extern volatile unsigned long firstRingAfterResetMs;
+
 // Initialize modem hardware and connect to LTE-M network
 bool modemInit();
 

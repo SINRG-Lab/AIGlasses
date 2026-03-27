@@ -22,7 +22,24 @@ char* base64Encode(const uint8_t* src, size_t srcLen, size_t* outLen);
 // Caller must free() the result.
 uint8_t* base64Decode(const char* src, size_t srcLen, size_t* outLen);
 
-// Build a WAV file (header + PCM data) for 24kHz 16-bit mono.
+// Decode µ-law (G.711) encoded bytes to signed 16-bit linear PCM.
+// Returns PSRAM-allocated buffer of int16_t samples. Caller must free().
+// *outLen is set to the output byte count (= 2 × mulawLen).
+uint8_t* mulawToPcm16(const uint8_t* mulaw, size_t mulawLen, size_t* outLen);
+
+// Encode signed 16-bit linear PCM samples to µ-law (G.711).
+// Returns PSRAM-allocated buffer of mulaw bytes. Caller must free().
+// *outLen is set to the output byte count (= sampleCount).
+uint8_t* pcm16ToMulaw(const int16_t* pcm, size_t sampleCount, size_t* outLen);
+
+// Build a WAV file for arbitrary format.
+// audioFormat: 1=PCM (linear16), 6=A-law, 7=µ-law
+// Returns PSRAM-allocated buffer. Caller must free().
+uint8_t* buildWavFile(const uint8_t* data, size_t dataLen,
+                      uint32_t sampleRate, uint16_t bitsPerSample,
+                      uint16_t audioFormat, size_t* outLen);
+
+// Convenience wrapper: 24 kHz 16-bit mono PCM (used by Gemini TTS).
 // Returns PSRAM-allocated buffer. Caller must free().
 uint8_t* buildWavFromPcm(const uint8_t* pcmData, size_t pcmLen, size_t* outLen);
 

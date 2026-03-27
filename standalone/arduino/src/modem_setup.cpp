@@ -15,6 +15,7 @@ static size_t responseCapacity = 0;
 volatile size_t pendingRingBytes = 0;
 volatile unsigned long lastRingMs = 0;
 volatile unsigned long firstByteMs = 0;
+volatile unsigned long firstRingAfterResetMs = 0;
 static volatile uint8_t pendingConnId = 0;
 
 // Temporary buffer for socketReceive (1500 = max TCP/modem chunk)
@@ -32,9 +33,12 @@ static void socketEventHandler(
             pendingConnId = data->conn_id;
             pendingRingBytes += data->data_len;
             lastRingMs = millis();
+            if (firstRingAfterResetMs == 0)
+                firstRingAfterResetMs = millis();
 
             // Batch reads: only pull from the modem when a full 1500-byte chunk has
-            // accumulated — avoids thousands of tiny AT round-trips for large responses.
+            // accumulated. This avoids thousands of tiny AT round-trips for large responses.
+            // to cut down on the AT command overhead
             // Exception: read immediately when responseLen == 0 (first ring of a new
             // request) so that small responses (<1500 bytes total) are captured before
             // the server closes the connection.
@@ -259,6 +263,7 @@ void resetResponseBuffer(size_t capacity)
     pendingRingBytes = 0;
     lastRingMs = 0;
     firstByteMs = 0;
+    firstRingAfterResetMs = 0;
 }
 
 void freeResponseBuffer()
@@ -274,6 +279,7 @@ void freeResponseBuffer()
     pendingRingBytes = 0;
     lastRingMs = 0;
     firstByteMs = 0;
+    firstRingAfterResetMs = 0;
 }
 
 bool flushPendingRing()
