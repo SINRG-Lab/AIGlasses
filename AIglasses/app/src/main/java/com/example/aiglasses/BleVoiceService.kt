@@ -54,6 +54,7 @@ class BleVoiceService(
         data object ProcessingStarted : BleEvent()
         data class SendingAudio(val totalBytes: Int) : BleEvent()
         data class AudioSent(val totalBytes: Int) : BleEvent()
+        data class ImageReceived(val jpegBytes: ByteArray) : BleEvent()
         data class Error(val message: String) : BleEvent()
     }
 
@@ -407,6 +408,7 @@ class BleVoiceService(
                     imageBuffer.reset()
                 }
                 Log.i(TAG, "Image end marker (${pendingJpeg?.size ?: 0} bytes stashed)")
+                pendingJpeg?.let { onEvent(BleEvent.ImageReceived(it)) }
             }
         }
     }

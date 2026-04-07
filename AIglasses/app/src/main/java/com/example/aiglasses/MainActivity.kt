@@ -2,6 +2,7 @@ package com.example.aiglasses
 
 import android.Manifest
 import android.content.pm.PackageManager
+import android.graphics.BitmapFactory
 import android.os.Build
 import android.os.Bundle
 import android.util.Log
@@ -9,6 +10,7 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -18,6 +20,8 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
@@ -130,6 +134,7 @@ class MainActivity : ComponentActivity() {
         var statusText by remember { mutableStateOf("Disconnected") }
         val logMessages = remember { mutableStateListOf<LogEntry>() }
         val listState = rememberLazyListState()
+        var capturedImageBitmap by remember { mutableStateOf<android.graphics.Bitmap?>(null) }
 
         fun addLog(tag: String, message: String) {
             logMessages.add(LogEntry(tag, message))
@@ -216,6 +221,12 @@ class MainActivity : ComponentActivity() {
                                         addLog("AUDIO", "Sending ${event.totalBytes} bytes to ESP32")
                                     is BleVoiceService.BleEvent.AudioSent ->
                                         addLog("AUDIO", "Sent ${event.totalBytes} bytes")
+                                    is BleVoiceService.BleEvent.ImageReceived -> {
+                                        addLog("CAMERA", "Image received (${event.jpegBytes.size} bytes)")
+                                        capturedImageBitmap = BitmapFactory.decodeByteArray(
+                                            event.jpegBytes, 0, event.jpegBytes.size
+                                        )
+                                    }
                                     is BleVoiceService.BleEvent.Error ->
                                         addLog("ERROR", event.message)
                                 }
@@ -345,6 +356,31 @@ class MainActivity : ComponentActivity() {
                 }
 
                 Spacer(modifier = Modifier.height(12.dp))
+
+                // Captured image preview
+                capturedImageBitmap?.let { bitmap ->
+                    Card(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .heightIn(max = 200.dp)
+                    ) {
+                        Box {
+                            Image(
+                                bitmap = bitmap.asImageBitmap(),
+                                contentDescription = "Captured image",
+                                modifier = Modifier.fillMaxWidth(),
+                                contentScale = ContentScale.Fit
+                            )
+                            TextButton(
+                                onClick = { capturedImageBitmap = null },
+                                modifier = Modifier.align(Alignment.TopEnd)
+                            ) {
+                                Text("Dismiss", fontSize = 11.sp)
+                            }
+                        }
+                    }
+                    Spacer(modifier = Modifier.height(8.dp))
+                }
 
                 // Log
                 Text("Conversation Log", fontWeight = FontWeight.Bold, fontSize = 16.sp)
