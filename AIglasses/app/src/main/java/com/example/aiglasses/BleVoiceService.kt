@@ -54,7 +54,6 @@ class BleVoiceService(
         data object ProcessingStarted : BleEvent()
         data class SendingAudio(val totalBytes: Int) : BleEvent()
         data class AudioSent(val totalBytes: Int) : BleEvent()
-        data class ImageReceived(val jpegBytes: ByteArray) : BleEvent()
         data class Error(val message: String) : BleEvent()
     }
 
