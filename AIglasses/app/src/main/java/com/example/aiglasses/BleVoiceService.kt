@@ -55,6 +55,7 @@ class BleVoiceService(
         data object ProcessingStarted : BleEvent()
         data class SendingAudio(val totalBytes: Int) : BleEvent()
         data class AudioSent(val totalBytes: Int) : BleEvent()
+        data class ImageReceived(val jpegBytes: ByteArray) : BleEvent()
         data class Error(val message: String) : BleEvent()
     }
 
@@ -72,6 +73,11 @@ class BleVoiceService(
 
     private var negotiatedMtu = 23
     private val audioChunks = mutableListOf<ByteArray>()
+
+    // Image reassembly state (single producer, consumed by pipeline on audio end)
+    private val imageBuffer = java.io.ByteArrayOutputStream()
+    private var expectedImageLen = 0
+    @Volatile private var pendingImage: ByteArray? = null
     @Volatile private var isConnected = false
     @Volatile private var isScanning = false
 
@@ -146,6 +152,11 @@ class BleVoiceService(
         controlChar = null
         imageTxChar = null
         synchronized(audioChunks) { audioChunks.clear() }
+        synchronized(imageBuffer) {
+            imageBuffer.reset()
+            expectedImageLen = 0
+            pendingImage = null
+        }
     }
 
     fun isConnected(): Boolean = isConnected
@@ -195,6 +206,7 @@ class BleVoiceService(
                     audioTxChar = null
                     audioRxChar = null
                     controlChar = null
+                    imageTxChar = null
                     try { gatt.close() } catch (_: Exception) {}
                     this@BleVoiceService.gatt = null
                     onEvent(BleEvent.Disconnected)

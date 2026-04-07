@@ -504,16 +504,16 @@ void setup() {
   Serial.println("Transport: BLE (WRITE_NR) + Streaming Ring Buffer");
   Serial.println("============================================================\n");
 
-  // Push-to-talk button
-  pinMode(PTT_PIN, INPUT_PULLUP);
+  // Push-to-talk button (active HIGH — pressed = HIGH, released = LOW)
+  pinMode(PTT_PIN, INPUT_PULLDOWN);
   delay(100);
 
   int btnState = digitalRead(PTT_PIN);
   Serial.printf("[PTT] GPIO%d initial state: %s (%d)\n",
-                PTT_PIN, btnState == HIGH ? "HIGH (not pressed)" : "LOW (pressed!)", btnState);
-  if (btnState == LOW) {
-    Serial.println("[PTT] WARNING: Button reads LOW at boot! Check wiring.");
-    while (digitalRead(PTT_PIN) == LOW) delay(100);
+                PTT_PIN, btnState == LOW ? "LOW (not pressed)" : "HIGH (pressed!)", btnState);
+  if (btnState == HIGH) {
+    Serial.println("[PTT] WARNING: Button reads HIGH at boot! Check wiring.");
+    while (digitalRead(PTT_PIN) == HIGH) delay(100);
     Serial.println("[PTT] Button released, continuing...");
   }
 
@@ -583,10 +583,10 @@ void loop() {
     return;
   }
 
-  // Debounced button read
-  bool raw1 = (digitalRead(PTT_PIN) == LOW);
+  // Debounced button read (active HIGH)
+  bool raw1 = (digitalRead(PTT_PIN) == HIGH);
   delay(10);
-  bool raw2 = (digitalRead(PTT_PIN) == LOW);
+  bool raw2 = (digitalRead(PTT_PIN) == HIGH);
   bool pressed = raw1 && raw2;
 
   static bool wasPressed = false;
