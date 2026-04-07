@@ -41,7 +41,6 @@ class BleVoiceService(
         private const val MIN_AUDIO_BYTES = 16000 * 2
         private const val SCAN_TIMEOUT_MS = 20000L
         private const val HEADER_SIZE = 2
-        private const val VISION_WAIT_MS = 1000L
     }
 
     sealed class BleEvent {
@@ -84,11 +83,9 @@ class BleVoiceService(
     // Image reassembly state
     private val imageBuffer = ByteArrayOutputStream()
     @Volatile private var receivingImage = false
-    private var pendingAudioPcm: ByteArray? = null
+    private var pendingJpeg: ByteArray? = null
 
     private val mainHandler = Handler(Looper.getMainLooper())
-    private val visionHandler = Handler(Looper.getMainLooper())
-    private val visionTimeoutRunnable = Runnable { processAudioOnly() }
 
     // ── Public API ──
 
@@ -140,8 +137,7 @@ class BleVoiceService(
     fun disconnect() {
         stopScan()
         isConnected = false
-        visionHandler.removeCallbacks(visionTimeoutRunnable)
-        pendingAudioPcm = null
+        pendingJpeg = null
         receivingImage = false
         synchronized(imageBuffer) { imageBuffer.reset() }
         try { gatt?.disconnect() } catch (_: Exception) {}
@@ -410,14 +406,17 @@ class BleVoiceService(
                     ByteBuffer.wrap(data, 2, 4).order(ByteOrder.LITTLE_ENDIAN).int
                 } else 0
                 Log.i(TAG, "Image start marker (expected $expectedSize bytes)")
-                visionHandler.removeCallbacks(visionTimeoutRunnable)
                 receivingImage = true
                 synchronized(imageBuffer) { imageBuffer.reset() }
             }
             'J' -> {
-                Log.i(TAG, "Image end marker")
+                // Image complete — stash JPEG until 'E' (audio end) arrives
                 receivingImage = false
-                finalizeImage()
+                synchronized(imageBuffer) {
+                    pendingJpeg = imageBuffer.toByteArray()
+                    imageBuffer.reset()
+                }
+                Log.i(TAG, "Image end marker (${pendingJpeg?.size ?: 0} bytes stashed)")
             }
         }
     }
@@ -429,56 +428,6 @@ class BleVoiceService(
         synchronized(imageBuffer) {
             imageBuffer.write(payload)
         }
-    }
-
-    private fun finalizeImage() {
-        val jpeg: ByteArray
-        synchronized(imageBuffer) {
-            jpeg = imageBuffer.toByteArray()
-            imageBuffer.reset()
-        }
-        Log.i(TAG, "Image complete: ${jpeg.size} bytes")
-
-        val audioPcm = pendingAudioPcm
-        pendingAudioPcm = null
-
-        if (audioPcm != null && audioPcm.size >= MIN_AUDIO_BYTES) {
-            processVisionRequest(audioPcm, jpeg)
-        } else {
-            // Image only — ask the model to describe what it sees
-            processVisionRequest(null, jpeg)
-        }
-    }
-
-    private fun processVisionRequest(audioPcm: ByteArray?, jpeg: ByteArray) {
-        onEvent(BleEvent.ProcessingStarted)
-        Thread {
-            try {
-                val pcm = pipeline.processWithVision(audioPcm, jpeg)
-                if (pcm != null) sendAudioToEsp32(pcm)
-                else Log.w(TAG, "Vision pipeline returned null")
-            } catch (e: Exception) {
-                Log.e(TAG, "Vision processing error", e)
-                onEvent(BleEvent.Error(e.message ?: "Vision processing failed"))
-            }
-        }.start()
-    }
-
-    private fun processAudioOnly() {
-        val raw = pendingAudioPcm ?: return
-        pendingAudioPcm = null
-
-        onEvent(BleEvent.ProcessingStarted)
-        Thread {
-            try {
-                val pcm = pipeline.process(raw)
-                if (pcm != null) sendAudioToEsp32(pcm)
-                else Log.w(TAG, "Pipeline returned null")
-            } catch (e: Exception) {
-                Log.e(TAG, "Processing error", e)
-                onEvent(BleEvent.Error(e.message ?: "Processing failed"))
-            }
-        }.start()
     }
 
     private fun processReceivedAudio() {
@@ -501,9 +450,36 @@ class BleVoiceService(
             return
         }
 
-        // Stash audio and wait briefly for a possible image ('I' marker)
-        pendingAudioPcm = raw
-        visionHandler.postDelayed(visionTimeoutRunnable, VISION_WAIT_MS)
+        // Check if a JPEG was stashed (ESP32 sends I/image/J before E)
+        val jpeg = pendingJpeg
+        pendingJpeg = null
+
+        onEvent(BleEvent.ProcessingStarted)
+
+        if (jpeg != null && jpeg.isNotEmpty()) {
+            Log.i(TAG, "Vision mode: ${jpeg.size} bytes image + ${raw.size} bytes audio")
+            Thread {
+                try {
+                    val pcm = pipeline.processWithVision(raw, jpeg)
+                    if (pcm != null) sendAudioToEsp32(pcm)
+                    else Log.w(TAG, "Vision pipeline returned null")
+                } catch (e: Exception) {
+                    Log.e(TAG, "Vision processing error", e)
+                    onEvent(BleEvent.Error(e.message ?: "Vision processing failed"))
+                }
+            }.start()
+        } else {
+            Thread {
+                try {
+                    val pcm = pipeline.process(raw)
+                    if (pcm != null) sendAudioToEsp32(pcm)
+                    else Log.w(TAG, "Pipeline returned null")
+                } catch (e: Exception) {
+                    Log.e(TAG, "Processing error", e)
+                    onEvent(BleEvent.Error(e.message ?: "Processing failed"))
+                }
+            }.start()
+        }
     }
 
     private fun sendAudioToEsp32(pcm: ByteArray) {
