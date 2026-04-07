@@ -73,10 +73,6 @@ class BleVoiceService(
     private var negotiatedMtu = 23
     private val audioChunks = mutableListOf<ByteArray>()
 
-    // Image reassembly state (single producer, consumed by pipeline on audio end)
-    private val imageBuffer = java.io.ByteArrayOutputStream()
-    private var expectedImageLen = 0
-    @Volatile private var pendingImage: ByteArray? = null
     @Volatile private var isConnected = false
     @Volatile private var isScanning = false
 
@@ -148,11 +144,6 @@ class BleVoiceService(
         controlChar = null
         imageTxChar = null
         synchronized(audioChunks) { audioChunks.clear() }
-        synchronized(imageBuffer) {
-            imageBuffer.reset()
-            expectedImageLen = 0
-            pendingImage = null
-        }
     }
 
     fun isConnected(): Boolean = isConnected
