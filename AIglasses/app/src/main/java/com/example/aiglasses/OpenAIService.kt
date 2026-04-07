@@ -1,5 +1,6 @@
 package com.example.aiglasses
 
+import android.util.Base64
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.MultipartBody
 import okhttp3.OkHttpClient
@@ -28,6 +29,10 @@ class OpenAIService(private val apiKey: String) {
             "Keep answers short (1-2 sentences). " +
             "If the user asks for current facts (like who is president), say you may be outdated " +
             "unless you were provided updated info."
+        private const val VISION_SYSTEM_PROMPT =
+            "You are a helpful vision assistant for smart glasses. " +
+            "The user is wearing smart glasses with a camera. " +
+            "Describe what you see concisely (1-3 sentences) and answer any questions about the image."
     }
 
     /**
@@ -134,5 +139,67 @@ class OpenAIService(private val apiKey: String) {
         }
 
         return response.body?.bytes() ?: throw Exception("Empty TTS response")
+    }
+
+    /**
+     * Vision chat: send user text + JPEG image to GPT-4o for visual understanding.
+     * @param userText The user's transcribed question (or a default prompt)
+     * @param jpegBytes Raw JPEG image bytes from the ESP32 camera
+     * @return AI response text describing/answering about the image
+     */
+    fun visionChat(userText: String, jpegBytes: ByteArray): String {
+        val base64Image = Base64.encodeToString(jpegBytes, Base64.NO_WRAP)
+        val imageUrl = "data:image/jpeg;base64,$base64Image"
+
+        val contentArray = JSONArray().apply {
+            put(JSONObject().apply {
+                put("type", "text")
+                put("text", userText)
+            })
+            put(JSONObject().apply {
+                put("type", "image_url")
+                put("image_url", JSONObject().apply {
+                    put("url", imageUrl)
+                })
+            })
+        }
+
+        val messages = JSONArray().apply {
+            put(JSONObject().apply {
+                put("role", "system")
+                put("content", VISION_SYSTEM_PROMPT)
+            })
+            put(JSONObject().apply {
+                put("role", "user")
+                put("content", contentArray)
+            })
+        }
+
+        val json = JSONObject().apply {
+            put("model", "gpt-4o")
+            put("messages", messages)
+            put("max_tokens", 300)
+        }
+
+        val request = Request.Builder()
+            .url(CHAT_URL)
+            .header("Authorization", "Bearer $apiKey")
+            .header("Content-Type", "application/json")
+            .post(json.toString().toRequestBody("application/json".toMediaType()))
+            .build()
+
+        val response = client.newCall(request).execute()
+        val body = response.body?.string() ?: throw Exception("Empty vision response")
+
+        if (!response.isSuccessful) {
+            throw Exception("Vision API error ${response.code}: $body")
+        }
+
+        return JSONObject(body)
+            .getJSONArray("choices")
+            .getJSONObject(0)
+            .getJSONObject("message")
+            .getString("content")
+            .trim()
     }
 }
