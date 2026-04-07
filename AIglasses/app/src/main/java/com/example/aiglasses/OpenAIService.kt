@@ -1,5 +1,7 @@
 package com.example.aiglasses
 
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.util.Base64
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.MultipartBody
@@ -148,8 +150,14 @@ class OpenAIService(private val apiKey: String) {
      * @return AI response text describing/answering about the image
      */
     fun visionChat(userText: String, jpegBytes: ByteArray): String {
-        val base64Image = Base64.encodeToString(jpegBytes, Base64.NO_WRAP)
-        val imageUrl = "data:image/jpeg;base64,$base64Image"
+        // Re-encode through Android Bitmap as PNG — ESP32 camera JPEGs have
+        // non-standard headers that OpenAI rejects
+        val bitmap = BitmapFactory.decodeByteArray(jpegBytes, 0, jpegBytes.size)
+            ?: throw Exception("Failed to decode JPEG from camera")
+        val pngStream = java.io.ByteArrayOutputStream()
+        bitmap.compress(Bitmap.CompressFormat.PNG, 100, pngStream)
+        val base64Image = Base64.encodeToString(pngStream.toByteArray(), Base64.NO_WRAP)
+        val imageUrl = "data:image/png;base64,$base64Image"
 
         val contentArray = JSONArray().apply {
             put(JSONObject().apply {
