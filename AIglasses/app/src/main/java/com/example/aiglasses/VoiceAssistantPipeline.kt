@@ -112,6 +112,58 @@ class VoiceAssistantPipeline(
     }
 
     /**
+     * Vision pipeline: optional audio PCM + JPEG → transcription → vision chat → TTS PCM.
+     *
+     * @param rawPcm 16kHz 16-bit mono PCM (nullable — if absent, uses a default prompt)
+     * @param jpegBytes Raw JPEG image bytes from the ESP32 camera
+     * @return PCM bytes at 22050Hz for the ESP32 speaker, or null on error
+     */
+    fun processWithVision(rawPcm: ByteArray?, jpegBytes: ByteArray): ByteArray? {
+        try {
+            Log.i(TAG, "Vision request: image=${jpegBytes.size} bytes" +
+                if (rawPcm != null) ", audio=${rawPcm.size} bytes" else "")
+
+            onEvent(PipelineEvent.Processing)
+
+            // 1. Transcribe audio if present
+            val userText = if (rawPcm != null && rawPcm.size >= MIC_SAMPLE_RATE * 2) {
+                val wavFile = pcmToWav(rawPcm, MIC_SAMPLE_RATE)
+                Log.i(TAG, "Transcribing audio for vision...")
+                val text = openAIService.transcribe(wavFile)
+                wavFile.delete()
+                Log.i(TAG, "User said: \"$text\"")
+                onEvent(PipelineEvent.Transcription(text))
+                if (text.isBlank()) "What do you see in this image?" else text
+            } else {
+                "What do you see in this image?"
+            }
+
+            // 2. Vision chat with image + transcribed question
+            Log.i(TAG, "Sending to vision API...")
+            val aiResponse = openAIService.visionChat(userText, jpegBytes)
+            Log.i(TAG, "Vision response: \"$aiResponse\"")
+            onEvent(PipelineEvent.AiResponse(aiResponse))
+
+            // 3. Synthesize TTS
+            onEvent(PipelineEvent.TtsSynthesizing)
+            Log.i(TAG, "Synthesizing TTS...")
+            val ttsPcm = synthesizeToPcm(aiResponse)
+            if (ttsPcm == null) {
+                onEvent(PipelineEvent.Error("TTS synthesis failed"))
+                return null
+            }
+            val ttsDuration = ttsPcm.size / (TTS_SAMPLE_RATE * 2.0)
+            Log.i(TAG, "TTS PCM ready: ${ttsPcm.size} bytes (${String.format("%.2f", ttsDuration)}s)")
+
+            return ttsPcm
+        } catch (e: Exception) {
+            Log.e(TAG, "Vision pipeline error", e)
+            onEvent(PipelineEvent.Error(e.message ?: "Vision processing failed"))
+            return null
+        }
+    }
+
+    /**
      * Wrap raw PCM into a WAV file for the Whisper API.
      */
     private fun pcmToWav(pcm: ByteArray, sampleRate: Int): File {

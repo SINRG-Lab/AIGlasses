@@ -8,6 +8,9 @@ import android.os.Handler
 import android.os.Looper
 import android.os.ParcelUuid
 import android.util.Log
+import java.io.ByteArrayOutputStream
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
 import java.util.UUID
 
 /**
@@ -31,12 +34,14 @@ class BleVoiceService(
         private val AUDIO_TX_UUID = UUID.fromString("0000aa01-1234-5678-abcd-0e5032c6b1e0")
         private val AUDIO_RX_UUID = UUID.fromString("0000aa02-1234-5678-abcd-0e5032c6b1e0")
         private val CONTROL_UUID = UUID.fromString("0000aa03-1234-5678-abcd-0e5032c6b1e0")
+        private val IMAGE_TX_UUID = UUID.fromString("0000aa04-1234-5678-abcd-0e5032c6b1e0")
         private val CCCD_UUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
 
         private const val TARGET_MTU = 512
         private const val MIN_AUDIO_BYTES = 16000 * 2
         private const val SCAN_TIMEOUT_MS = 20000L
         private const val HEADER_SIZE = 2
+        private const val VISION_WAIT_MS = 1000L
     }
 
     sealed class BleEvent {
@@ -63,13 +68,21 @@ class BleVoiceService(
     private var audioTxChar: BluetoothGattCharacteristic? = null
     private var audioRxChar: BluetoothGattCharacteristic? = null
     private var controlChar: BluetoothGattCharacteristic? = null
+    private var imageTxChar: BluetoothGattCharacteristic? = null
 
     private var negotiatedMtu = 23
     private val audioChunks = mutableListOf<ByteArray>()
     @Volatile private var isConnected = false
     @Volatile private var isScanning = false
 
+    // Image reassembly state
+    private val imageBuffer = ByteArrayOutputStream()
+    @Volatile private var receivingImage = false
+    private var pendingAudioPcm: ByteArray? = null
+
     private val mainHandler = Handler(Looper.getMainLooper())
+    private val visionHandler = Handler(Looper.getMainLooper())
+    private val visionTimeoutRunnable = Runnable { processAudioOnly() }
 
     // ── Public API ──
 
@@ -121,12 +134,17 @@ class BleVoiceService(
     fun disconnect() {
         stopScan()
         isConnected = false
+        visionHandler.removeCallbacks(visionTimeoutRunnable)
+        pendingAudioPcm = null
+        receivingImage = false
+        synchronized(imageBuffer) { imageBuffer.reset() }
         try { gatt?.disconnect() } catch (_: Exception) {}
         try { gatt?.close() } catch (_: Exception) {}
         gatt = null
         audioTxChar = null
         audioRxChar = null
         controlChar = null
+        imageTxChar = null
         synchronized(audioChunks) { audioChunks.clear() }
     }
 
@@ -217,10 +235,15 @@ class BleVoiceService(
                 audioTxChar = service.getCharacteristic(AUDIO_TX_UUID)
                 audioRxChar = service.getCharacteristic(AUDIO_RX_UUID)
                 controlChar = service.getCharacteristic(CONTROL_UUID)
+                imageTxChar = service.getCharacteristic(IMAGE_TX_UUID)
 
                 if (audioTxChar == null || audioRxChar == null || controlChar == null) {
                     onEvent(BleEvent.Error("Missing BLE characteristics"))
                     return
+                }
+
+                if (imageTxChar == null) {
+                    Log.w(TAG, "IMAGE_TX (aa04) not found — vision mode unavailable")
                 }
 
                 Log.i(TAG, "Services found, enabling Audio TX notifications...")
@@ -253,10 +276,13 @@ class BleVoiceService(
                 Log.i(TAG, "Descriptor written for $charUuid (status=$status)")
 
                 if (charUuid == AUDIO_TX_UUID) {
-                    // Step 2: enable Control notifications
+                    // Step 2: enable Image TX notifications (or skip to Control)
+                    doEnableImageTxNotifications(gatt)
+                } else if (charUuid == IMAGE_TX_UUID) {
+                    // Step 3: enable Control notifications
                     doEnableControlNotifications(gatt)
                 } else if (charUuid == CONTROL_UUID) {
-                    // Step 3: fully connected
+                    // Step 4: fully connected
                     isConnected = true
                     val name = try { gatt.device?.name ?: "ESP32" } catch (_: Exception) { "ESP32" }
                     Log.i(TAG, "Fully connected to $name")
@@ -284,6 +310,31 @@ class BleVoiceService(
 
     // ── Helpers ──
 
+    private fun doEnableImageTxNotifications(gatt: BluetoothGatt) {
+        try {
+            val imgChar = imageTxChar
+            if (imgChar == null) {
+                // No IMAGE_TX characteristic — skip to Control
+                doEnableControlNotifications(gatt)
+                return
+            }
+            Log.i(TAG, "Enabling Image TX notifications...")
+            gatt.setCharacteristicNotification(imgChar, true)
+            val imgDesc = imgChar.getDescriptor(CCCD_UUID)
+            if (imgDesc != null) {
+                @Suppress("DEPRECATION")
+                imgDesc.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
+                @Suppress("DEPRECATION")
+                gatt.writeDescriptor(imgDesc)
+            } else {
+                doEnableControlNotifications(gatt)
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "enableImageTxNotifications error", e)
+            doEnableControlNotifications(gatt)
+        }
+    }
+
     private fun doEnableControlNotifications(gatt: BluetoothGatt) {
         try {
             val ctrl = controlChar ?: return
@@ -308,6 +359,7 @@ class BleVoiceService(
     private fun dispatchCharacteristicData(uuid: UUID, data: ByteArray) {
         when (uuid) {
             AUDIO_TX_UUID -> handleAudioTx(data)
+            IMAGE_TX_UUID -> handleImageTx(data)
             CONTROL_UUID -> handleControl(data)
         }
     }
@@ -340,7 +392,81 @@ class BleVoiceService(
                 Log.i(TAG, "Start marker → clearing buffer")
                 synchronized(audioChunks) { audioChunks.clear() }
             }
+            'I' -> {
+                // Image start: [tag='I'][reserved][4-byte LE length]
+                val expectedSize = if (data.size >= 6) {
+                    ByteBuffer.wrap(data, 2, 4).order(ByteOrder.LITTLE_ENDIAN).int
+                } else 0
+                Log.i(TAG, "Image start marker (expected $expectedSize bytes)")
+                visionHandler.removeCallbacks(visionTimeoutRunnable)
+                receivingImage = true
+                synchronized(imageBuffer) { imageBuffer.reset() }
+            }
+            'J' -> {
+                Log.i(TAG, "Image end marker")
+                receivingImage = false
+                finalizeImage()
+            }
         }
+    }
+
+    private fun handleImageTx(data: ByteArray) {
+        if (data.size <= HEADER_SIZE) return
+        // Strip [tag][seq] header, keep JPEG payload
+        val payload = data.copyOfRange(HEADER_SIZE, data.size)
+        synchronized(imageBuffer) {
+            imageBuffer.write(payload)
+        }
+    }
+
+    private fun finalizeImage() {
+        val jpeg: ByteArray
+        synchronized(imageBuffer) {
+            jpeg = imageBuffer.toByteArray()
+            imageBuffer.reset()
+        }
+        Log.i(TAG, "Image complete: ${jpeg.size} bytes")
+
+        val audioPcm = pendingAudioPcm
+        pendingAudioPcm = null
+
+        if (audioPcm != null && audioPcm.size >= MIN_AUDIO_BYTES) {
+            processVisionRequest(audioPcm, jpeg)
+        } else {
+            // Image only — ask the model to describe what it sees
+            processVisionRequest(null, jpeg)
+        }
+    }
+
+    private fun processVisionRequest(audioPcm: ByteArray?, jpeg: ByteArray) {
+        onEvent(BleEvent.ProcessingStarted)
+        Thread {
+            try {
+                val pcm = pipeline.processWithVision(audioPcm, jpeg)
+                if (pcm != null) sendAudioToEsp32(pcm)
+                else Log.w(TAG, "Vision pipeline returned null")
+            } catch (e: Exception) {
+                Log.e(TAG, "Vision processing error", e)
+                onEvent(BleEvent.Error(e.message ?: "Vision processing failed"))
+            }
+        }.start()
+    }
+
+    private fun processAudioOnly() {
+        val raw = pendingAudioPcm ?: return
+        pendingAudioPcm = null
+
+        onEvent(BleEvent.ProcessingStarted)
+        Thread {
+            try {
+                val pcm = pipeline.process(raw)
+                if (pcm != null) sendAudioToEsp32(pcm)
+                else Log.w(TAG, "Pipeline returned null")
+            } catch (e: Exception) {
+                Log.e(TAG, "Processing error", e)
+                onEvent(BleEvent.Error(e.message ?: "Processing failed"))
+            }
+        }.start()
     }
 
     private fun processReceivedAudio() {
@@ -363,18 +489,9 @@ class BleVoiceService(
             return
         }
 
-        onEvent(BleEvent.ProcessingStarted)
-
-        Thread {
-            try {
-                val pcm = pipeline.process(raw)
-                if (pcm != null) sendAudioToEsp32(pcm)
-                else Log.w(TAG, "Pipeline returned null")
-            } catch (e: Exception) {
-                Log.e(TAG, "Processing error", e)
-                onEvent(BleEvent.Error(e.message ?: "Processing failed"))
-            }
-        }.start()
+        // Stash audio and wait briefly for a possible image ('I' marker)
+        pendingAudioPcm = raw
+        visionHandler.postDelayed(visionTimeoutRunnable, VISION_WAIT_MS)
     }
 
     private fun sendAudioToEsp32(pcm: ByteArray) {
