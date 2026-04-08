@@ -159,7 +159,101 @@ static bool wsSendText(int socketId, const char* text)
 // Send audio data as binary (opcode 0x2) WebSocket frames.
 // Uses 1460-byte payload chunks so each frame fits in one socketSend call
 // (1460 payload + 8 WS header = 1468 bytes, within the 1500-byte AT limit).
-static bool wsSendBinaryChunked(int socketId, const uint8_t* data, size_t totalLen)
+// Forward declaration — defined below in the WS frame parser section.
+static bool parseNextWsFrame(uint8_t* outOpcode,
+                             const uint8_t** outPayload,
+                             size_t* outPayloadLen);
+
+// Shared state for interleaved upload + response collection.
+// Both wsSendBinaryChunked and collectAgentResponse use this so that
+// audio frames arriving during upload are timestamped and buffered immediately.
+struct CollectState {
+    uint8_t*      pcmBuf       = nullptr;
+    size_t        pcmCapacity  = 0;
+    size_t        pcmLen       = 0;
+    unsigned long firstAudioMs = 0;  // millis() of first binary (audio) WS frame
+    bool          audioDone    = false;
+};
+
+// Parse all available WS frames from responseBuffer and handle them.
+// Binary audio → buffered into cs; text events → logged; close/done → flagged.
+// Returns true if at least one frame was processed.
+static bool processAvailableFrames(CollectState& cs)
+{
+    bool           gotData = false;
+    uint8_t        opcode;
+    const uint8_t* payload;
+    size_t         payloadLen;
+
+    while (parseNextWsFrame(&opcode, &payload, &payloadLen)) {
+        gotData = true;
+
+        if (opcode == 0x2) {
+            // Binary: raw audio samples
+            if (cs.firstAudioMs == 0)
+                cs.firstAudioMs = millis();
+            if (cs.pcmLen + payloadLen <= cs.pcmCapacity) {
+                memcpy(cs.pcmBuf + cs.pcmLen, payload, payloadLen);
+                cs.pcmLen += payloadLen;
+            } else {
+                Serial.println("PCM buffer full, truncating audio");
+            }
+
+        } else if (opcode == 0x1) {
+            // Text: JSON event
+            JsonDocument doc;
+            DeserializationError err = deserializeJson(doc,
+                (const char*)payload, payloadLen);
+            if (!err) {
+                const char* type = doc["type"] | "";
+
+                #if VERBOSITY >= 2
+                Serial.printf("  WS event: %s\n", type);
+                #endif
+
+                if (strcmp(type, "ConversationText") == 0) {
+                    #if VERBOSITY >= 1
+                    const char* role    = doc["role"]    | "";
+                    const char* content = doc["content"] | "";
+                    Serial.printf("  [%s]: %.120s\n", role, content);
+                    #endif
+
+                } else if (strcmp(type, "AgentStartedSpeaking") == 0) {
+                    #if VERBOSITY >= 1
+                    float lat = doc["total_latency"] | 0.0f;
+                    Serial.printf("  Agent speaking (latency: %.2f s)\n", lat);
+                    #endif
+
+                } else if (strcmp(type, "AgentAudioDone") == 0) {
+                    Serial.println("  Agent audio complete");
+                    cs.audioDone = true;
+
+                } else if (strcmp(type, "Error") == 0) {
+                    Serial.printf("  Agent error: %s\n",
+                                  doc["description"] | "unknown");
+                    if (cs.pcmLen == 0) cs.audioDone = true;
+
+                } else if (strcmp(type, "Warning") == 0) {
+                    #if VERBOSITY >= 1
+                    Serial.printf("  Warning: %s\n",
+                                  doc["description"] | "");
+                    #endif
+                }
+            }
+
+        } else if (opcode == 0x8) {
+            // Close frame from server
+            #if VERBOSITY >= 1
+            Serial.println("  Server sent close frame");
+            #endif
+            cs.audioDone = true;
+        }
+    }
+    return gotData;
+}
+
+static bool wsSendBinaryChunked(int socketId, const uint8_t* data, size_t totalLen,
+                                CollectState* cs = nullptr)
 {
     const size_t payloadChunk = 1460;
     uint8_t frameBuf[1480]; // 1460 payload + 14 header bytes max, on stack
@@ -183,7 +277,15 @@ static bool wsSendBinaryChunked(int socketId, const uint8_t* data, size_t totalL
                           (unsigned)(sent * 100 / totalLen));
         }
         #endif
-        delay(5);
+
+        // Interleave: flush incoming data and parse WS frames between sends
+        if (cs) {
+            if (pendingRingBytes > 0 && lastRingMs > 0 &&
+                millis() - lastRingMs > RING_CHUNK_TIMEOUT_MS) {
+                flushPendingRing();
+            }
+            processAvailableFrames(*cs);
+        }
     }
 
     Serial.printf("Audio streaming complete: %u bytes sent\n", (unsigned)totalLen);
@@ -436,29 +538,21 @@ static char* buildSettingsJson(const char* prompt, const char* voice,
 //  RESPONSE COLLECTION
 // ================================================================
 
-// Reads WS frames from responseBuffer until AgentAudioDone (or timeout/disconnect).
-// Copies binary audio frames into pcmBuf.
-// outFirstAudioMs is set to millis() when the first binary frame arrives (0 if none received).
-// Returns the number of PCM bytes written to pcmBuf.
-static size_t collectAgentResponse(int socketId,
-                                   uint8_t* pcmBuf, size_t pcmCapacity,
-                                   unsigned long* outFirstAudioMs)
+// Continue collecting response frames using the shared CollectState.
+// Called after upload completes (some frames may already have been collected
+// during the upload phase via processAvailableFrames).
+static void collectAgentResponse(int socketId, CollectState& cs)
 {
-    *outFirstAudioMs = 0;
-
-    size_t        pcmLen        = 0;
-    bool          audioDone     = false;
     unsigned long noDataCount   = 0;
     unsigned long lastKeepalive = millis();
-    unsigned long lastStatus    = millis();
     unsigned long start         = millis();
     const unsigned long timeout = 120000; // 2 minutes
 
-    while (millis() - start < timeout) {
-        // Periodic status log
+    while (!cs.audioDone && millis() - start < timeout) {
         #if VERBOSITY >= 2
+        static unsigned long lastStatus = 0;
         if (millis() - lastStatus >= 5000) {
-            Serial.printf("  Collecting... %u audio bytes\n", (unsigned)pcmLen);
+            Serial.printf("  Collecting... %u audio bytes\n", (unsigned)cs.pcmLen);
             lastStatus = millis();
         }
         #endif
@@ -486,78 +580,9 @@ static size_t collectAgentResponse(int socketId,
             break;
         }
 
-        // Parse all available WS frames
-        bool        gotData = false;
-        uint8_t     opcode;
-        const uint8_t* payload;
-        size_t      payloadLen;
+        bool gotData = processAvailableFrames(cs);
 
-        while (parseNextWsFrame(&opcode, &payload, &payloadLen)) {
-            gotData = true;
-
-            if (opcode == 0x2) {
-                // Binary: raw audio samples
-                if (*outFirstAudioMs == 0)
-                    *outFirstAudioMs = millis();
-                if (pcmLen + payloadLen <= pcmCapacity) {
-                    memcpy(pcmBuf + pcmLen, payload, payloadLen);
-                    pcmLen += payloadLen;
-                } else {
-                    Serial.println("PCM buffer full, truncating audio");
-                }
-
-            } else if (opcode == 0x1) {
-                // Text: JSON event
-                JsonDocument doc;
-                DeserializationError err = deserializeJson(doc,
-                    (const char*)payload, payloadLen);
-                if (!err) {
-                    const char* type = doc["type"] | "";
-
-                    #if VERBOSITY >= 2
-                    Serial.printf("  WS event: %s\n", type);
-                    #endif
-
-                    if (strcmp(type, "ConversationText") == 0) {
-                        #if VERBOSITY >= 1
-                        const char* role    = doc["role"]    | "";
-                        const char* content = doc["content"] | "";
-                        Serial.printf("  [%s]: %.120s\n", role, content);
-                        #endif
-
-                    } else if (strcmp(type, "AgentStartedSpeaking") == 0) {
-                        #if VERBOSITY >= 1
-                        float lat = doc["total_latency"] | 0.0f;
-                        Serial.printf("  Agent speaking (latency: %.2f s)\n", lat);
-                        #endif
-
-                    } else if (strcmp(type, "AgentAudioDone") == 0) {
-                        Serial.println("  Agent audio complete");
-                        audioDone = true;
-
-                    } else if (strcmp(type, "Error") == 0) {
-                        Serial.printf("  Agent error: %s\n",
-                                      doc["description"] | "unknown");
-                        if (pcmLen == 0) return 0;
-
-                    } else if (strcmp(type, "Warning") == 0) {
-                        #if VERBOSITY >= 1
-                        Serial.printf("  Warning: %s\n",
-                                      doc["description"] | "");
-                        #endif
-                    }
-                }
-
-            } else if (opcode == 0x8) {
-                // Close frame from server
-                #if VERBOSITY >= 1
-                Serial.println("  Server sent close frame");
-                #endif
-                audioDone = true;
-            }
-        }
-
-        if (audioDone) break;
+        if (cs.audioDone) break;
 
         if (gotData) {
             noDataCount = 0;
@@ -572,8 +597,6 @@ static size_t collectAgentResponse(int socketId,
 
         delay(50);
     }
-
-    return pcmLen;
 }
 
 // ================================================================
@@ -674,13 +697,31 @@ bool audioToAudio(const char* audioPath,
     }
     Serial.println("SettingsApplied received");
 
-    // 6. Stream mulaw audio as binary WebSocket frames
+    // 6. Allocate output buffer before upload so we can collect audio during upload
+    const size_t pcmOutCapacity = 300 * 1024; // 300 KB — ~6 s at 24 kHz 16-bit mono
+    uint8_t* pcmOut = (uint8_t*)ps_malloc(pcmOutCapacity);
+    if (!pcmOut) {
+        Serial.println("PSRAM alloc failed for PCM output buffer");
+        free(mulawIn);
+        closeSocket(1);
+        freeResponseBuffer();
+        return false;
+    }
+
+    CollectState cs;
+    cs.pcmBuf      = pcmOut;
+    cs.pcmCapacity = pcmOutCapacity;
+
+    // 7. Stream mulaw audio as binary WebSocket frames.
+    //    Between each chunk, processAvailableFrames() parses any incoming WS
+    //    frames so firstAudioMs is set the moment Deepgram's first audio
+    //    frame is parsed — even if it arrives mid-upload.
     Serial.printf("Sending %u bytes of mulaw audio...\n", (unsigned)mulawInLen);
-    firstRingAfterResetMs = 0; // reset so we capture when Deepgram's response first arrives
     unsigned long audioSendStart = millis();
 
-    if (!wsSendBinaryChunked(1, mulawIn, mulawInLen)) {
+    if (!wsSendBinaryChunked(1, mulawIn, mulawInLen, &cs)) {
         free(mulawIn);
+        free(pcmOut);
         closeSocket(1);
         freeResponseBuffer();
         return false;
@@ -691,27 +732,17 @@ bool audioToAudio(const char* audioPath,
     unsigned long audioSendDone = millis();
     Serial.printf("[DG] Audio sent in %lu ms\n", audioSendDone - audioSendStart);
 
-    // 7. Collect spoken response
-    Serial.println("Waiting for agent response...");
-    const size_t pcmOutCapacity = 300 * 1024; // 300 KB — ~6 s at 24 kHz 16-bit mono
-    uint8_t* pcmOut = (uint8_t*)ps_malloc(pcmOutCapacity);
-    if (!pcmOut) {
-        Serial.println("PSRAM alloc failed for PCM output buffer");
-        closeSocket(1);
-        freeResponseBuffer();
-        return false;
+    // 8. Continue collecting response (some or all may already be in cs from the upload phase)
+    if (!cs.audioDone) {
+        Serial.println("Waiting for agent response...");
+        collectAgentResponse(1, cs);
     }
+    unsigned long collectDone = millis();
 
-    unsigned long firstAudioMs  = 0; // absolute millis() of first audio byte (from WS parsing)
-    size_t pcmOutLen = collectAgentResponse(1, pcmOut, pcmOutCapacity, &firstAudioMs);
-    unsigned long collectDone   = millis();
-
-    // Use the ring-handler timestamp for first response — it captures when data
-    // actually arrived at the modem, even if that happened during the upload phase.
-    // Fall back to the WS-parse timestamp if no ring fired (shouldn't happen).
-    unsigned long actualFirstMs = (firstRingAfterResetMs > 0) ? firstRingAfterResetMs : firstAudioMs;
-    unsigned long firstResponseMs = (actualFirstMs > audioSendStart) ? actualFirstMs - audioSendStart : 0;
+    unsigned long firstResponseMs = (cs.firstAudioMs > audioSendStart)
+                                    ? cs.firstAudioMs - audioSendStart : 0;
     unsigned long lastResponseMs  = collectDone - audioSendStart;
+    size_t pcmOutLen = cs.pcmLen;
 
     // Decode output mulaw → PCM16 (for timing; speaker output will use this buffer later)
     unsigned long decodeMs = 0;
