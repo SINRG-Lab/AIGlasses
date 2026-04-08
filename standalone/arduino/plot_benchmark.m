@@ -8,7 +8,7 @@
    DATA,END
 
  Timing model:
-   enc_ms         — PCM to mulaw encode (local, no network)
+   enc_ms         — Don't worry about PCM to mulaw encode (local, no network)
    up_ms          — wall-clock time to send all mulaw bytes
    first_resp_ms  — time from send-start to first audio byte received
    last_resp_ms   — time from send-start to AgentAudioDone / collect end
@@ -23,17 +23,27 @@
 
 filepath = fullfile(pwd, "serial_log.txt");
 
-colors = [
-    0.0784 0.1765 0.4118;     % navy blue
-    0.5500 0.3500 0.7000;     % muted purple
-    0.9000 0.7500 0.2000;     % muted yellow
-    0.8000 0.2000 0.2000;     % muted red
-    0.0000 0.5804 0.3686;     % velvet green
-    0.4000 0.4000 0.4000;     % neutral gray
-    0.2000 0.6000 0.7500;     % soft teal-blue
-    0.8000 0.5000 0.0000;     % orange
-    0.6000 0.2000 0.4500;     % wine / plum
-    ];
+%% ---- Color palette ----
+% Clean 4-color palette (upload, overlap, inference, download)
+% c_upload   = [0.220 0.557 0.835];  % steel blue
+% c_overlap  = [0.584 0.345 0.698];  % soft purple
+% c_infer    = [0.925 0.620 0.215];  % warm amber
+% c_download = [0.204 0.694 0.490];  % sea green
+c_sep      = [0.40  0.40  0.40 ];  % separator gray
+
+colors = lines(5);
+c_upload = colors(1,:);
+c_overlap = colors(2,:);
+c_infer = colors(3,:);
+c_download = colors(4,:);
+
+% Accent colors for line / box plots
+% c_ul_line  = [0.220 0.557 0.835];  % matches upload
+% c_dl_line  = [0.204 0.694 0.490];  % matches download
+c_ul_line = colors(1,:);
+c_dl_line = colors(4,:);
+
+txt_color  = [0.15 0.15 0.15];
 
 %% ---- Parse DATA lines from serial log ----
 fid = fopen(filepath, 'r');
@@ -93,93 +103,136 @@ up_kbs = (up_bytes ./ up_ms) * 1000 / 1024;
 dl_dur_ms = last_resp_ms - first_resp_ms;
 dl_kbs    = (dl_bytes ./ dl_dur_ms) * 1000 / 1024;
 
-% For the stacked bar, break the network phase into three non-overlapping
-% segments that sum to last_resp_ms:
-%   1) upload-only   = time before first response arrives (upload still going)
-%   2) overlap       = time both upload and download are active
-%   3) download-only = time after upload finishes but download continues
-% If first_resp < up, there is overlap; otherwise there is a gap (inference wait).
+% For the stacked bar, break the network phase into non-overlapping segments:
 upload_only_ms   = min(first_resp_ms, up_ms);
 overlap_ms       = max(0, up_ms - first_resp_ms);
 download_only_ms = max(0, last_resp_ms - up_ms);
-% The "inference gap" is time between upload done and first response, if any
 infer_gap_ms     = max(0, first_resp_ms - up_ms);
 
-%% ---- Figure 1: Stacked bar chart of total latency per trial ----
+%% ---- File boundary positions (for separator lines) ----
+file_boundaries = [];
+boundary_labels = {};
+for i = 2:N
+    if ~strcmp(files{i}, files{i-1})
+        file_boundaries(end+1) = i - 0.5; %#ok<SAGROW>
+        boundary_labels{end+1} = strrep(files{i}, '_', '\_'); %#ok<SAGROW>
+    end
+end
+
+%% ---- Build file group index for box plots ----
+file_idx = zeros(1, N);
+file_labels_escaped = cellfun(@(s) strrep(s, '_', '\_'), unique_files, 'UniformOutput', false);
+for i = 1:N
+    file_idx(i) = find(strcmp(unique_files, files{i}));
+end
+
+%% ---- Figure 1 (2x1): Latency ----
 figure(1);
-stage_matrix = [enc_ms; upload_only_ms; overlap_ms; infer_gap_ms; download_only_ms; dec_ms]' / 1000;
+
+% ---- Subplot 1: Stacked bar — per-trial latency breakdown ----
+subplot(2,1,1);
+stage_matrix = [upload_only_ms; overlap_ms; infer_gap_ms; download_only_ms]' / 1000;
 
 h = bar(1:N, stage_matrix, 'stacked');
+h(1).FaceColor = c_upload;
+h(2).FaceColor = c_overlap;
+h(3).FaceColor = c_infer;
+h(4).FaceColor = c_download;
+
 ax = gca;
-
-% Apply custom colors (rows of 'colors' correspond to stages)
-% Ensure we have one color per stage; repeat or truncate as needed
-numStages = numel(h);
-if size(colors,1) < numStages
-    % Repeat colors cyclically if not enough provided
-    rep = ceil(numStages / size(colors,1));
-    cmap = repmat(colors, rep, 1);
-else
-    cmap = colors;
-end
-cmap = cmap(1:numStages, :);
-
-for k = 1:numStages
-    h(k).FaceColor = 'flat';
-    h(k).CData = repmat(cmap(k,:), N, 1);
-end
-
-legend({'Encode', 'Upload (before resp)', 'Upload+Download overlap', ...
-        'Inference wait', 'Download (after upload)', 'Decode'}, ...
-        'Location', 'northeastoutside');
 xlabel('Trial');
 ylabel('Latency (s)');
 title('Per-Trial Latency Breakdown');
 xticks(1:N);
+ylim([0 max(sum(stage_matrix, 2)) * 1.15])
 grid on; box off;
 ax.YAxis.Color = 'none';
-ax.YLabel.Color = [0.15 0.15 0.15];
-ax.YAxis.TickLabelColor = [0.15 0.15 0.15];
+ax.YLabel.Color = txt_color;
+ax.YAxis.TickLabelColor = txt_color;
+ax.XGrid = 'off';
+ax.YGrid = 'on';
+hold on;
+for bi = 1:numel(file_boundaries)
+    xline(file_boundaries(bi), '--', 'Color', c_sep, 'LineWidth', 1, 'HandleVisibility', 'off');
+end
+hold off;
+legend(h, {'Upload', 'Upload + Download', 'Inference wait', 'Download'}, ...
+       'Location', 'best');
+
+% ---- Subplot 2: Average stage proportion ----
+subplot(2,1,2);
+avg_up_only  = mean(upload_only_ms  ./ total_ms) * 100;
+avg_overlap  = mean(overlap_ms      ./ total_ms) * 100;
+avg_infer    = mean(infer_gap_ms    ./ total_ms) * 100;
+avg_dl_only  = mean(download_only_ms./ total_ms) * 100;
+
+b = bar([avg_up_only, avg_overlap, avg_infer, avg_dl_only]);
+b.FaceColor = 'flat';
+b.CData = [c_upload; c_overlap; c_infer; c_download];
+ax = gca;
+xticklabels({'Upload', 'Upload + Download', 'Inference', 'Download'});
+ylabel('% of Total Pipeline');
+ylim([0 max([avg_up_only, avg_overlap, avg_infer, avg_dl_only]) * 1.15]);
+title('Average Stage Proportion');
+grid on; box off;
+ax.YAxis.Color = 'none';
+ax.YLabel.Color = txt_color;
+ax.YAxis.TickLabelColor = txt_color;
 ax.XGrid = 'off';
 ax.YGrid = 'on';
 
-%% ---- Figure 2: Upload and download speed over trials ----
+%% ---- Figure 2 (2x1): Speed ----
 figure(2);
-plot(1:N, up_kbs, '-o', 'Color', colors(3, :), 'LineWidth', 1.5);
+
+% ---- Subplot 3: Upload / download speed per trial ----
+subplot(2,1,1);
+h_up = plot(1:N, up_kbs, '-o', 'Color', c_ul_line, 'LineWidth', 1.5, 'MarkerSize', 5);
 hold on;
-plot(1:N, dl_kbs, '-s', 'Color', colors(2, :), 'LineWidth', 1.5);
+h_dl = plot(1:N, dl_kbs, '-s', 'Color', c_dl_line, 'LineWidth', 1.5, 'MarkerSize', 5);
 ax = gca;
-legend({'Upload', 'Download'});
 xlabel('Trial');
 ylabel('Speed (KB/s)');
 title('Upload / Download Speed per Trial');
 xticks(1:N);
 grid on; box off;
 ax.YAxis.Color = 'none';
-ax.YLabel.Color = [0.15 0.15 0.15];
-ax.YAxis.TickLabelColor = [0.15 0.15 0.15];
+ax.YLabel.Color = txt_color;
+ax.YAxis.TickLabelColor = txt_color;
 ax.XGrid = 'off';
 ax.YGrid = 'on';
+sep_handles_2 = gobjects(numel(file_boundaries), 1);
+for bi = 1:numel(file_boundaries)
+    sep_handles_2(bi) = xline(file_boundaries(bi), '--', 'Color', c_sep, 'LineWidth', 1);
+end
+legend([h_up, h_dl, sep_handles_2'], ...
+       [{'Upload', 'Download'}, boundary_labels], ...
+       'Location', 'best');
 hold off;
 
-%% ---- Figure 3: Average % each stage takes of total pipeline ----
-avg_enc      = mean(enc_ms          ./ total_ms) * 100;
-avg_up_only  = mean(upload_only_ms  ./ total_ms) * 100;
-avg_overlap  = mean(overlap_ms      ./ total_ms) * 100;
-avg_infer    = mean(infer_gap_ms    ./ total_ms) * 100;
-avg_dl_only  = mean(download_only_ms./ total_ms) * 100;
-avg_dec      = mean(dec_ms          ./ total_ms) * 100;
+% ---- Subplot 4: Speed variation box plot ----
+subplot(2,1,2);
 
-figure(3);
-b = bar([avg_enc, avg_up_only, avg_infer, avg_overlap, avg_dl_only, avg_dec]);
-b.FaceColor = colors(1,:);
+group_data = [up_kbs, dl_kbs]';
+group_type = categorical([repmat({'Upload'}, 1, N), repmat({'Download'}, 1, N)])';
+
+bc = boxchart(group_type, group_data);
+bc.BoxFaceColor = [0.5 0.5 0.5];
+bc.MarkerColor  = [0.5 0.5 0.5];
+
 ax = gca;
-xticklabels({'Encode', 'Upload', 'Inference', 'Overlap', 'Download', 'Decode'});
-ylabel('% of Total Pipeline');
-title('Average Stage Proportion');
+cla;
+hold on;
+bc_up = boxchart(ones(N,1), up_kbs', 'BoxFaceColor', c_ul_line, 'MarkerColor', c_ul_line);
+bc_dl = boxchart(2*ones(N,1), dl_kbs', 'BoxFaceColor', c_dl_line, 'MarkerColor', c_dl_line);
+hold off;
+ax.XTick = [1 2];
+ax.XTickLabel = {'Upload', 'Download'};
+ylabel('Speed (KB/s)');
+title('Overall Speed Variation');
+legend([bc_up, bc_dl], {'Upload', 'Download'}, 'Location', 'best');
 grid on; box off;
 ax.YAxis.Color = 'none';
-ax.YLabel.Color = [0.15 0.15 0.15];
-ax.YAxis.TickLabelColor = [0.15 0.15 0.15];
+ax.YLabel.Color = txt_color;
+ax.YAxis.TickLabelColor = txt_color;
 ax.XGrid = 'off';
 ax.YGrid = 'on';
