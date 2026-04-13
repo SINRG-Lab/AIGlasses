@@ -707,6 +707,19 @@ void setup() {
 
   Serial.printf("[SYS] PSRAM: %u KB\n", ESP.getPsramSize() / 1024);
   Serial.printf("[SYS] Free heap: %u KB\n", ESP.getFreeHeap() / 1024);
+  Serial.printf("[SYS] Free PSRAM: %u KB\n", ESP.getFreePsram() / 1024);
+
+  // ── Initialize camera FIRST — before any PSRAM/DMA allocations ──
+  // The camera driver claims DMA channels and PSRAM frame buffers.
+  // If the mic or ring buffer are initialized first, DMA channel conflicts
+  // or PSRAM fragmentation can cause esp_camera_fb_get() to return NULL.
+  Serial.println("[CAM] Initializing camera...");
+  if (!initCamera()) {
+    Serial.println("[CAM] FAILED — voice-only mode (no camera)");
+  } else {
+    Serial.println("[CAM] Camera initialized OK");
+  }
+  Serial.printf("[SYS] Free PSRAM after camera: %u KB\n", ESP.getFreePsram() / 1024);
 
   // Allocate ring buffer in PSRAM
   ringBuffer = (uint8_t*)ps_malloc(RING_SIZE);
@@ -743,14 +756,6 @@ void setup() {
     i2s_channel_read(pdmRxHandle, micBuf, sizeof(micBuf), &dummy, 50 / portTICK_PERIOD_MS);
   }
   Serial.println("[MIC] Warmup complete — DMA flushed");
-
-  // Initialize camera
-  Serial.println("[CAM] Initializing OV3660...");
-  if (!initCamera()) {
-    Serial.println("[CAM] FAILED — voice-only mode (no camera)");
-  } else {
-    Serial.println("[CAM] OV3660 initialized OK");
-  }
 
   // ── Initialize BLE ──
   Serial.println("\n[BLE] Initializing...");
