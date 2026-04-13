@@ -339,6 +339,19 @@ bool initCamera() {
     s->set_gain_ctrl(s, 1);
   }
 
+  // Warm up the sensor — discard the first several frames.
+  // The OV2640/OV3660 outputs garbage or returns NULL on esp_camera_fb_get()
+  // until the AEC/AWB loops have converged (~300–500 ms after clock start).
+  Serial.println("[CAM] Warming up sensor (discarding first frames)...");
+  for (int i = 0; i < 5; i++) {
+    camera_fb_t *warmup = esp_camera_fb_get();
+    if (warmup) {
+      esp_camera_fb_return(warmup);
+    }
+    delay(100);
+  }
+  Serial.println("[CAM] Sensor warm-up complete");
+
   return true;
 }
 
@@ -346,9 +359,17 @@ bool initCamera() {
 //  Capture camera snapshot into PSRAM buffer
 // ════════════════════════════════════════════════════════════════
 bool captureSnapshot() {
-  camera_fb_t *fb = esp_camera_fb_get();
+  // Retry up to 5 times — sensor occasionally needs a few attempts
+  // if it was idle or the DMA pipeline stalled.
+  camera_fb_t *fb = nullptr;
+  for (int attempt = 1; attempt <= 5; attempt++) {
+    fb = esp_camera_fb_get();
+    if (fb) break;
+    Serial.printf("[CAM] Capture attempt %d failed, retrying...\n", attempt);
+    delay(150);
+  }
   if (!fb) {
-    Serial.println("[CAM] Capture failed!");
+    Serial.println("[CAM] Capture FAILED after 5 attempts!");
     return false;
   }
 
