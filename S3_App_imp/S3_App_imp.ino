@@ -23,13 +23,13 @@
 // ════════════════════════════════════════════════════════════════
 //  I2S Pins — XIAO ESP32-S3 Sense
 //    Speaker (MAX98357A x2, hardware-panned L/R via SD_MODE):
-//      BCLK = GPIO6, LRC = GPIO7, DIN = GPIO8
+//      BCLK = GPIO18, LRC = GPIO22, DIN = GPIO20
 //    Microphone: built-in PDM mic (MSM261D3526H1CPM)
 //      PDM_CLK  = GPIO42, PDM_DATA = GPIO41
 // ════════════════════════════════════════════════════════════════
-#define I2S_BCLK    6    // Speaker BCLK
-#define I2S_WS      7    // Speaker LRC / WS
-#define AMP_DIN     8    // Speaker DIN (data out)
+#define I2S_BCLK    18   // Speaker BCLK
+#define I2S_WS      22   // Speaker LRC / WS
+#define AMP_DIN     20   // Speaker DIN (data out)
 
 // Built-in PDM mic pins (XIAO ESP32-S3 Sense)
 #define PDM_CLK     42
@@ -709,17 +709,9 @@ void setup() {
   Serial.printf("[SYS] Free heap: %u KB\n", ESP.getFreeHeap() / 1024);
   Serial.printf("[SYS] Free PSRAM: %u KB\n", ESP.getFreePsram() / 1024);
 
-  // ── Initialize camera FIRST — before any PSRAM/DMA allocations ──
-  // The camera driver claims DMA channels and PSRAM frame buffers.
-  // If the mic or ring buffer are initialized first, DMA channel conflicts
-  // or PSRAM fragmentation can cause esp_camera_fb_get() to return NULL.
-  Serial.println("[CAM] Initializing camera...");
-  if (!initCamera()) {
-    Serial.println("[CAM] FAILED — voice-only mode (no camera)");
-  } else {
-    Serial.println("[CAM] Camera initialized OK");
-  }
-  Serial.printf("[SYS] Free PSRAM after camera: %u KB\n", ESP.getFreePsram() / 1024);
+  // ── Camera disabled: GPIO18 (CAM_Y4) conflicts with speaker BCLK on this PCB rev ──
+  // Fix planned for next PCB revision. Without XCLK the sensor stays idle so GPIO18 is free.
+  Serial.println("[CAM] Disabled — GPIO18 conflict with speaker BCLK (fix in next PCB rev)");
 
   // Allocate ring buffer in PSRAM
   ringBuffer = (uint8_t*)ps_malloc(RING_SIZE);
