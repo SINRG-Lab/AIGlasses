@@ -67,6 +67,12 @@ static const int SAMPLES_PER_CHUNK = 512;
 // 16-bit output buffer sent over BLE (PDM mic outputs 16-bit directly)
 static int16_t micBuf[SAMPLES_PER_CHUNK];
 
+// Speaker volume attenuation (right-shift). MAX98357A has fixed 9dB gain;
+// full-scale digital audio drives it into clipping → buzzy/distorted output.
+// 0 = full, 1 = -6dB (half), 2 = -12dB (quarter), 3 = -18dB (1/8), 4 = -24dB.
+// Tune down if still loud/buzzy, up if too quiet.
+#define SPK_VOL_SHIFT   2
+
 // ════════════════════════════════════════════════════════════════
 //  Ring Buffer for streaming playback (PSRAM-backed)
 //  BLE callback (NimBLE task) writes → main loop reads → I2S
@@ -510,12 +516,13 @@ void streamPlaybackTick() {
       }
     }
 
-    // Interleave mono → stereo (L=R)
+    // Interleave mono → stereo (L=R) with volume attenuation
     const int16_t* monoSrc = (const int16_t*)monoReadBuf;
     size_t monoSamples = wantBytes / 2;
     for (size_t i = 0; i < monoSamples; i++) {
-      stereoChunk[2 * i]     = monoSrc[i];
-      stereoChunk[2 * i + 1] = monoSrc[i];
+      int16_t s = monoSrc[i] >> SPK_VOL_SHIFT;
+      stereoChunk[2 * i]     = s;
+      stereoChunk[2 * i + 1] = s;
     }
 
     size_t bytesToWrite = monoSamples * 2 * sizeof(int16_t);
