@@ -71,7 +71,7 @@ static int16_t micBuf[SAMPLES_PER_CHUNK];
 // full-scale digital audio drives it into clipping → buzzy/distorted output.
 // 0 = full, 1 = -6dB (half), 2 = -12dB (quarter), 3 = -18dB (1/8), 4 = -24dB.
 // Tune down if still loud/buzzy, up if too quiet.
-#define SPK_VOL_SHIFT   2
+#define SPK_VOL_SHIFT   1
 
 // ════════════════════════════════════════════════════════════════
 //  Ring Buffer for streaming playback (PSRAM-backed)
@@ -133,9 +133,9 @@ enum StreamState {
 };
 static volatile StreamState streamState = STREAM_IDLE;
 static volatile bool endMarkerReceived = false;
-// Pre-buffer ~550 ms at 22050 Hz mono 16-bit before starting playback.
+// Pre-buffer ~800 ms at 22050 Hz mono 16-bit before starting playback.
 // Larger = more latency but more tolerance to BLE jitter/bursts (fewer cut-outs).
-#define STREAM_START_THRESHOLD  24000
+#define STREAM_START_THRESHOLD  35000
 // If the ring drops below this while playing, insert silence rather than
 // feeding starved data — prevents audible glitches on brief underruns.
 #define STREAM_LOW_WATER        2048
@@ -499,7 +499,7 @@ void streamPlaybackTick() {
       // Wait (non-blocking busy-yield) up to ~60 ms for more data to arrive
       // before giving up and writing silence for this tick.
       unsigned long waitStart = millis();
-      while (ringAvailable() < wantBytes && (millis() - waitStart) < 60) {
+      while (ringAvailable() < wantBytes && (millis() - waitStart) < 120) {
         delay(2);
       }
       if (ringAvailable() >= wantBytes) {
