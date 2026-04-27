@@ -10,3 +10,15 @@ local.properties
 .vscode/launch.json
 .vscode/ipch
 .vscode/extensions.json
+.vscode/
+
+# Editor / IDE
+.idea/
+.kotlin/
+
+# Backups & scratch
+*.backup
+~$*
+
+# Local tool worktrees
+.claude/

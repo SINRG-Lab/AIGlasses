@@ -151,13 +151,22 @@ class OpenAIService(private val apiKey: String) {
      */
     fun visionChat(userText: String, jpegBytes: ByteArray): String {
         // Re-encode through Android Bitmap as PNG — ESP32 camera JPEGs have
-        // non-standard headers that OpenAI rejects
+        // non-standard headers that OpenAI rejects.
+        // If decode fails (corrupted BLE transfer), fall back to raw JPEG bytes.
         val bitmap = BitmapFactory.decodeByteArray(jpegBytes, 0, jpegBytes.size)
-            ?: throw Exception("Failed to decode JPEG from camera")
-        val pngStream = java.io.ByteArrayOutputStream()
-        bitmap.compress(Bitmap.CompressFormat.PNG, 100, pngStream)
-        val base64Image = Base64.encodeToString(pngStream.toByteArray(), Base64.NO_WRAP)
-        val imageUrl = "data:image/png;base64,$base64Image"
+        val base64Image: String
+        val mimeType: String
+        if (bitmap != null) {
+            val pngStream = java.io.ByteArrayOutputStream()
+            bitmap.compress(Bitmap.CompressFormat.PNG, 100, pngStream)
+            base64Image = Base64.encodeToString(pngStream.toByteArray(), Base64.NO_WRAP)
+            mimeType = "image/png"
+        } else {
+            // Raw bytes — image may be partially corrupted from BLE
+            base64Image = Base64.encodeToString(jpegBytes, Base64.NO_WRAP)
+            mimeType = "image/jpeg"
+        }
+        val imageUrl = "data:$mimeType;base64,$base64Image"
 
         val contentArray = JSONArray().apply {
             put(JSONObject().apply {

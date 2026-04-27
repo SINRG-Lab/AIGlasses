@@ -23,13 +23,13 @@
 // ════════════════════════════════════════════════════════════════
 //  I2S Pins — XIAO ESP32-S3 Sense
 //    Speaker (MAX98357A x2, hardware-panned L/R via SD_MODE):
-//      BCLK = GPIO6, LRC = GPIO7, DIN = GPIO8
+//      BCLK = GPIO9, LRC = GPIO5, DIN = GPIO8
 //    Microphone: built-in PDM mic (MSM261D3526H1CPM)
 //      PDM_CLK  = GPIO42, PDM_DATA = GPIO41
 // ════════════════════════════════════════════════════════════════
-#define I2S_BCLK    6    // Speaker BCLK
-#define I2S_WS      7    // Speaker LRC / WS
-#define AMP_DIN     8    // Speaker DIN (data out)
+#define I2S_BCLK    9   // Speaker BCLK
+#define I2S_WS      5   // Speaker LRC / WS
+#define AMP_DIN     8   // Speaker DIN (data out)
 
 // Built-in PDM mic pins (XIAO ESP32-S3 Sense)
 #define PDM_CLK     42
@@ -54,9 +54,9 @@
 #define CAM_PCLK    13
 
 // ════════════════════════════════════════════════════════════════
-//  Push-to-talk button: GPIO5 → GND when pressed (active LOW)
+//  Push-to-talk button: GPIO6 → HIGH when pressed (active HIGH)
 // ════════════════════════════════════════════════════════════════
-#define PTT_PIN         5
+#define PTT_PIN         6
 
 // ════════════════════════════════════════════════════════════════
 //  Audio settings
@@ -66,6 +66,12 @@ static const int SPK_SR = 22050;
 static const int SAMPLES_PER_CHUNK = 512;
 // 16-bit output buffer sent over BLE (PDM mic outputs 16-bit directly)
 static int16_t micBuf[SAMPLES_PER_CHUNK];
+
+// Speaker volume attenuation (right-shift). MAX98357A has fixed 9dB gain;
+// full-scale digital audio drives it into clipping → buzzy/distorted output.
+// 0 = full, 1 = -6dB (half), 2 = -12dB (quarter), 3 = -18dB (1/8), 4 = -24dB.
+// Tune down if still loud/buzzy, up if too quiet.
+#define SPK_VOL_SHIFT   1
 
 // ════════════════════════════════════════════════════════════════
 //  Ring Buffer for streaming playback (PSRAM-backed)
@@ -127,9 +133,9 @@ enum StreamState {
 };
 static volatile StreamState streamState = STREAM_IDLE;
 static volatile bool endMarkerReceived = false;
-// Pre-buffer ~550 ms at 22050 Hz mono 16-bit before starting playback.
+// Pre-buffer ~800 ms at 22050 Hz mono 16-bit before starting playback.
 // Larger = more latency but more tolerance to BLE jitter/bursts (fewer cut-outs).
-#define STREAM_START_THRESHOLD  24000
+#define STREAM_START_THRESHOLD  35000
 // If the ring drops below this while playing, insert silence rather than
 // feeding starved data — prevents audible glitches on brief underruns.
 #define STREAM_LOW_WATER        2048
@@ -339,6 +345,19 @@ bool initCamera() {
     s->set_gain_ctrl(s, 1);
   }
 
+  // Warm up the sensor — discard the first several frames.
+  // The OV2640/OV3660 outputs garbage or returns NULL on esp_camera_fb_get()
+  // until the AEC/AWB loops have converged (~300–500 ms after clock start).
+  Serial.println("[CAM] Warming up sensor (discarding first frames)...");
+  for (int i = 0; i < 5; i++) {
+    camera_fb_t *warmup = esp_camera_fb_get();
+    if (warmup) {
+      esp_camera_fb_return(warmup);
+    }
+    delay(100);
+  }
+  Serial.println("[CAM] Sensor warm-up complete");
+
   return true;
 }
 
@@ -346,9 +365,17 @@ bool initCamera() {
 //  Capture camera snapshot into PSRAM buffer
 // ════════════════════════════════════════════════════════════════
 bool captureSnapshot() {
-  camera_fb_t *fb = esp_camera_fb_get();
+  // Retry up to 5 times — sensor occasionally needs a few attempts
+  // if it was idle or the DMA pipeline stalled.
+  camera_fb_t *fb = nullptr;
+  for (int attempt = 1; attempt <= 5; attempt++) {
+    fb = esp_camera_fb_get();
+    if (fb) break;
+    Serial.printf("[CAM] Capture attempt %d failed, retrying...\n", attempt);
+    delay(150);
+  }
   if (!fb) {
-    Serial.println("[CAM] Capture failed!");
+    Serial.println("[CAM] Capture FAILED after 5 attempts!");
     return false;
   }
 
@@ -472,7 +499,7 @@ void streamPlaybackTick() {
       // Wait (non-blocking busy-yield) up to ~60 ms for more data to arrive
       // before giving up and writing silence for this tick.
       unsigned long waitStart = millis();
-      while (ringAvailable() < wantBytes && (millis() - waitStart) < 60) {
+      while (ringAvailable() < wantBytes && (millis() - waitStart) < 120) {
         delay(2);
       }
       if (ringAvailable() >= wantBytes) {
@@ -489,12 +516,13 @@ void streamPlaybackTick() {
       }
     }
 
-    // Interleave mono → stereo (L=R)
+    // Interleave mono → stereo (L=R) with volume attenuation
     const int16_t* monoSrc = (const int16_t*)monoReadBuf;
     size_t monoSamples = wantBytes / 2;
     for (size_t i = 0; i < monoSamples; i++) {
-      stereoChunk[2 * i]     = monoSrc[i];
-      stereoChunk[2 * i + 1] = monoSrc[i];
+      int16_t s = monoSrc[i] >> SPK_VOL_SHIFT;
+      stereoChunk[2 * i]     = s;
+      stereoChunk[2 * i + 1] = s;
     }
 
     size_t bytesToWrite = monoSamples * 2 * sizeof(int16_t);
@@ -686,6 +714,19 @@ void setup() {
 
   Serial.printf("[SYS] PSRAM: %u KB\n", ESP.getPsramSize() / 1024);
   Serial.printf("[SYS] Free heap: %u KB\n", ESP.getFreeHeap() / 1024);
+  Serial.printf("[SYS] Free PSRAM: %u KB\n", ESP.getFreePsram() / 1024);
+
+  // ── Initialize camera FIRST — before any PSRAM/DMA allocations ──
+  // The camera driver claims DMA channels and PSRAM frame buffers.
+  // If the mic or ring buffer are initialized first, DMA channel conflicts
+  // or PSRAM fragmentation can cause esp_camera_fb_get() to return NULL.
+  Serial.println("[CAM] Initializing camera...");
+  if (!initCamera()) {
+    Serial.println("[CAM] FAILED — voice-only mode (no camera)");
+  } else {
+    Serial.println("[CAM] Camera initialized OK");
+  }
+  Serial.printf("[SYS] Free PSRAM after camera: %u KB\n", ESP.getFreePsram() / 1024);
 
   // Allocate ring buffer in PSRAM
   ringBuffer = (uint8_t*)ps_malloc(RING_SIZE);
@@ -699,16 +740,16 @@ void setup() {
     Serial.println("[SYS] FATAL: Could not allocate ring buffer!");
   }
 
-  // Push-to-talk button (active LOW — button shorts GPIO5 to GND)
-  pinMode(PTT_PIN, INPUT_PULLUP);
+  // Push-to-talk button (active HIGH — pressed = HIGH, released = LOW)
+  pinMode(PTT_PIN, INPUT_PULLDOWN);
   delay(100);
 
   int btnState = digitalRead(PTT_PIN);
   Serial.printf("[PTT] GPIO%d initial state: %s (%d)\n",
-                PTT_PIN, btnState == HIGH ? "HIGH (not pressed)" : "LOW (pressed!)", btnState);
-  if (btnState == LOW) {
-    Serial.println("[PTT] WARNING: Button reads LOW at boot! Check wiring.");
-    while (digitalRead(PTT_PIN) == LOW) delay(100);
+                PTT_PIN, btnState == LOW ? "LOW (not pressed)" : "HIGH (pressed!)", btnState);
+  if (btnState == HIGH) {
+    Serial.println("[PTT] WARNING: Button reads HIGH at boot! Check wiring.");
+    while (digitalRead(PTT_PIN) == HIGH) delay(100);
     Serial.println("[PTT] Button released, continuing...");
   }
 
@@ -722,14 +763,6 @@ void setup() {
     i2s_channel_read(pdmRxHandle, micBuf, sizeof(micBuf), &dummy, 50 / portTICK_PERIOD_MS);
   }
   Serial.println("[MIC] Warmup complete — DMA flushed");
-
-  // Initialize camera
-  Serial.println("[CAM] Initializing OV3660...");
-  if (!initCamera()) {
-    Serial.println("[CAM] FAILED — voice-only mode (no camera)");
-  } else {
-    Serial.println("[CAM] OV3660 initialized OK");
-  }
 
   // ── Initialize BLE ──
   Serial.println("\n[BLE] Initializing...");
@@ -805,10 +838,10 @@ void loop() {
     return;
   }
 
-  // Debounced button read (active LOW)
-  bool raw1 = (digitalRead(PTT_PIN) == LOW);
+  // Debounced button read (active HIGH)
+  bool raw1 = (digitalRead(PTT_PIN) == HIGH);
   delay(10);
-  bool raw2 = (digitalRead(PTT_PIN) == LOW);
+  bool raw2 = (digitalRead(PTT_PIN) == HIGH);
   bool pressed = raw1 && raw2;
 
   static bool wasPressed = false;
