@@ -5,6 +5,13 @@
 
 namespace deepgram {
 
+// Callback: fills pcmBuf with up to maxSamples int16 samples from the mic.
+// Returns the number of samples actually read (0 on timeout).
+typedef size_t (*MicReadFn)(int16_t* pcmBuf, size_t maxSamples);
+
+// Callback: returns true when recording should stop (e.g. button pressed).
+typedef bool (*StopFn)();
+
 // Per-call latency and throughput data.
 // Populated by audioToAudio when outTiming != nullptr.
 //
@@ -44,6 +51,20 @@ bool audioToAudio(
     const char* voice          = "aura-2-asteria-en",
     Timing*     outTiming      = nullptr,
     bool        printBreakdown = true
+);
+
+// Stream live mic audio to Deepgram while recording.
+// micReadFn: called repeatedly to get PCM16 samples from the mic.
+// stopFn:    called each chunk — return true to stop recording.
+// On success, *outPcm16 is a PSRAM buffer of PCM16 samples at 8kHz (caller must free).
+// *outPcm16Len is the byte count.
+bool liveToAudio(
+    MicReadFn   micReadFn,
+    StopFn      stopFn,
+    uint8_t**   outPcm16,
+    size_t*     outPcm16Len,
+    const char* prompt = "You are a helpful voice assistant. Be concise.",
+    const char* voice  = "aura-2-asteria-en"
 );
 
 } // namespace deepgram
