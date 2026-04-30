@@ -810,4 +810,177 @@ bool audioToAudio(const char* audioPath,
     return true;
 }
 
+// ================================================================
+//  INLINE MULAW ENCODER  (mirrors encodeLinearToMulaw in audio_utils)
+// ================================================================
+
+static uint8_t encodeMulaw(int16_t sample)
+{
+    const int BIAS = 0x84;
+    const int CLIP = 32767;
+    int sign = 0;
+    if (sample < 0) {
+        sign   = 0x80;
+        sample = (sample == INT16_MIN) ? INT16_MAX : -sample;
+    }
+    if (sample > CLIP) sample = CLIP;
+    sample += BIAS;
+    int exp;
+    if      (sample < 0x0100) exp = 0;
+    else if (sample < 0x0200) exp = 1;
+    else if (sample < 0x0400) exp = 2;
+    else if (sample < 0x0800) exp = 3;
+    else if (sample < 0x1000) exp = 4;
+    else if (sample < 0x2000) exp = 5;
+    else if (sample < 0x4000) exp = 6;
+    else                      exp = 7;
+    int mantissa = (sample >> (exp + 3)) & 0x0F;
+    return (uint8_t)(~(sign | (exp << 4) | mantissa));
+}
+
+// ================================================================
+//  LIVE MIC → DEEPGRAM STREAMING
+// ================================================================
+
+bool liveToAudio(MicReadFn micReadFn, StopFn stopFn,
+                 uint8_t** outPcm16, size_t* outPcm16Len,
+                 const char* prompt, const char* voice)
+{
+    Serial.println("\n--- Deepgram Live Agent ---");
+    Serial.flush();
+
+    // Static chunk buffers — avoids repeated heap alloc in tight loop
+    static int16_t chunkPcm[512];
+    static uint8_t chunkMulaw[512];
+    static uint8_t wsFrame[512 + 14]; // payload + max WS header
+
+    // 1. Connect and handshake
+    Serial.println("[DG] Resetting response buffer...");
+    Serial.flush();
+    wsParsedOffset = 0;
+    resetResponseBuffer(512 * 1024);
+    Serial.println("[DG] Response buffer ready, connecting socket...");
+    Serial.flush();
+
+    if (!connectSocket(1, DG_HOST, DG_PORT)) {
+        freeResponseBuffer();
+        return false;
+    }
+    if (!wsHandshake(1)) {
+        closeSocket(1);
+        freeResponseBuffer();
+        return false;
+    }
+
+    // 2. Settings: mulaw input at 16kHz, mulaw output at 8kHz
+    char* settingsJson = buildSettingsJson(prompt, voice, 16000, "mulaw");
+    if (!settingsJson || !wsSendText(1, settingsJson)) {
+        free(settingsJson);
+        closeSocket(1);
+        freeResponseBuffer();
+        return false;
+    }
+    free(settingsJson);
+    Serial.println("Settings sent, waiting for SettingsApplied...");
+
+    if (!waitForWsEvent(1, "SettingsApplied", 15000)) {
+        Serial.println("Never received SettingsApplied");
+        closeSocket(1);
+        freeResponseBuffer();
+        return false;
+    }
+    Serial.println("Recording — press button to stop.");
+
+    // 3. Allocate response collection buffer
+    const size_t pcmOutCapacity = 300 * 1024;
+    uint8_t* pcmOut = (uint8_t*)ps_malloc(pcmOutCapacity);
+    if (!pcmOut) {
+        Serial.println("PSRAM alloc failed for response buffer");
+        closeSocket(1);
+        freeResponseBuffer();
+        return false;
+    }
+    CollectState cs;
+    cs.pcmBuf      = pcmOut;
+    cs.pcmCapacity = pcmOutCapacity;
+
+    // 4. Live record + stream loop
+    // Ignore stopFn for first 500ms to let button bounce settle
+    unsigned long recStartMs = millis();
+    unsigned long lastBtnMs  = recStartMs;
+
+    while (true) {
+        size_t samples = micReadFn(chunkPcm, 512);
+        if (samples > 0) {
+            // Encode PCM16 → mulaw
+            for (size_t i = 0; i < samples; i++)
+                chunkMulaw[i] = encodeMulaw(chunkPcm[i]);
+
+            // Build WS binary frame and send
+            size_t frameLen = buildWsFrame(wsFrame, 0x2, chunkMulaw, samples);
+            WalterModem::socketSend(1, wsFrame, (uint16_t)frameLen);
+        }
+
+        // Drain any incoming WS frames (early response audio)
+        if (pendingRingBytes > 0 && lastRingMs > 0 &&
+            millis() - lastRingMs > RING_CHUNK_TIMEOUT_MS) {
+            flushPendingRing();
+        }
+        processAvailableFrames(cs);
+
+        // Check stop condition every 100ms (after 500ms min recording)
+        if (millis() - lastBtnMs >= 100) {
+            lastBtnMs = millis();
+            if (millis() - recStartMs >= 500 && stopFn()) break;
+        }
+    }
+
+    Serial.printf("[LIVE] Recorded %.2f s, sending trailing silence...\n",
+                  (millis() - recStartMs) / 1000.0f);
+
+    // 5. Send 1.5s trailing silence so Deepgram endpointing triggers
+    memset(chunkMulaw, 0xFF, sizeof(chunkMulaw)); // 0xFF = mulaw silence
+    size_t silenceTotal = 16000 * 3 / 2;          // 1.5s at 16kHz
+    size_t silenceSent  = 0;
+    while (silenceSent < silenceTotal) {
+        size_t chunk = min((size_t)512, silenceTotal - silenceSent);
+        size_t frameLen = buildWsFrame(wsFrame, 0x2, chunkMulaw, chunk);
+        WalterModem::socketSend(1, wsFrame, (uint16_t)frameLen);
+        silenceSent += chunk;
+        if (pendingRingBytes > 0 && lastRingMs > 0 &&
+            millis() - lastRingMs > RING_CHUNK_TIMEOUT_MS) {
+            flushPendingRing();
+        }
+        processAvailableFrames(cs);
+    }
+
+    // 6. Collect full response
+    if (!cs.audioDone) {
+        Serial.println("Waiting for agent response...");
+        collectAgentResponse(1, cs);
+    }
+
+    Serial.printf("[LIVE] Response: %u mulaw bytes\n", (unsigned)cs.pcmLen);
+
+    // 7. Decode mulaw → PCM16
+    size_t pcm16Len = 0;
+    uint8_t* pcm16 = mulawToPcm16(pcmOut, cs.pcmLen, &pcm16Len);
+    free(pcmOut);
+
+    wsSendClose(1);
+    delay(100);
+    closeSocket(1);
+    freeResponseBuffer();
+
+    if (!pcm16 || pcm16Len == 0) {
+        Serial.println("No audio response from agent");
+        if (pcm16) free(pcm16);
+        return false;
+    }
+
+    *outPcm16    = pcm16;
+    *outPcm16Len = pcm16Len;
+    return true;
+}
+
 } // namespace deepgram

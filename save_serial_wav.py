@@ -3,7 +3,7 @@ Helper file for downloading wav data that is dumped over the serial line.
 """
 import base64
 
-with open('serial_log.txt', encoding='utf-16') as f:
+with open('serial_log.txt', encoding='utf-8') as f:
     lines = f.readlines()
 
 in_block = False
