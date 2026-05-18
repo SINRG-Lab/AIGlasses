@@ -299,7 +299,7 @@ private fun ImageViewer(
             modifier = Modifier
                 .align(Alignment.TopEnd)
                 .statusBarsPadding()
-                .padding(16.dp),
+                .padding(top = 24.dp, end = 16.dp),
             horizontalArrangement = Arrangement.spacedBy(8.dp)
         ) {
             IconButton(onClick = { showDeleteConfirm = true }) {
