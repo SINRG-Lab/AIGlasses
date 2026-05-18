@@ -44,20 +44,5 @@ fun AmbientBackground(
             center = Offset(size.width * 0.85f, size.height * 0.08f)
         )
 
-        // Subtle fixed glow in bottom-left (hidden when connected to avoid blue overload)
-        if (connectionState != ConnectionState.Active) {
-            drawCircle(
-                brush = Brush.radialGradient(
-                    colors = listOf(
-                        Blue.copy(alpha = 0.06f),
-                        Color.Transparent
-                    ),
-                    center = Offset(size.width * 0.1f, size.height * 0.85f),
-                    radius = size.minDimension * 0.5f
-                ),
-                radius = size.minDimension * 0.5f,
-                center = Offset(size.width * 0.1f, size.height * 0.85f)
-            )
-        }
     }
 }
