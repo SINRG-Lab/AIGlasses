@@ -105,17 +105,24 @@ private fun HeroCard(
     val glassesStatus by viewModel.glassesStatus.collectAsStateWithLifecycle()
     val connectionState = glassesStatus.connectionState
     val isActive = connectionState == ConnectionState.Active
+    val isScanning = connectionState == ConnectionState.Scanning
 
-    val glowColor by animateColorAsState(
-        targetValue = when (connectionState) {
-            ConnectionState.Active -> Blue.copy(alpha = 0.5f)
-            ConnectionState.Connected -> Blue.copy(alpha = 0.2f)
-            ConnectionState.Scanning -> Orange.copy(alpha = 0.2f)
-            ConnectionState.Disconnected -> Color.Transparent
-        },
-        animationSpec = spring(Spring.DampingRatioMediumBouncy, Spring.StiffnessLow),
-        label = "hero_glow"
+    // Pulsing glow for scanning — animates alpha in and out
+    val infiniteTransition = rememberInfiniteTransition(label = "scan_glow")
+    val scanPulse by infiniteTransition.animateFloat(
+        initialValue = 0.08f,
+        targetValue = 0.35f,
+        animationSpec = infiniteRepeatable(
+            tween(1200, easing = FastOutSlowInEasing),
+            RepeatMode.Reverse
+        ),
+        label = "scan_pulse"
     )
+
+    val glowColor = when (connectionState) {
+        ConnectionState.Scanning -> Orange.copy(alpha = scanPulse)
+        else -> Color.Transparent
+    }
 
     val cardScale by animateFloatAsState(
         targetValue = if (isActive) 1.01f else 1f,
@@ -153,22 +160,13 @@ private fun HeroCard(
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                    Text(
-                        text = "AIGLASSES",
-                        fontSize = 11.sp,
-                        fontWeight = FontWeight.SemiBold,
-                        letterSpacing = 1.5.sp,
-                        color = TextTertiary
-                    )
-                    Text(
-                        text = if (glassesStatus.deviceName.isNotBlank())
-                            glassesStatus.deviceName
-                        else "NemoClaw / OpenClaw",
-                        style = MaterialTheme.typography.titleLarge,
-                        color = TextPrimary
-                    )
-                }
+                Text(
+                    text = if (glassesStatus.deviceName.isNotBlank())
+                        glassesStatus.deviceName
+                    else "AI Glasses",
+                    style = MaterialTheme.typography.titleLarge,
+                    color = TextPrimary
+                )
                 StatusBadge(state = connectionState)
             }
 
@@ -187,12 +185,11 @@ private fun HeroCard(
             GlassPillButton(
                 text = when (connectionState) {
                     ConnectionState.Disconnected -> "Connect Glasses"
-                    ConnectionState.Scanning -> "Scanning..."
+                    ConnectionState.Scanning -> "Stop Scanning"
                     ConnectionState.Connected, ConnectionState.Active -> "Disconnect"
                 },
                 onClick = {
-                    if (connectionState == ConnectionState.Disconnected ||
-                        connectionState == ConnectionState.Scanning) {
+                    if (connectionState == ConnectionState.Disconnected) {
                         viewModel.startScan()
                     } else {
                         viewModel.stopScan()
@@ -200,10 +197,10 @@ private fun HeroCard(
                 },
                 variant = when (connectionState) {
                     ConnectionState.Disconnected -> ButtonVariant.Accent
-                    ConnectionState.Scanning -> ButtonVariant.Default
+                    ConnectionState.Scanning -> ButtonVariant.Danger
                     else -> ButtonVariant.Danger
                 },
-                enabled = connectionState != ConnectionState.Scanning,
+                enabled = true,
                 modifier = Modifier.fillMaxWidth()
             )
         }
