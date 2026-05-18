@@ -237,7 +237,7 @@ private fun GalleryThumbnail(
             Icon(
                 Icons.Filled.Delete,
                 contentDescription = "Delete",
-                tint = Red,
+                tint = TextSecondary,
                 modifier = Modifier.size(16.dp)
             )
         }
@@ -306,7 +306,7 @@ private fun ImageViewer(
                 Icon(
                     Icons.Filled.Delete,
                     contentDescription = "Delete",
-                    tint = Red
+                    tint = TextSecondary
                 )
             }
             IconButton(onClick = onDismiss) {
