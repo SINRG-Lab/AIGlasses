@@ -138,7 +138,8 @@ fun GalleryScreen(viewModel: MainViewModel) {
                         GalleryThumbnail(
                             image = image,
                             viewModel = viewModel,
-                            onClick = { selectedImage = image }
+                            onClick = { selectedImage = image },
+                            onDelete = { viewModel.deleteImage(image.filename) }
                         )
                     }
                 }
@@ -170,56 +171,95 @@ fun GalleryScreen(viewModel: MainViewModel) {
 private fun GalleryThumbnail(
     image: SavedImage,
     viewModel: MainViewModel,
-    onClick: () -> Unit
+    onClick: () -> Unit,
+    onDelete: () -> Unit
 ) {
     val bitmap = remember(image.filename) {
         val file = viewModel.getImageFile(image.filename)
         if (file.exists()) BitmapFactory.decodeFile(file.absolutePath) else null
     }
     val timeFormat = remember { SimpleDateFormat("MMM d, h:mm a", Locale.getDefault()) }
+    var showDeleteConfirm by remember { mutableStateOf(false) }
 
-    GlassCard(depth = 1, cornerRadius = 12.dp, onClick = onClick) {
-        Column {
-            if (bitmap != null) {
-                Image(
-                    bitmap = bitmap.asImageBitmap(),
-                    contentDescription = image.filename,
-                    contentScale = ContentScale.Crop,
-                    filterQuality = FilterQuality.High,
+    Box {
+        GlassCard(depth = 1, cornerRadius = 12.dp, onClick = onClick) {
+            Column {
+                if (bitmap != null) {
+                    Image(
+                        bitmap = bitmap.asImageBitmap(),
+                        contentDescription = image.filename,
+                        contentScale = ContentScale.Crop,
+                        filterQuality = FilterQuality.High,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .aspectRatio(1f)
+                            .clip(RoundedCornerShape(topStart = 12.dp, topEnd = 12.dp))
+                    )
+                } else {
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .aspectRatio(1f)
+                            .background(GlassSurface),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Text("?", fontSize = 24.sp, color = TextTertiary)
+                    }
+                }
+                Row(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .aspectRatio(1f)
-                        .clip(RoundedCornerShape(topStart = 12.dp, topEnd = 12.dp))
-                )
-            } else {
-                Box(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .aspectRatio(1f)
-                        .background(GlassSurface),
-                    contentAlignment = Alignment.Center
+                        .padding(horizontal = 8.dp, vertical = 6.dp),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Text("?", fontSize = 24.sp, color = TextTertiary)
+                    Text(
+                        text = timeFormat.format(Date(image.timestamp)),
+                        fontSize = 10.sp,
+                        color = TextTertiary
+                    )
+                    Text(
+                        text = "${image.sizeBytes / 1024}KB",
+                        fontSize = 10.sp,
+                        color = TextTertiary
+                    )
                 }
             }
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(horizontal = 8.dp, vertical = 6.dp),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Text(
-                    text = timeFormat.format(Date(image.timestamp)),
-                    fontSize = 10.sp,
-                    color = TextTertiary
-                )
-                Text(
-                    text = "${image.sizeBytes / 1024}KB",
-                    fontSize = 10.sp,
-                    color = TextTertiary
-                )
-            }
+        }
+
+        IconButton(
+            onClick = { showDeleteConfirm = true },
+            modifier = Modifier
+                .align(Alignment.TopEnd)
+                .padding(4.dp)
+                .size(28.dp)
+        ) {
+            Icon(
+                Icons.Filled.Delete,
+                contentDescription = "Delete",
+                tint = Red,
+                modifier = Modifier.size(16.dp)
+            )
+        }
+
+        if (showDeleteConfirm) {
+            AlertDialog(
+                onDismissRequest = { showDeleteConfirm = false },
+                title = { Text("Delete Image?", color = TextPrimary) },
+                text = { Text("This cannot be undone.", color = TextSecondary) },
+                confirmButton = {
+                    TextButton(onClick = { onDelete(); showDeleteConfirm = false }) {
+                        Text("Delete", color = Red)
+                    }
+                },
+                dismissButton = {
+                    TextButton(onClick = { showDeleteConfirm = false }) {
+                        Text("Cancel", color = TextTertiary)
+                    }
+                },
+                containerColor = BgMid,
+                shape = RoundedCornerShape(16.dp)
+            )
         }
     }
 }
@@ -258,6 +298,7 @@ private fun ImageViewer(
         Row(
             modifier = Modifier
                 .align(Alignment.TopEnd)
+                .statusBarsPadding()
                 .padding(16.dp),
             horizontalArrangement = Arrangement.spacedBy(8.dp)
         ) {
