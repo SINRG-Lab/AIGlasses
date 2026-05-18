@@ -174,10 +174,7 @@ private fun GalleryThumbnail(
 ) {
     val bitmap = remember(image.filename) {
         val file = viewModel.getImageFile(image.filename)
-        if (file.exists()) {
-            val opts = BitmapFactory.Options().apply { inSampleSize = 2 }
-            BitmapFactory.decodeFile(file.absolutePath, opts)
-        } else null
+        if (file.exists()) BitmapFactory.decodeFile(file.absolutePath) else null
     }
     val timeFormat = remember { SimpleDateFormat("MMM d, h:mm a", Locale.getDefault()) }
 
@@ -188,6 +185,7 @@ private fun GalleryThumbnail(
                     bitmap = bitmap.asImageBitmap(),
                     contentDescription = image.filename,
                     contentScale = ContentScale.Crop,
+                    filterQuality = FilterQuality.High,
                     modifier = Modifier
                         .fillMaxWidth()
                         .aspectRatio(1f)
