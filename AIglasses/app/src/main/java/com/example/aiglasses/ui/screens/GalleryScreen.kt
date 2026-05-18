@@ -22,6 +22,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.graphics.FilterQuality
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
@@ -174,7 +175,7 @@ private fun GalleryThumbnail(
     val bitmap = remember(image.filename) {
         val file = viewModel.getImageFile(image.filename)
         if (file.exists()) {
-            val opts = BitmapFactory.Options().apply { inSampleSize = 4 }
+            val opts = BitmapFactory.Options().apply { inSampleSize = 2 }
             BitmapFactory.decodeFile(file.absolutePath, opts)
         } else null
     }
@@ -249,6 +250,7 @@ private fun ImageViewer(
                 bitmap = bitmap.asImageBitmap(),
                 contentDescription = image.filename,
                 contentScale = ContentScale.Fit,
+                filterQuality = FilterQuality.High,
                 modifier = Modifier
                     .fillMaxSize()
                     .padding(24.dp)
