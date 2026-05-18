@@ -13,6 +13,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import java.io.File
 
 class MainViewModel(application: Application) : AndroidViewModel(application) {
 
@@ -20,7 +21,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         private const val TAG = "MainViewModel"
         private const val PREFS_NAME = "aiglasses_prefs"
         private const val KEY_API_KEY = "openai_api_key"
+        private const val KEY_AUTO_SAVE_IMAGES = "auto_save_images"
         private const val MAX_LOG_ENTRIES = 100
+        private const val GALLERY_DIR = "gallery"
     }
 
     private val prefs = application.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
@@ -46,6 +49,18 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val _apiKey = MutableStateFlow(loadApiKey())
     val apiKey: StateFlow<String> = _apiKey.asStateFlow()
 
+    private val _autoSaveImages = MutableStateFlow(prefs.getBoolean(KEY_AUTO_SAVE_IMAGES, false))
+    val autoSaveImages: StateFlow<Boolean> = _autoSaveImages.asStateFlow()
+
+    private val _savedImages = MutableStateFlow<List<SavedImage>>(emptyList())
+    val savedImages: StateFlow<List<SavedImage>> = _savedImages.asStateFlow()
+
+    private val galleryDir = File(application.filesDir, GALLERY_DIR).also { it.mkdirs() }
+
+    init {
+        loadSavedImages()
+    }
+
     private fun loadApiKey(): String {
         val builtIn = try { BuildConfig.OPENAI_API_KEY } catch (_: Exception) { "" }
         return if (builtIn.isNotBlank()) builtIn
@@ -63,6 +78,42 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     fun setDevMode(enabled: Boolean) {
         _devModeEnabled.update { enabled }
+    }
+
+    fun setAutoSaveImages(enabled: Boolean) {
+        _autoSaveImages.update { enabled }
+        prefs.edit().putBoolean(KEY_AUTO_SAVE_IMAGES, enabled).apply()
+    }
+
+    fun deleteImage(filename: String) {
+        viewModelScope.launch(Dispatchers.IO) {
+            File(galleryDir, filename).delete()
+            loadSavedImages()
+        }
+    }
+
+    fun getImageFile(filename: String): File = File(galleryDir, filename)
+
+    private fun loadSavedImages() {
+        viewModelScope.launch(Dispatchers.IO) {
+            val images = galleryDir.listFiles()
+                ?.filter { it.extension == "jpg" }
+                ?.sortedByDescending { it.lastModified() }
+                ?.map { SavedImage(it.name, it.lastModified(), it.length().toInt()) }
+                ?: emptyList()
+            _savedImages.update { images }
+        }
+    }
+
+    private fun saveImageToGallery(jpegBytes: ByteArray) {
+        viewModelScope.launch(Dispatchers.IO) {
+            val filename = "IMG_${System.currentTimeMillis()}.jpg"
+            File(galleryDir, filename).writeBytes(jpegBytes)
+            loadSavedImages()
+            viewModelScope.launch(Dispatchers.Main.immediate) {
+                addLog("GALLERY", "Image saved: $filename")
+            }
+        }
     }
 
     fun startScan() {
@@ -213,6 +264,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             }
             is BleVoiceService.BleEvent.ImageReceived -> {
                 addLog("CAMERA", "Image received (${event.jpegBytes.size} bytes)")
+                if (_autoSaveImages.value) {
+                    saveImageToGallery(event.jpegBytes)
+                }
                 viewModelScope.launch(Dispatchers.IO) {
                     val bitmap = BitmapFactory.decodeByteArray(event.jpegBytes, 0, event.jpegBytes.size)
                     viewModelScope.launch(Dispatchers.Main.immediate) {

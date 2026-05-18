@@ -23,3 +23,9 @@ data class PipelineStatus(
     val isSynthesizing: Boolean = false,
     val lastInferenceMs: Long = 0L
 )
+
+data class SavedImage(
+    val filename: String,
+    val timestamp: Long,
+    val sizeBytes: Int
+)

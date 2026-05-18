@@ -15,7 +15,7 @@ import com.example.aiglasses.MainViewModel
 import com.example.aiglasses.ui.components.GlassDock
 import com.example.aiglasses.ui.screens.*
 
-private val mainRoutes = setOf(Screen.Home.route, Screen.Features.route, Screen.Settings.route)
+private val mainRoutes = setOf(Screen.Home.route, Screen.Features.route, Screen.Gallery.route, Screen.Settings.route)
 
 @Composable
 fun AppNavigation(viewModel: MainViewModel) {
@@ -39,6 +39,9 @@ fun AppNavigation(viewModel: MainViewModel) {
             }
             composable(Screen.Features.route) {
                 FeaturesScreen(viewModel = viewModel)
+            }
+            composable(Screen.Gallery.route) {
+                GalleryScreen(viewModel = viewModel)
             }
             composable(Screen.Settings.route) {
                 SettingsScreen(viewModel = viewModel)
