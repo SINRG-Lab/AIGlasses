@@ -41,6 +41,10 @@ class BleVoiceService(
         private const val MIN_AUDIO_BYTES = 16000 * 2
         private const val SCAN_TIMEOUT_MS = 20000L
         private const val HEADER_SIZE = 2
+        // A photo taken standalone is only attached to a question asked within
+        // this window. Older photos are considered stale and the question runs
+        // voice-only. (Bundled vision via double-tap+hold lands well inside this.)
+        private const val VISION_WINDOW_MS = 5000L
     }
 
     sealed class BleEvent {
@@ -81,6 +85,7 @@ class BleVoiceService(
     private val imageBuffer = ByteArrayOutputStream()
     @Volatile private var receivingImage = false
     private var pendingJpeg: ByteArray? = null
+    private var pendingJpegTime = 0L   // when the pending photo was received (for the 5s window)
 
     // Performance measurement state
     private var perfImageTxStartMs  = 0L   // M17: image transfer start time
@@ -474,6 +479,7 @@ class BleVoiceService(
                         pendingJpeg = imageBuffer.toByteArray()
                         imageBuffer.reset()
                     }
+                    pendingJpegTime = System.currentTimeMillis()  // start the 5s attach window
                     val imgBytes = pendingJpeg ?: ByteArray(0)
                     val imgMs = System.currentTimeMillis() - perfImageTxStartMs
                     val imgThroughput = if (imgMs > 0) imgBytes.size * 1000.0 / imgMs else 0.0
@@ -538,8 +544,13 @@ class BleVoiceService(
             return
         }
 
-        // Check if a JPEG was stashed (ESP32 sends I/image/J before E)
-        val jpeg = pendingJpeg
+        // Attach a recently-taken photo if one is within the 5s window.
+        // Always consume the pending photo so a stale one can't attach later.
+        val ageMs = System.currentTimeMillis() - pendingJpegTime
+        val jpeg = pendingJpeg?.takeIf { it.isNotEmpty() && ageMs <= VISION_WINDOW_MS }
+        if (pendingJpeg != null && jpeg == null) {
+            Log.i(TAG, "Photo too old (${ageMs}ms > ${VISION_WINDOW_MS}ms) — answering voice-only")
+        }
         pendingJpeg = null
 
         onEvent(BleEvent.ProcessingStarted)

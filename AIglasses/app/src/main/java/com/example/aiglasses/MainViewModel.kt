@@ -2,7 +2,12 @@ package com.example.aiglasses
 
 import android.app.Application
 import android.content.Context
+import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.media.MediaCodec
+import android.media.MediaCodecInfo
+import android.media.MediaFormat
+import android.media.MediaMuxer
 import android.util.Log
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
@@ -97,9 +102,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private fun loadSavedImages() {
         viewModelScope.launch(Dispatchers.IO) {
             val images = galleryDir.listFiles()
-                ?.filter { it.extension == "jpg" }
+                ?.filter { it.extension == "jpg" || it.extension == "mp4" }
                 ?.sortedByDescending { it.lastModified() }
-                ?.map { SavedImage(it.name, it.lastModified(), it.length().toInt()) }
+                ?.map { SavedImage(it.name, it.lastModified(), it.length().toInt(), it.extension == "mp4") }
                 ?: emptyList()
             _savedImages.update { images }
         }
@@ -114,6 +119,147 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 addLog("GALLERY", "Image saved: $filename")
             }
         }
+    }
+
+    private fun saveVideoToGallery(frames: List<ByteArray>) {
+        if (frames.isEmpty()) return
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val firstBitmap = BitmapFactory.decodeByteArray(frames[0], 0, frames[0].size)
+                    ?: return@launch
+                val width = firstBitmap.width
+                val height = firstBitmap.height
+                firstBitmap.recycle()
+
+                val filename = "VID_${System.currentTimeMillis()}.mp4"
+                val outputFile = File(galleryDir, filename)
+                encodeJpegsToMp4(frames, width, height, fps = 3, outputFile = outputFile)
+                loadSavedImages()
+                viewModelScope.launch(Dispatchers.Main.immediate) {
+                    addLog("GALLERY", "Video saved: $filename (${frames.size} frames)")
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "Video save failed", e)
+                viewModelScope.launch(Dispatchers.Main.immediate) {
+                    addLog("ERROR", "Video save failed: ${e.message}")
+                }
+            }
+        }
+    }
+
+    private fun encodeJpegsToMp4(
+        frames: List<ByteArray>,
+        width: Int, height: Int,
+        fps: Int,
+        outputFile: File
+    ) {
+        val mime = MediaFormat.MIMETYPE_VIDEO_AVC
+        val format = MediaFormat.createVideoFormat(mime, width, height).apply {
+            setInteger(MediaFormat.KEY_COLOR_FORMAT,
+                MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420SemiPlanar)
+            setInteger(MediaFormat.KEY_BIT_RATE, 500_000)
+            setInteger(MediaFormat.KEY_FRAME_RATE, fps)
+            setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
+        }
+
+        val encoder = MediaCodec.createEncoderByType(mime)
+        encoder.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+        encoder.start()
+
+        val muxer = MediaMuxer(outputFile.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
+        var trackIndex = -1
+        var muxerStarted = false
+        val bufferInfo = MediaCodec.BufferInfo()
+        val frameIntervalUs = 1_000_000L / fps
+
+        var frameIdx = 0
+        var inputDone = false
+
+        try {
+            while (true) {
+                if (!inputDone) {
+                    val inputIdx = encoder.dequeueInputBuffer(10_000L)
+                    if (inputIdx >= 0) {
+                        if (frameIdx >= frames.size) {
+                            encoder.queueInputBuffer(inputIdx, 0, 0,
+                                frameIdx * frameIntervalUs, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
+                            inputDone = true
+                        } else {
+                            val bitmap = BitmapFactory.decodeByteArray(
+                                frames[frameIdx], 0, frames[frameIdx].size)
+                            if (bitmap != null) {
+                                val yuv = bitmapToNv12(bitmap, width, height)
+                                bitmap.recycle()
+                                val inputBuffer = encoder.getInputBuffer(inputIdx)!!
+                                inputBuffer.clear()
+                                inputBuffer.put(yuv)
+                                encoder.queueInputBuffer(inputIdx, 0, yuv.size,
+                                    frameIdx * frameIntervalUs, 0)
+                            } else {
+                                encoder.queueInputBuffer(inputIdx, 0, 0,
+                                    frameIdx * frameIntervalUs, 0)
+                            }
+                            frameIdx++
+                        }
+                    }
+                }
+
+                val outputIdx = encoder.dequeueOutputBuffer(bufferInfo, 10_000L)
+                when {
+                    outputIdx == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
+                        trackIndex = muxer.addTrack(encoder.outputFormat)
+                        muxer.start()
+                        muxerStarted = true
+                    }
+                    outputIdx >= 0 -> {
+                        if (muxerStarted && bufferInfo.size > 0 &&
+                            bufferInfo.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG == 0) {
+                            val outputBuffer = encoder.getOutputBuffer(outputIdx)!!
+                            muxer.writeSampleData(trackIndex, outputBuffer, bufferInfo)
+                        }
+                        encoder.releaseOutputBuffer(outputIdx, false)
+                        if (bufferInfo.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0) break
+                    }
+                }
+            }
+        } finally {
+            try { encoder.stop(); encoder.release() } catch (_: Exception) {}
+            if (muxerStarted) try { muxer.stop(); muxer.release() } catch (_: Exception) {}
+        }
+    }
+
+    private fun bitmapToNv12(bitmap: Bitmap, width: Int, height: Int): ByteArray {
+        val argb = IntArray(width * height)
+        bitmap.getPixels(argb, 0, width, 0, 0, width, height)
+
+        val yuv = ByteArray(width * height * 3 / 2)
+
+        // Y plane
+        for (j in 0 until height) {
+            for (i in 0 until width) {
+                val p = argb[j * width + i]
+                val r = (p shr 16) and 0xFF
+                val g = (p shr 8) and 0xFF
+                val b = p and 0xFF
+                yuv[j * width + i] =
+                    (((66 * r + 129 * g + 25 * b + 128) shr 8) + 16).coerceIn(0, 255).toByte()
+            }
+        }
+
+        // UV plane: NV12 — interleaved Cb, Cr, 2×2 downsampled
+        var uvIdx = width * height
+        for (j in 0 until height / 2) {
+            for (i in 0 until width / 2) {
+                val p = argb[(j * 2) * width + (i * 2)]
+                val r = (p shr 16) and 0xFF
+                val g = (p shr 8) and 0xFF
+                val b = p and 0xFF
+                yuv[uvIdx++] = (((-38 * r - 74 * g + 112 * b + 128) shr 8) + 128).coerceIn(0, 255).toByte()
+                yuv[uvIdx++] = (((112 * r - 94 * g - 18 * b + 128) shr 8) + 128).coerceIn(0, 255).toByte()
+            }
+        }
+
+        return yuv
     }
 
     fun startScan() {
@@ -264,9 +410,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             }
             is BleVoiceService.BleEvent.ImageReceived -> {
                 addLog("CAMERA", "Image received (${event.jpegBytes.size} bytes)")
-                if (_autoSaveImages.value) {
-                    saveImageToGallery(event.jpegBytes)
-                }
+                // Always persist received photos (parity with video, which always
+                // saves). A photo is a deliberate capture, so it should survive
+                // even when no question follows.
+                saveImageToGallery(event.jpegBytes)
                 viewModelScope.launch(Dispatchers.IO) {
                     val bitmap = BitmapFactory.decodeByteArray(event.jpegBytes, 0, event.jpegBytes.size)
                     viewModelScope.launch(Dispatchers.Main.immediate) {
@@ -279,6 +426,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                         }
                     }
                 }
+            }
+            is BleVoiceService.BleEvent.VideoReceived -> {
+                addLog("CAMERA", "Video received: ${event.frames.size} frames")
+                saveVideoToGallery(event.frames)
             }
             is BleVoiceService.BleEvent.Error -> {
                 addLog("ERROR", event.message)

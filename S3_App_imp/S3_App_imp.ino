@@ -424,12 +424,16 @@ bool captureSnapshot() {
   unsigned long _capStart = millis();  // M21
   int _attempts = 0;
 
-  // Flush one stale frame. With CAMERA_GRAB_LATEST + fb_count=2 the driver may
-  // hand back a frame captured while the camera sat idle (often dark/garbage,
-  // or NULL on the very first grab). Grab+return one, then capture the real one.
-  {
-    camera_fb_t *stale = esp_camera_fb_get();
-    if (stale) esp_camera_fb_return(stale);
+  // Warm up the sensor. After the camera sits idle the auto-exposure/gain (AEC/AGC)
+  // hasn't converged, so the first frames come back blank/dark. Discard a few
+  // frames (grab+return) so exposure settles before the real capture. This is the
+  // fix for "image comes out blank ~half the time".
+  const int WARMUP_FRAMES = 4;
+  for (int i = 0; i < WARMUP_FRAMES; i++) {
+    camera_fb_t *warm = esp_camera_fb_get();
+    if (!warm) break;          // sensor not producing — let the retry loop handle it
+    esp_camera_fb_return(warm);
+    delay(20);                 // ~one frame interval for AEC/AGC to step
   }
 
   // Retry up to 5 times — sensor occasionally needs a few attempts
@@ -488,6 +492,19 @@ static int notifyWithRetry(NimBLECharacteristic* pChar, const uint8_t* data, siz
 }
 
 // ════════════════════════════════════════════════════════════════
+//  Send 'S' (recording start) marker → tells Android to flush any stale
+//  audio chunks left over from quick taps before this utterance begins.
+//  The small delay lets the marker (CONTROL char) land before the first
+//  mic chunk (AUDIO_TX char) — the two are separate notification streams.
+// ════════════════════════════════════════════════════════════════
+void sendAudioStartMarker() {
+  if (!deviceConnected || pControlChar == nullptr) return;
+  uint8_t startPkt[BLE_HEADER_SIZE] = {'S', 0};
+  notifyWithRetry(pControlChar, startPkt, BLE_HEADER_SIZE);
+  delay(10);
+}
+
+// ════════════════════════════════════════════════════════════════
 //  Send stored JPEG over BLE via IMAGE_TX characteristic
 // ════════════════════════════════════════════════════════════════
 void sendCapturedImage() {
@@ -509,7 +526,11 @@ void sendCapturedImage() {
     startPkt[4] = (capturedJpegLen >> 16) & 0xFF;
     startPkt[5] = (capturedJpegLen >> 24) & 0xFF;
     notifyWithRetry(pControlChar, startPkt, 6);
-    delay(10);
+    // Let the start marker (CONTROL char) land before the first fragment
+    // (IMAGE_TX char) — they're separate notification streams and can reorder.
+    // Too short a gap = Android resets its buffer after fragments already
+    // arrived → corrupt reassembly.
+    delay(40);
   }
 
   // Fragment JPEG and send
@@ -1027,8 +1048,9 @@ void setup() {
   Serial.println();
   Serial.println("============================================================");
   Serial.println("  READY!");
-  Serial.printf("  Press once  + hold GPIO%d → voice only\n", PTT_PIN);
-  Serial.println("  Press twice + hold        → photo + voice (vision AI)");
+  Serial.printf("  Press once  + hold GPIO%d → voice question (attaches a photo taken in last 5s)\n", PTT_PIN);
+  Serial.println("  Quick double-tap          → take photo (saved; ask within 5s to query it)");
+  Serial.println("  Press twice + hold        → photo + voice bundled (vision AI)");
   Serial.println("  Press 3x    + hold        → video recording");
   Serial.println("  No WiFi hotspot needed — uses BLE directly!");
   Serial.println("============================================================\n");
@@ -1073,16 +1095,26 @@ void loop() {
 
       } else if (isRecording) {
         if (pressDuration < QUICK_TAP_MAX_MS) {
-          // Quick tap — track it for multi-tap gesture, discard audio/snapshot
+          // Quick tap.
           lastQuickTapTime = millis();
-          if (visionMode && capturedJpeg) {
+          if (tapCount == 2 && visionMode && capturedJpeg) {
+            // Quick double-tap → STANDALONE PHOTO: send the image but NO audio
+            // END marker. Android stores + saves it and opens a 5s window during
+            // which a single-hold question will attach this photo.
+            Serial.println("[PTT] Quick double-tap → PHOTO (stored, no question)");
+            sendCapturedImage();
+            tapCount = 0;  // gesture complete
+          } else if (visionMode && capturedJpeg) {
+            // Stray captured frame from another tap pattern — discard it.
             free(capturedJpeg);
             capturedJpeg = nullptr;
             capturedJpegLen = 0;
+            Serial.printf("[PTT] Quick tap (tapCount=%d) — discarded capture\n", tapCount);
+          } else {
+            Serial.printf("[PTT] Quick tap (tapCount=%d)\n", tapCount);
           }
           visionMode = false;
           isRecording = false;
-          Serial.printf("[PTT] Quick tap (tapCount=%d)\n", tapCount);
         } else {
           // Long press — send image (vision) + audio END
           unsigned long _recMs = millis() - perfAudioTxStartMs;
@@ -1137,11 +1169,14 @@ void loop() {
       visionMode = false;
       sendVideoStartMarker();
     } else if (tapCount == 2) {
-      // Double-press + hold → vision mode (photo + voice)
-      Serial.println("[PTT] Double-press → VISION MODE (photo + voice)");
+      // Double-tap: capture a photo now. The release handler decides what to do:
+      //   • QUICK release → standalone photo (stored/saved, no question)
+      //   • HOLD          → photo + voice question bundled (vision)
+      Serial.println("[PTT] Double-tap → capturing photo");
       visionMode = true;
       txSeqNum = 0;
       isRecording = true;
+      sendAudioStartMarker();  // flush stale audio on the app side
       // Reset M1/M25 accumulators
       perfAudioTxStartMs = millis();
       perfAudioTxBytes = 0;
@@ -1158,11 +1193,13 @@ void loop() {
         visionMode = false;
       }
     } else {
-      // Single press + hold → voice only
+      // Single press + hold → voice only (app attaches a recent photo if one
+      // was taken within the last 5s)
       Serial.println("[PTT] Single press → voice only");
       visionMode = false;
       txSeqNum = 0;
       isRecording = true;
+      sendAudioStartMarker();  // flush stale audio on the app side
       // Reset M1/M25 accumulators
       perfAudioTxStartMs = millis();
       perfAudioTxBytes = 0;
