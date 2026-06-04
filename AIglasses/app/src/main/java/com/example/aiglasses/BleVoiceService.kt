@@ -86,6 +86,8 @@ class BleVoiceService(
     private var perfImageTxStartMs  = 0L   // M17: image transfer start time
     private var perfExpectedImageSize = 0   // M24: expected bytes from 'I' marker
     private var perfImagePacketCount = 0    // M24: fragment count
+    private var perfImageExpectedSeq = 0    // M24: next expected fragment seq (0-255 wrap)
+    private var perfImageSeqGaps     = 0    // M24: dropped image fragments detected
     private var perfAudioRxStartMs   = 0L   // M11: audio receive start
 
     // Video reassembly state
@@ -447,6 +449,8 @@ class BleVoiceService(
                     perfImageTxStartMs   = System.currentTimeMillis()  // M17
                     perfExpectedImageSize = expectedSize               // M24
                     perfImagePacketCount  = 0                          // M24
+                    perfImageExpectedSeq  = 0                          // M24
+                    perfImageSeqGaps      = 0                          // M24
                     receivingImage = true
                     receivingVideoFrame = false
                     synchronized(imageBuffer) { imageBuffer.reset() }
@@ -476,7 +480,7 @@ class BleVoiceService(
                     Log.i(TAG, "[PERF-M17] Image transfer complete: ${imgBytes.size} bytes in ${imgMs}ms, $perfImagePacketCount packets")
                     Log.i(TAG, "[PERF-M18] Image BLE RX throughput: ${String.format("%.0f", imgThroughput)} B/s (${String.format("%.1f", imgThroughput/1024)} KB/s)")
                     val sizeMatch = imgBytes.size == perfExpectedImageSize
-                    Log.i(TAG, "[PERF-M24] Reassembly: expected=$perfExpectedImageSize assembled=${imgBytes.size} → ${if (sizeMatch) "OK" else "SIZE MISMATCH!"}")
+                    Log.i(TAG, "[PERF-M24] Reassembly: expected=$perfExpectedImageSize assembled=${imgBytes.size} seqGaps=$perfImageSeqGaps → ${if (sizeMatch) "OK" else "SIZE MISMATCH!"}")
                     // Attempt JPEG decode to verify integrity
                     if (imgBytes.isNotEmpty()) {
                         val bm = android.graphics.BitmapFactory.decodeByteArray(imgBytes, 0, imgBytes.size)
@@ -495,6 +499,17 @@ class BleVoiceService(
         if (receivingVideoFrame) {
             synchronized(currentVideoFrame) { currentVideoFrame.write(payload) }
         } else {
+            // M24: detect dropped fragments via the 1-byte seq in the header.
+            // The seq wraps 0..255; any jump > 1 means notification(s) were lost,
+            // which corrupts the JPEG. This confirms whether the firmware-side
+            // notify retry fix actually eliminated the drops.
+            val seq = data[1].toInt() and 0xFF
+            if (seq != perfImageExpectedSeq) {
+                val gap = (seq - perfImageExpectedSeq) and 0xFF
+                perfImageSeqGaps += gap
+                Log.w(TAG, "[PERF-M24] Image SEQ gap: expected $perfImageExpectedSeq got $seq (lost ~$gap fragment(s))")
+            }
+            perfImageExpectedSeq = (seq + 1) and 0xFF
             synchronized(imageBuffer) { imageBuffer.write(payload) }
             perfImagePacketCount++  // M24: count fragments
         }

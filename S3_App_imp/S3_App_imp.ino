@@ -423,6 +423,15 @@ bool initCamera() {
 bool captureSnapshot() {
   unsigned long _capStart = millis();  // M21
   int _attempts = 0;
+
+  // Flush one stale frame. With CAMERA_GRAB_LATEST + fb_count=2 the driver may
+  // hand back a frame captured while the camera sat idle (often dark/garbage,
+  // or NULL on the very first grab). Grab+return one, then capture the real one.
+  {
+    camera_fb_t *stale = esp_camera_fb_get();
+    if (stale) esp_camera_fb_return(stale);
+  }
+
   // Retry up to 5 times — sensor occasionally needs a few attempts
   // if it was idle or the DMA pipeline stalled.
   camera_fb_t *fb = nullptr;
@@ -457,6 +466,28 @@ bool captureSnapshot() {
 }
 
 // ════════════════════════════════════════════════════════════════
+//  notify() with flow control.
+//  NimBLE's notify() returns false when the host TX buffer is full
+//  (BLE_HS_ENOMEM during a burst). The original code ignored this, so
+//  fragments were SILENTLY DROPPED → missing bytes → JPEG that won't
+//  reassemble/decode. Retry with backoff until the stack drains.
+//  Returns the number of retries used (0 = first try succeeded), or -1
+//  if it gave up / disconnected.
+// ════════════════════════════════════════════════════════════════
+static int notifyWithRetry(NimBLECharacteristic* pChar, const uint8_t* data, size_t len) {
+  pChar->setValue(data, len);
+  if (pChar->notify()) return 0;
+  int tries = 0;
+  const int MAX_TRIES = 50;     // ~250 ms worst case
+  while (tries < MAX_TRIES && deviceConnected) {
+    delay(5);                   // let the BLE stack drain its TX buffers
+    tries++;
+    if (pChar->notify()) return tries;
+  }
+  return -1;  // gave up
+}
+
+// ════════════════════════════════════════════════════════════════
 //  Send stored JPEG over BLE via IMAGE_TX characteristic
 // ════════════════════════════════════════════════════════════════
 void sendCapturedImage() {
@@ -465,6 +496,8 @@ void sendCapturedImage() {
 
   unsigned long _imgTxStart = millis();  // M23
   unsigned int _imgPackets = 0;
+  unsigned int _imgRetries = 0;   // M23: total notify retries (flow-control pressure)
+  unsigned int _imgDropped = 0;   // M23: fragments that never sent (gave up)
 
   // Send start marker with total size on control channel
   {
@@ -475,8 +508,7 @@ void sendCapturedImage() {
     startPkt[3] = (capturedJpegLen >>  8) & 0xFF;
     startPkt[4] = (capturedJpegLen >> 16) & 0xFF;
     startPkt[5] = (capturedJpegLen >> 24) & 0xFF;
-    pControlChar->setValue(startPkt, 6);
-    pControlChar->notify();
+    notifyWithRetry(pControlChar, startPkt, 6);
     delay(10);
   }
 
@@ -491,26 +523,31 @@ void sendCapturedImage() {
     pkt[1] = imgSeq++;
     memcpy(pkt + BLE_HEADER_SIZE, capturedJpeg + sent, fragSize);
 
-    pImageTxChar->setValue(pkt, BLE_HEADER_SIZE + fragSize);
-    pImageTxChar->notify();
+    int r = notifyWithRetry(pImageTxChar, pkt, BLE_HEADER_SIZE + fragSize);
+    if (r < 0) { _imgDropped++; }
+    else       { _imgRetries += r; }
 
     sent += fragSize;
     _imgPackets++;
     delay(15);  // one fragment per connection event — prevents notification drops
   }
 
+  // Guard delay so the last IMAGE_TX fragments drain before the 'J' end marker
+  // (sent on a different characteristic) — prevents the end marker racing ahead
+  // and closing Android's reassembly buffer early.
+  delay(30);
+
   // Send image end marker
   {
     uint8_t endPkt[2] = {'J', 0};
-    pControlChar->setValue(endPkt, 2);
-    pControlChar->notify();
+    notifyWithRetry(pControlChar, endPkt, 2);
   }
 
   unsigned long _imgTxMs = millis() - _imgTxStart;
   float _imgThroughput = (_imgTxMs > 0) ? (capturedJpegLen * 1000.0f / _imgTxMs) : 0;
-  Serial.printf("[PERF-M23] Image TX: %u bytes, %u packets, %lu ms (%.0f B/s = %.1f KB/s)\n",
+  Serial.printf("[PERF-M23] Image TX: %u bytes, %u packets, %lu ms (%.0f B/s = %.1f KB/s) | retries=%u dropped=%u\n",
                 (unsigned int)capturedJpegLen, _imgPackets, _imgTxMs,
-                _imgThroughput, _imgThroughput / 1024.0f);
+                _imgThroughput, _imgThroughput / 1024.0f, _imgRetries, _imgDropped);
 
   // Free the buffer
   free(capturedJpeg);
@@ -553,8 +590,7 @@ void sendVideoFrame(uint8_t frameIndex) {
   startPkt[3] = (fb->len >>  8) & 0xFF;
   startPkt[4] = (fb->len >> 16) & 0xFF;
   startPkt[5] = (fb->len >> 24) & 0xFF;
-  pControlChar->setValue(startPkt, 6);
-  pControlChar->notify();
+  notifyWithRetry(pControlChar, startPkt, 6);
   delay(10);
 
   // Fragment and send JPEG directly from camera DMA buffer
@@ -566,16 +602,17 @@ void sendVideoFrame(uint8_t frameIndex) {
     pkt[0] = 'I';
     pkt[1] = imgSeq++;
     memcpy(pkt + BLE_HEADER_SIZE, fb->buf + sent, fragSize);
-    pImageTxChar->setValue(pkt, BLE_HEADER_SIZE + fragSize);
-    pImageTxChar->notify();
+    notifyWithRetry(pImageTxChar, pkt, BLE_HEADER_SIZE + fragSize);
     sent += fragSize;
     delay(15);
   }
 
+  // Guard delay so the last fragments drain before the 'J' frame-end marker
+  delay(30);
+
   // Frame end: 'J' + frameIndex
   uint8_t endPkt[2] = {'J', frameIndex};
-  pControlChar->setValue(endPkt, 2);
-  pControlChar->notify();
+  notifyWithRetry(pControlChar, endPkt, 2);
 
   Serial.printf("[VID] Frame %u: %u bytes\n", frameIndex, (unsigned int)fb->len);
   esp_camera_fb_return(fb);
@@ -1113,7 +1150,13 @@ void loop() {
       perfMicMaxAmp = -32768;
       perfMicSumAmp = 0;
       perfMicSampleCount = 0;
-      captureSnapshot();
+      // If capture fails, fall back to voice-only instead of silently sending
+      // audio with no image (which leaves Android waiting for a JPEG that never
+      // arrives, or processing a half-baked vision request).
+      if (!captureSnapshot()) {
+        Serial.println("[CAM] Capture failed → falling back to VOICE-ONLY for this utterance");
+        visionMode = false;
+      }
     } else {
       // Single press + hold → voice only
       Serial.println("[PTT] Single press → voice only");
