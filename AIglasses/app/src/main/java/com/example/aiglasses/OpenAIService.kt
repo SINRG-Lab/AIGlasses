@@ -24,6 +24,10 @@ class OpenAIService(private val apiKey: String) {
 
     companion object {
         private const val WHISPER_URL = "https://api.openai.com/v1/audio/transcriptions"
+        // STT model. "gpt-4o-transcribe" is the most accurate (best for imperfect
+        // mic audio); "gpt-4o-mini-transcribe" is faster/cheaper; "whisper-1" is
+        // the legacy fallback.
+        private const val STT_MODEL = "gpt-4o-transcribe"
         private const val CHAT_URL = "https://api.openai.com/v1/chat/completions"
         private const val TTS_URL = "https://api.openai.com/v1/audio/speech"
         private const val SYSTEM_PROMPT =
@@ -45,8 +49,9 @@ class OpenAIService(private val apiKey: String) {
     fun transcribe(wavFile: File): String {
         val requestBody = MultipartBody.Builder()
             .setType(MultipartBody.FORM)
-            .addFormDataPart("model", "whisper-1")
+            .addFormDataPart("model", STT_MODEL)
             .addFormDataPart("language", "en")
+            .addFormDataPart("temperature", "0")  // greedy decode → fewer hallucinations
             .addFormDataPart(
                 "file",
                 wavFile.name,
@@ -117,13 +122,14 @@ class OpenAIService(private val apiKey: String) {
     /**
      * Synthesize speech using OpenAI TTS API.
      * @param text The text to speak
-     * @return Raw MP3 bytes
+     * @return Raw PCM16 LE @ 24 kHz mono bytes (no container, no MP3 decode needed)
      */
     fun speak(text: String): ByteArray {
         val json = JSONObject().apply {
             put("model", "tts-1")
             put("input", text)
             put("voice", "nova")
+            put("response_format", "pcm")
         }
 
         val request = Request.Builder()

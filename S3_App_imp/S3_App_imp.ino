@@ -927,7 +927,7 @@ void setup() {
 
   Serial.println("\n\n============================================================");
   Serial.println("  ESP32-S3 AI GLASSES (BLE + Shared I2S + Camera)");
-  Serial.println("  Running on C6 PCB — shared BCLK/WS bus");
+  Serial.println("  Running on XIAO ESP32-S3 Sense — built-in PDM mic");
   Serial.println("============================================================");
   Serial.printf("SPK: BCLK=GPIO%d  LRC=GPIO%d  DIN=GPIO%d\n", I2S_BCLK, I2S_WS, AMP_DIN);
   Serial.printf("MIC: built-in PDM (CLK=GPIO%d, DATA=GPIO%d)\n", PDM_CLK, PDM_DATA);
@@ -1238,7 +1238,11 @@ void loop() {
   static float dcPrevX = 0.0f;
   static float dcPrevY = 0.0f;
   const float  DC_R    = 0.995f;
-  const int    MIC_GAIN = 10;   // raise if still quiet, lower if it clips/distorts
+  const int    MIC_GAIN = 1;    // NO amplification — raw mic is already 16-bit, so
+                                // gain=1 cannot clip. ALL leveling is done by the
+                                // Android normalizer (normalizeForAsr). 10x and even
+                                // 4x clipped loud speech (peak=32768) → distortion →
+                                // Whisper hallucinations.
 
   for (int i = 0; i < samples; i++) {
     float x = (float)micBuf[i];

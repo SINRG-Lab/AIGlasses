@@ -22,6 +22,13 @@ class VoiceAssistantPipeline(
         // Peak-limiter target: ~-1.3 dBFS leaves margin under the ESP32 SPK_VOL_SHIFT=1 ceiling
         private const val LIMITER_TARGET_PEAK = 28000
         private const val LIMITER_MAX_BOOST = 2.0  // +6 dB cap so quiet TTS isn't pumped to noise floor
+        // Mic (ASR) normalization — the PDM mic is quiet, so soft utterances reach
+        // Whisper too low and get mis-transcribed. Bigger boost ceiling than the TTS
+        // limiter; silence guard avoids amplifying pure noise.
+        private const val ASR_TARGET_PEAK = 22000
+        private const val ASR_MAX_BOOST = 12.0   // firmware gain lowered to 4x, so the
+                                                 // app does more of the leveling here
+        private const val ASR_SILENCE_PEAK = 150 // scaled down with the lower firmware gain
     }
 
     sealed class PipelineEvent {
@@ -45,9 +52,9 @@ class VoiceAssistantPipeline(
             val duration = rawPcm.size / (MIC_SAMPLE_RATE * 2.0)
             Log.i(TAG, "Processing utterance: ${rawPcm.size} bytes (${String.format("%.2f", duration)}s)")
 
-            // 1. Save PCM as WAV for Whisper
+            // 1. Save PCM as WAV for Whisper (normalize quiet mic first)
             onEvent(PipelineEvent.Processing)
-            val wavFile = pcmToWav(rawPcm, MIC_SAMPLE_RATE)
+            val wavFile = pcmToWav(normalizeForAsr(rawPcm), MIC_SAMPLE_RATE)
             Log.i(TAG, "Saved utterance WAV: ${wavFile.length()} bytes")
 
             // 2. Transcribe with Whisper
@@ -113,7 +120,7 @@ class VoiceAssistantPipeline(
             // 1. Transcribe audio if present
             var whisperMs = 0L
             val userText = if (rawPcm != null && rawPcm.size >= MIC_SAMPLE_RATE * 2) {
-                val wavFile = pcmToWav(rawPcm, MIC_SAMPLE_RATE)
+                val wavFile = pcmToWav(normalizeForAsr(rawPcm), MIC_SAMPLE_RATE)
                 Log.i(TAG, "Transcribing audio for vision...")
                 val whisperStartMs = System.currentTimeMillis()
                 val text = openAIService.transcribe(wavFile)
@@ -313,6 +320,39 @@ class VoiceAssistantPipeline(
      * but cap the gain at LIMITER_MAX_BOOST so quiet TTS isn't pumped to the noise floor.
      * Recovers perceived loudness lost by the ESP32-side digital attenuation.
      */
+    /**
+     * Peak-normalize mic PCM toward a consistent level for Whisper. The XIAO PDM
+     * mic is quiet, so soft utterances arrive low and get mis-transcribed. Scales
+     * each utterance so its peak ≈ ASR_TARGET_PEAK (capped at ASR_MAX_BOOST), with
+     * a silence guard so near-silent / pure-noise buffers aren't amplified.
+     * Mutates the array in place and returns it.
+     */
+    private fun normalizeForAsr(pcm: ByteArray): ByteArray {
+        val n = pcm.size / 2
+        if (n == 0) return pcm
+        val bb = ByteBuffer.wrap(pcm).order(ByteOrder.LITTLE_ENDIAN)
+        var peak = 1
+        for (i in 0 until n) {
+            val a = kotlin.math.abs(bb.getShort(i * 2).toInt())
+            if (a > peak) peak = a
+        }
+        if (peak < ASR_SILENCE_PEAK) {
+            Log.i(TAG, "[ASR] peak=$peak below silence floor — not amplifying")
+            return pcm
+        }
+        val gain = minOf(ASR_TARGET_PEAK.toDouble() / peak, ASR_MAX_BOOST)
+        if (gain <= 1.0) {
+            Log.i(TAG, "[ASR] peak=$peak already loud enough — no boost")
+            return pcm
+        }
+        for (i in 0 until n) {
+            val s = (bb.getShort(i * 2) * gain).toInt().coerceIn(-32768, 32767)
+            bb.putShort(i * 2, s.toShort())
+        }
+        Log.i(TAG, "[ASR] normalized: peak=$peak gain=${String.format("%.2f", gain)} → ${(peak * gain).toInt()}")
+        return pcm
+    }
+
     private fun peakLimit(pcm: ByteArray): ByteArray {
         val n = pcm.size / 2
         if (n == 0) return pcm

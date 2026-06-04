@@ -14,7 +14,7 @@ import java.nio.ByteOrder
 import java.util.UUID
 
 /**
- * BLE Central (GATT client) that connects to the ESP32-C6 BLE Peripheral.
+ * BLE Central (GATT client) that connects to the ESP32-S3 BLE Peripheral.
  *
  * Protocol:
  *   Audio TX (NOTIFY):  ESP32 mic → Android   [TAG][SEQ][PCM]
