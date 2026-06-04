@@ -18,7 +18,10 @@ class VoiceAssistantPipeline(
     companion object {
         private const val TAG = "VoicePipeline"
         private const val MIC_SAMPLE_RATE = 16000
-        private const val TTS_SAMPLE_RATE = 22050
+        private const val TTS_SAMPLE_RATE = 24000  // OpenAI TTS native PCM rate — no resampling
+        // Peak-limiter target: ~-1.3 dBFS leaves margin under the ESP32 SPK_VOL_SHIFT=1 ceiling
+        private const val LIMITER_TARGET_PEAK = 28000
+        private const val LIMITER_MAX_BOOST = 2.0  // +6 dB cap so quiet TTS isn't pumped to noise floor
     }
 
     sealed class PipelineEvent {
@@ -38,6 +41,7 @@ class VoiceAssistantPipeline(
      */
     fun process(rawPcm: ByteArray): ByteArray? {
         try {
+            val pipelineStartMs = System.currentTimeMillis()
             val duration = rawPcm.size / (MIC_SAMPLE_RATE * 2.0)
             Log.i(TAG, "Processing utterance: ${rawPcm.size} bytes (${String.format("%.2f", duration)}s)")
 
@@ -48,9 +52,11 @@ class VoiceAssistantPipeline(
 
             // 2. Transcribe with Whisper
             Log.i(TAG, "Transcribing with Whisper...")
+            val whisperStartMs = System.currentTimeMillis()
             val userText = openAIService.transcribe(wavFile)
+            val whisperMs = System.currentTimeMillis() - whisperStartMs
             wavFile.delete()
-            Log.i(TAG, "User said: \"$userText\"")
+            Log.i(TAG, "[PERF-M1] Whisper: ${whisperMs}ms → \"$userText\"")
             onEvent(PipelineEvent.Transcription(userText))
 
             if (userText.isBlank()) {
@@ -60,23 +66,26 @@ class VoiceAssistantPipeline(
 
             // 3. Get AI response from GPT-4o-mini
             Log.i(TAG, "Getting AI response...")
+            val chatStartMs = System.currentTimeMillis()
             val aiResponse = openAIService.chat(userText)
-            Log.i(TAG, "AI response: \"$aiResponse\"")
+            val chatMs = System.currentTimeMillis() - chatStartMs
+            Log.i(TAG, "[PERF-M2] GPT-4o-mini: ${chatMs}ms → \"$aiResponse\"")
             onEvent(PipelineEvent.AiResponse(aiResponse))
 
-            // 4. Synthesize with OpenAI TTS → decode MP3 → PCM at 22050Hz
+            // 4. Synthesize with OpenAI TTS (raw 24kHz mono PCM) → resample → limit
             onEvent(PipelineEvent.TtsSynthesizing)
             Log.i(TAG, "Synthesizing with OpenAI TTS...")
-            val mp3Bytes = openAIService.speak(aiResponse)
-            Log.i(TAG, "OpenAI TTS returned ${mp3Bytes.size} bytes of MP3")
+            val ttsStartMs = System.currentTimeMillis()
+            val pcm24k = openAIService.speak(aiResponse)
+            val ttsMs = System.currentTimeMillis() - ttsStartMs
+            Log.i(TAG, "[PERF-M3] TTS: ${ttsMs}ms → ${pcm24k.size} bytes PCM @ 24kHz")
 
-            val ttsPcm = decodeMp3ToPcm(mp3Bytes)
-            if (ttsPcm == null) {
-                onEvent(PipelineEvent.Error("MP3 decode failed"))
-                return null
-            }
+            val ttsPcm = peakLimit(pcm24k)
             val ttsDuration = ttsPcm.size / (TTS_SAMPLE_RATE * 2.0)
             Log.i(TAG, "TTS PCM ready: ${ttsPcm.size} bytes (${String.format("%.2f", ttsDuration)}s)")
+
+            val totalMs = System.currentTimeMillis() - pipelineStartMs
+            Log.i(TAG, "[PERF-M7] Voice pipeline total: ${totalMs}ms (whisper=${whisperMs} chat=${chatMs} tts=${ttsMs})")
 
             return ttsPcm
         } catch (e: Exception) {
@@ -95,18 +104,22 @@ class VoiceAssistantPipeline(
      */
     fun processWithVision(rawPcm: ByteArray?, jpegBytes: ByteArray): ByteArray? {
         try {
+            val pipelineStartMs = System.currentTimeMillis()
             Log.i(TAG, "Vision request: image=${jpegBytes.size} bytes" +
                 if (rawPcm != null) ", audio=${rawPcm.size} bytes" else "")
 
             onEvent(PipelineEvent.Processing)
 
             // 1. Transcribe audio if present
+            var whisperMs = 0L
             val userText = if (rawPcm != null && rawPcm.size >= MIC_SAMPLE_RATE * 2) {
                 val wavFile = pcmToWav(rawPcm, MIC_SAMPLE_RATE)
                 Log.i(TAG, "Transcribing audio for vision...")
+                val whisperStartMs = System.currentTimeMillis()
                 val text = openAIService.transcribe(wavFile)
+                whisperMs = System.currentTimeMillis() - whisperStartMs
                 wavFile.delete()
-                Log.i(TAG, "User said: \"$text\"")
+                Log.i(TAG, "[PERF-M1] Whisper (vision): ${whisperMs}ms → \"$text\"")
                 onEvent(PipelineEvent.Transcription(text))
                 if (text.isBlank()) "What do you see in this image?" else text
             } else {
@@ -115,23 +128,26 @@ class VoiceAssistantPipeline(
 
             // 2. Vision chat with image + transcribed question
             Log.i(TAG, "Sending to vision API...")
+            val visionStartMs = System.currentTimeMillis()
             val aiResponse = openAIService.visionChat(userText, jpegBytes)
-            Log.i(TAG, "Vision response: \"$aiResponse\"")
+            val visionMs = System.currentTimeMillis() - visionStartMs
+            Log.i(TAG, "[PERF-M27] Vision API (GPT-4o): ${visionMs}ms → \"$aiResponse\"")
             onEvent(PipelineEvent.AiResponse(aiResponse))
 
-            // 3. Synthesize with OpenAI TTS → decode MP3 → PCM
+            // 3. Synthesize with OpenAI TTS (raw 24kHz mono PCM) → resample → limit
             onEvent(PipelineEvent.TtsSynthesizing)
             Log.i(TAG, "Synthesizing with OpenAI TTS...")
-            val mp3Bytes = openAIService.speak(aiResponse)
-            Log.i(TAG, "OpenAI TTS returned ${mp3Bytes.size} bytes of MP3")
+            val ttsStartMs = System.currentTimeMillis()
+            val pcm24k = openAIService.speak(aiResponse)
+            val ttsMs = System.currentTimeMillis() - ttsStartMs
+            Log.i(TAG, "[PERF-M3] TTS (vision): ${ttsMs}ms → ${pcm24k.size} bytes PCM @ 24kHz")
 
-            val ttsPcm = decodeMp3ToPcm(mp3Bytes)
-            if (ttsPcm == null) {
-                onEvent(PipelineEvent.Error("MP3 decode failed"))
-                return null
-            }
+            val ttsPcm = peakLimit(pcm24k)
             val ttsDuration = ttsPcm.size / (TTS_SAMPLE_RATE * 2.0)
             Log.i(TAG, "TTS PCM ready: ${ttsPcm.size} bytes (${String.format("%.2f", ttsDuration)}s)")
+
+            val totalMs = System.currentTimeMillis() - pipelineStartMs
+            Log.i(TAG, "[PERF-M7] Vision pipeline total: ${totalMs}ms (whisper=${whisperMs} vision=${visionMs} tts=${ttsMs})")
 
             return ttsPcm
         } catch (e: Exception) {
@@ -290,6 +306,30 @@ class VoiceAssistantPipeline(
             mono.putShort(((left + right) shr 1).toShort())
         }
         return mono.array()
+    }
+
+    /**
+     * Peak-normalise PCM16 LE in-place: scale so max |sample| ≈ LIMITER_TARGET_PEAK,
+     * but cap the gain at LIMITER_MAX_BOOST so quiet TTS isn't pumped to the noise floor.
+     * Recovers perceived loudness lost by the ESP32-side digital attenuation.
+     */
+    private fun peakLimit(pcm: ByteArray): ByteArray {
+        val n = pcm.size / 2
+        if (n == 0) return pcm
+        val bb = ByteBuffer.wrap(pcm).order(ByteOrder.LITTLE_ENDIAN)
+        var peak = 1
+        for (i in 0 until n) {
+            val s = bb.getShort(i * 2).toInt()
+            val a = if (s < 0) -s else s
+            if (a > peak) peak = a
+        }
+        val gain = minOf(LIMITER_TARGET_PEAK.toDouble() / peak, LIMITER_MAX_BOOST)
+        if (gain <= 1.0) return pcm  // already at-or-above target peak — leave alone
+        for (i in 0 until n) {
+            val s = (bb.getShort(i * 2) * gain).toInt().coerceIn(-32768, 32767)
+            bb.putShort(i * 2, s.toShort())
+        }
+        return pcm
     }
 
     /**

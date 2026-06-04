@@ -55,6 +55,7 @@ class BleVoiceService(
         data class SendingAudio(val totalBytes: Int) : BleEvent()
         data class AudioSent(val totalBytes: Int) : BleEvent()
         data class ImageReceived(val jpegBytes: ByteArray) : BleEvent()
+        data class VideoReceived(val frames: List<ByteArray>) : BleEvent()
         data class Error(val message: String) : BleEvent()
     }
 
@@ -80,6 +81,19 @@ class BleVoiceService(
     private val imageBuffer = ByteArrayOutputStream()
     @Volatile private var receivingImage = false
     private var pendingJpeg: ByteArray? = null
+
+    // Performance measurement state
+    private var perfImageTxStartMs  = 0L   // M17: image transfer start time
+    private var perfExpectedImageSize = 0   // M24: expected bytes from 'I' marker
+    private var perfImagePacketCount = 0    // M24: fragment count
+    private var perfAudioRxStartMs   = 0L   // M11: audio receive start
+
+    // Video reassembly state
+    @Volatile private var receivingVideo = false
+    @Volatile private var receivingVideoFrame = false
+    private val videoFrames = mutableListOf<ByteArray>()
+    private val currentVideoFrame = ByteArrayOutputStream()
+    private var expectedVideoFrameSize = 0
 
     private val mainHandler = Handler(Looper.getMainLooper())
 
@@ -135,7 +149,11 @@ class BleVoiceService(
         isConnected = false
         pendingJpeg = null
         receivingImage = false
+        receivingVideo = false
+        receivingVideoFrame = false
         synchronized(imageBuffer) { imageBuffer.reset() }
+        synchronized(currentVideoFrame) { currentVideoFrame.reset() }
+        synchronized(videoFrames) { videoFrames.clear() }
         try { gatt?.disconnect() } catch (_: Exception) {}
         try { gatt?.close() } catch (_: Exception) {}
         gatt = null
@@ -371,6 +389,7 @@ class BleVoiceService(
         if (payload.isEmpty()) return
 
         synchronized(audioChunks) {
+            if (audioChunks.isEmpty()) perfAudioRxStartMs = System.currentTimeMillis()  // M11 start
             audioChunks.add(payload)
             if (audioChunks.size % 50 == 0) {
                 val total = audioChunks.sumOf { it.size }
@@ -391,34 +410,93 @@ class BleVoiceService(
                 Log.i(TAG, "Start marker → clearing buffer")
                 synchronized(audioChunks) { audioChunks.clear() }
             }
+            'V' -> {
+                // Video recording start — clear any stale audio and prepare frame list
+                Log.i(TAG, "Video start marker")
+                receivingVideo = true
+                receivingVideoFrame = false
+                synchronized(audioChunks) { audioChunks.clear() }
+                synchronized(videoFrames) { videoFrames.clear() }
+                synchronized(currentVideoFrame) { currentVideoFrame.reset() }
+            }
+            'W' -> {
+                // Video end — fire event with all collected frames
+                receivingVideo = false
+                receivingVideoFrame = false
+                val frames: List<ByteArray>
+                synchronized(videoFrames) {
+                    frames = videoFrames.toList()
+                    videoFrames.clear()
+                }
+                Log.i(TAG, "Video end marker: ${frames.size} frames received")
+                onEvent(BleEvent.VideoReceived(frames))
+            }
             'I' -> {
-                // Image start: [tag='I'][reserved][4-byte LE length]
+                // Image or video-frame start: [tag='I'][reserved/flags][4-byte LE length]
+                val isVideoFrame = data.size >= 2 && data[1] == 0x01.toByte()
                 val expectedSize = if (data.size >= 6) {
                     ByteBuffer.wrap(data, 2, 4).order(ByteOrder.LITTLE_ENDIAN).int
                 } else 0
-                Log.i(TAG, "Image start marker (expected $expectedSize bytes)")
-                receivingImage = true
-                synchronized(imageBuffer) { imageBuffer.reset() }
+                if (isVideoFrame) {
+                    Log.d(TAG, "Video frame start ($expectedSize bytes)")
+                    receivingVideoFrame = true
+                    expectedVideoFrameSize = expectedSize
+                    synchronized(currentVideoFrame) { currentVideoFrame.reset() }
+                } else {
+                    Log.i(TAG, "Image start marker (expected $expectedSize bytes)")
+                    perfImageTxStartMs   = System.currentTimeMillis()  // M17
+                    perfExpectedImageSize = expectedSize               // M24
+                    perfImagePacketCount  = 0                          // M24
+                    receivingImage = true
+                    receivingVideoFrame = false
+                    synchronized(imageBuffer) { imageBuffer.reset() }
+                    Log.i(TAG, "[PERF-M17] Image transfer start: expected $expectedSize bytes")
+                }
             }
             'J' -> {
-                // Image complete — stash JPEG until 'E' (audio end) arrives
-                receivingImage = false
-                synchronized(imageBuffer) {
-                    pendingJpeg = imageBuffer.toByteArray()
-                    imageBuffer.reset()
+                if (receivingVideoFrame) {
+                    // Video frame complete — add to list
+                    receivingVideoFrame = false
+                    synchronized(currentVideoFrame) {
+                        val frameBytes = currentVideoFrame.toByteArray()
+                        synchronized(videoFrames) { videoFrames.add(frameBytes) }
+                        currentVideoFrame.reset()
+                    }
+                    Log.d(TAG, "Video frame ${data.getOrNull(1)?.toInt() ?: 0} complete (${videoFrames.size} frames so far)")
+                } else {
+                    // Still image complete — stash until 'E' arrives
+                    receivingImage = false
+                    synchronized(imageBuffer) {
+                        pendingJpeg = imageBuffer.toByteArray()
+                        imageBuffer.reset()
+                    }
+                    val imgBytes = pendingJpeg ?: ByteArray(0)
+                    val imgMs = System.currentTimeMillis() - perfImageTxStartMs
+                    val imgThroughput = if (imgMs > 0) imgBytes.size * 1000.0 / imgMs else 0.0
+                    Log.i(TAG, "[PERF-M17] Image transfer complete: ${imgBytes.size} bytes in ${imgMs}ms, $perfImagePacketCount packets")
+                    Log.i(TAG, "[PERF-M18] Image BLE RX throughput: ${String.format("%.0f", imgThroughput)} B/s (${String.format("%.1f", imgThroughput/1024)} KB/s)")
+                    val sizeMatch = imgBytes.size == perfExpectedImageSize
+                    Log.i(TAG, "[PERF-M24] Reassembly: expected=$perfExpectedImageSize assembled=${imgBytes.size} → ${if (sizeMatch) "OK" else "SIZE MISMATCH!"}")
+                    // Attempt JPEG decode to verify integrity
+                    if (imgBytes.isNotEmpty()) {
+                        val bm = android.graphics.BitmapFactory.decodeByteArray(imgBytes, 0, imgBytes.size)
+                        Log.i(TAG, "[PERF-M24] JPEG decode: ${if (bm != null) "SUCCESS (${bm.width}x${bm.height})" else "FAILED — corrupted transfer"}")
+                        bm?.recycle()
+                    }
+                    pendingJpeg?.let { onEvent(BleEvent.ImageReceived(it)) }
                 }
-                Log.i(TAG, "Image end marker (${pendingJpeg?.size ?: 0} bytes stashed)")
-                pendingJpeg?.let { onEvent(BleEvent.ImageReceived(it)) }
             }
         }
     }
 
     private fun handleImageTx(data: ByteArray) {
         if (data.size <= HEADER_SIZE) return
-        // Strip [tag][seq] header, keep JPEG payload
         val payload = data.copyOfRange(HEADER_SIZE, data.size)
-        synchronized(imageBuffer) {
-            imageBuffer.write(payload)
+        if (receivingVideoFrame) {
+            synchronized(currentVideoFrame) { currentVideoFrame.write(payload) }
+        } else {
+            synchronized(imageBuffer) { imageBuffer.write(payload) }
+            perfImagePacketCount++  // M24: count fragments
         }
     }
 
@@ -435,7 +513,10 @@ class BleVoiceService(
         }
 
         val dur = raw.size / (16000.0 * 2)
+        val audioRxMs = System.currentTimeMillis() - perfAudioRxStartMs
         Log.i(TAG, "Utterance: ${raw.size} bytes (${String.format("%.2f", dur)}s)")
+        Log.i(TAG, "[PERF-M11] Utterance received: ${raw.size} bytes (${String.format("%.2f", dur)}s) in ${audioRxMs}ms from ESP32")
+        Log.i(TAG, "[PERF-M9]  MTU: $negotiatedMtu (payload: ${negotiatedMtu - 3 - HEADER_SIZE} bytes/pkt)")
 
         if (raw.size < MIN_AUDIO_BYTES) {
             Log.w(TAG, "Too short, ignoring")
@@ -483,8 +564,9 @@ class BleVoiceService(
         // Without this, lost packets (WRITE_NR has no ACK) shift the audio buffer by an
         // odd byte count, misaligning every subsequent 16-bit sample → buzzing/noise.
         val maxPayload = (negotiatedMtu - 3 - HEADER_SIZE) and 0x7FFFFFFE.toInt()
-        val dur = pcm.size / (22050.0 * 2)
+        val dur = pcm.size / (24000.0 * 2)
         Log.i(TAG, "Sending ${pcm.size} bytes (${String.format("%.2f", dur)}s)")
+        val bleTxStartMs = System.currentTimeMillis()  // M4/M10
         onEvent(BleEvent.SendingAudio(pcm.size))
 
         try {
@@ -499,26 +581,51 @@ class BleVoiceService(
             }
 
             // Audio fragments
+            // WRITE_TYPE_NO_RESPONSE writes are queued by Android's BLE stack (typically
+            // 4–7 slots). If we blast faster than the link can drain, writeCharacteristic()
+            // returns false and the packet is SILENTLY DROPPED. We must check the return
+            // value and back off until the slot frees, otherwise the ESP32 sees seq gaps
+            // and the audio crackles.
             var seq: Byte = 0
             var offset = 0
             var chunks = 0
+            var dropped = 0
             while (offset < pcm.size && isConnected) {
                 val frag = minOf(maxPayload, pcm.size - offset)
                 val pkt = ByteArray(HEADER_SIZE + frag)
                 pkt[0] = 'A'.code.toByte()
-                pkt[1] = seq++
+                pkt[1] = seq
                 System.arraycopy(pcm, offset, pkt, HEADER_SIZE, frag)
 
                 @Suppress("DEPRECATION")
                 rx.value = pkt
                 rx.writeType = BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
-                @Suppress("DEPRECATION")
-                g.writeCharacteristic(rx)
 
+                var queued = false
+                var attempts = 0
+                while (!queued && attempts < 100 && isConnected) {
+                    @Suppress("DEPRECATION")
+                    queued = g.writeCharacteristic(rx)
+                    if (!queued) {
+                        Thread.sleep(2)
+                        attempts++
+                    }
+                }
+                if (!queued) {
+                    dropped++
+                    Log.w(TAG, "BLE write dropped (seq=$seq) after $attempts retries")
+                }
+
+                seq++
                 offset += frag
                 chunks++
-                Thread.sleep(8)
+                Thread.sleep(4)  // small inter-packet delay; queue check above does the real pacing
             }
+            if (dropped > 0) Log.w(TAG, "Total dropped audio packets: $dropped/$chunks")
+            val bleTxMs = System.currentTimeMillis() - bleTxStartMs
+            val bleThroughput = if (bleTxMs > 0) pcm.size * 1000.0 / bleTxMs else 0.0
+            Log.i(TAG, "[PERF-M4]  BLE TX (Android→ESP32): ${pcm.size} bytes, $chunks chunks, $dropped dropped")
+            Log.i(TAG, "[PERF-M10] BLE TX throughput: ${String.format("%.0f", bleThroughput)} B/s (${String.format("%.1f", bleThroughput/1024)} KB/s) in ${bleTxMs}ms")
 
             // End marker
             Thread.sleep(30)

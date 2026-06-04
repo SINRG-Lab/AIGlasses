@@ -23,13 +23,14 @@
 // ════════════════════════════════════════════════════════════════
 //  I2S Pins — XIAO ESP32-S3 Sense
 //    Speaker (MAX98357A x2, hardware-panned L/R via SD_MODE):
-//      BCLK = GPIO9, LRC = GPIO5, DIN = GPIO8
+//      BCLK = GPIO9 (D10), LRC = GPIO4 (D3), DIN = GPIO8 (D9)
 //    Microphone: built-in PDM mic (MSM261D3526H1CPM)
 //      PDM_CLK  = GPIO42, PDM_DATA = GPIO41
+//    Left side is For PCB/C/breadboard
 // ════════════════════════════════════════════════════════════════
-#define I2S_BCLK    9   // Speaker BCLK
-#define I2S_WS      5   // Speaker LRC / WS
-#define AMP_DIN     8   // Speaker DIN (data out)
+#define I2S_BCLK    9   // Speaker BCLK 9/18/6
+#define I2S_WS      5   // Speaker LRC / WS 5/22/7
+#define AMP_DIN     8   // Speaker DIN (data out) 8/20/8
 
 // Built-in PDM mic pins (XIAO ESP32-S3 Sense)
 #define PDM_CLK     42
@@ -56,13 +57,13 @@
 // ════════════════════════════════════════════════════════════════
 //  Push-to-talk button: GPIO6 → HIGH when pressed (active HIGH)
 // ════════════════════════════════════════════════════════════════
-#define PTT_PIN         6
+#define PTT_PIN        6 // 6/23/5
 
 // ════════════════════════════════════════════════════════════════
 //  Audio settings
 // ════════════════════════════════════════════════════════════════
 static const int MIC_SR = 16000;
-static const int SPK_SR = 22050;
+static const int SPK_SR = 24000;   // Matches OpenAI TTS native PCM rate — no resampling needed
 static const int SAMPLES_PER_CHUNK = 512;
 // 16-bit output buffer sent over BLE (PDM mic outputs 16-bit directly)
 static int16_t micBuf[SAMPLES_PER_CHUNK];
@@ -71,7 +72,7 @@ static int16_t micBuf[SAMPLES_PER_CHUNK];
 // full-scale digital audio drives it into clipping → buzzy/distorted output.
 // 0 = full, 1 = -6dB (half), 2 = -12dB (quarter), 3 = -18dB (1/8), 4 = -24dB.
 // Tune down if still loud/buzzy, up if too quiet.
-#define SPK_VOL_SHIFT   1
+#define SPK_VOL_SHIFT  0
 
 // ════════════════════════════════════════════════════════════════
 //  Ring Buffer for streaming playback (PSRAM-backed)
@@ -133,12 +134,12 @@ enum StreamState {
 };
 static volatile StreamState streamState = STREAM_IDLE;
 static volatile bool endMarkerReceived = false;
-// Pre-buffer ~800 ms at 22050 Hz mono 16-bit before starting playback.
+// Pre-buffer ~1s at 24000 Hz mono 16-bit before starting playback.
 // Larger = more latency but more tolerance to BLE jitter/bursts (fewer cut-outs).
-#define STREAM_START_THRESHOLD  35000
+#define STREAM_START_THRESHOLD  48000
 // If the ring drops below this while playing, insert silence rather than
 // feeding starved data — prevents audible glitches on brief underruns.
-#define STREAM_LOW_WATER        2048
+#define STREAM_LOW_WATER        4096
 
 // ════════════════════════════════════════════════════════════════
 //  I2S mode tracking (shared bus — must switch between mic & speaker)
@@ -156,6 +157,33 @@ static unsigned int rxChunkCount = 0;
 static unsigned int rxTotalBytes = 0;
 static unsigned int rxDroppedBytes = 0;
 static unsigned int rxLostPackets = 0;
+unsigned int _streamUnderruns = 0;  // file-scope so finish: handler can read & reset
+
+// ════════════════════════════════════════════════════════════════
+//  Performance measurement state  (grep: [PERF-Mxx])
+//  M1  = mic audio BLE TX (ESP32→Android): bytes + throughput
+//  M4  = TTS audio BLE RX (Android→ESP32): throughput
+//  M5  = ring buffer fill % at playback start
+//  M6  = 'S' marker → first I2S write latency
+//  M7  = button press → first I2S write (end-to-end round-trip)
+//  M8  = speaker I2S init duration
+//  M10 = BLE RX throughput (bytes/sec)
+//  M11 = utterance size + duration
+//  M13 = heap / PSRAM at key init stages
+//  M19 = streaming underruns
+//  M21 = camera capture: attempts, duration, size
+//  M23 = image BLE TX: bytes + throughput
+//  M25 = mic amplitude summary (for STT quality diagnosis)
+// ════════════════════════════════════════════════════════════════
+static unsigned long perfButtonPressMs    = 0;  // M7: set on button press
+static unsigned long perfAudioTxStartMs   = 0;  // M1: recording start time
+static unsigned long perfAudioTxBytes     = 0;  // M1: bytes sent to Android
+static unsigned long perfAudioTxChunks    = 0;  // M1: BLE chunk count
+static unsigned long perfRxStartMs        = 0;  // M4/M6: time of 'S' marker
+static int16_t       perfMicMinAmp        = 32767;  // M25: min sample this recording
+static int16_t       perfMicMaxAmp        = -32768; // M25: max sample this recording
+static long          perfMicSumAmp        = 0;      // M25: sum |sample|
+static unsigned long perfMicSampleCount   = 0;      // M25: total samples counted
 
 // ════════════════════════════════════════════════════════════════
 //  BLE state
@@ -169,13 +197,25 @@ static volatile bool deviceConnected = false;
 static uint8_t txSeqNum = 0;
 
 // ════════════════════════════════════════════════════════════════
-//  Double-press detection for camera
+//  Multi-tap detection
+//    1 tap  + hold → voice only
+//    2 taps + hold → vision (photo + voice)
+//    3 taps + hold → video recording
 // ════════════════════════════════════════════════════════════════
-static unsigned long lastReleaseTime = 0;
-static int pressCount = 0;
-static const unsigned long DOUBLE_PRESS_MS = 400;
-static bool visionMode = false;       // true = image was captured for this utterance
+#define QUICK_TAP_MAX_MS  350   // press shorter than this counts as a "quick tap"
+#define TAP_WINDOW_MS     600   // inter-tap window for multi-tap accumulation
+
+static unsigned long lastQuickTapTime = 0;
+static int tapCount = 0;
+static unsigned long pressStartTime = 0;
+static bool visionMode = false;
 static volatile bool sendImageFirst = false;
+
+// ════════════════════════════════════════════════════════════════
+//  Video recording state
+// ════════════════════════════════════════════════════════════════
+static bool videoMode = false;
+static int videoFrameCount = 0;
 
 // ════════════════════════════════════════════════════════════════
 //  Camera frame buffer (stored in PSRAM until sent)
@@ -231,12 +271,19 @@ void i2sMicInit() {
 //  I2S init: Speaker (TX) on I2S0 — shared bus, must teardown mic first
 // ════════════════════════════════════════════════════════════════
 void i2sSpkInit() {
+  unsigned long _spkInitStart = millis();  // M8
   // Tear down previous TX channel if any
   if (stdTxHandle != NULL) {
     i2s_channel_disable(stdTxHandle);
     i2s_del_channel(stdTxHandle);
     stdTxHandle = NULL;
     delay(20);
+  }
+
+  // Pause the PDM mic so GPIO42 (PDM_CLK) stops toggling — eliminates
+  // crosstalk between the always-on mic clock and the speaker BCLK line.
+  if (pdmRxHandle != NULL) {
+    i2s_channel_disable(pdmRxHandle);
   }
 
   i2s_chan_config_t chanCfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_1, I2S_ROLE_MASTER);
@@ -279,6 +326,15 @@ void i2sSpkInit() {
     return;
   }
   Serial.println("[I2S] SPEAKER enabled OK");
+  Serial.printf("[PERF-M8] Speaker I2S init time: %lu ms\n", millis() - _spkInitStart);
+
+  // Preload DMA with silence so the first frames out are clean,
+  // not whatever uninitialized memory the driver allocated.
+  int16_t silence[256] = {0};
+  size_t wrote = 0;
+  for (int i = 0; i < 8; i++) {
+    i2s_channel_write(stdTxHandle, silence, sizeof(silence), &wrote, 100 / portTICK_PERIOD_MS);
+  }
 
   currentI2SMode = MODE_SPEAKER;
 }
@@ -365,17 +421,21 @@ bool initCamera() {
 //  Capture camera snapshot into PSRAM buffer
 // ════════════════════════════════════════════════════════════════
 bool captureSnapshot() {
+  unsigned long _capStart = millis();  // M21
+  int _attempts = 0;
   // Retry up to 5 times — sensor occasionally needs a few attempts
   // if it was idle or the DMA pipeline stalled.
   camera_fb_t *fb = nullptr;
   for (int attempt = 1; attempt <= 5; attempt++) {
+    _attempts = attempt;
     fb = esp_camera_fb_get();
     if (fb) break;
     Serial.printf("[CAM] Capture attempt %d failed, retrying...\n", attempt);
     delay(150);
   }
   if (!fb) {
-    Serial.println("[CAM] Capture FAILED after 5 attempts!");
+    Serial.printf("[PERF-M21] Camera capture FAILED after %d attempts (%lu ms)\n",
+                  _attempts, millis() - _capStart);
     return false;
   }
 
@@ -391,7 +451,8 @@ bool captureSnapshot() {
   capturedJpegLen = fb->len;
   esp_camera_fb_return(fb);
 
-  Serial.printf("[CAM] Captured %u bytes JPEG\n", (unsigned int)capturedJpegLen);
+  Serial.printf("[PERF-M21] Camera capture: %d attempt(s), %lu ms, %u bytes JPEG\n",
+                _attempts, millis() - _capStart, (unsigned int)capturedJpegLen);
   return true;
 }
 
@@ -401,6 +462,9 @@ bool captureSnapshot() {
 void sendCapturedImage() {
   if (!capturedJpeg || capturedJpegLen == 0) return;
   if (!deviceConnected || pImageTxChar == nullptr) return;
+
+  unsigned long _imgTxStart = millis();  // M23
+  unsigned int _imgPackets = 0;
 
   // Send start marker with total size on control channel
   {
@@ -431,6 +495,7 @@ void sendCapturedImage() {
     pImageTxChar->notify();
 
     sent += fragSize;
+    _imgPackets++;
     delay(15);  // one fragment per connection event — prevents notification drops
   }
 
@@ -441,12 +506,87 @@ void sendCapturedImage() {
     pControlChar->notify();
   }
 
-  Serial.printf("[CAM] Sent %u bytes in %u packets\n", (unsigned int)capturedJpegLen, imgSeq);
+  unsigned long _imgTxMs = millis() - _imgTxStart;
+  float _imgThroughput = (_imgTxMs > 0) ? (capturedJpegLen * 1000.0f / _imgTxMs) : 0;
+  Serial.printf("[PERF-M23] Image TX: %u bytes, %u packets, %lu ms (%.0f B/s = %.1f KB/s)\n",
+                (unsigned int)capturedJpegLen, _imgPackets, _imgTxMs,
+                _imgThroughput, _imgThroughput / 1024.0f);
 
   // Free the buffer
   free(capturedJpeg);
   capturedJpeg = nullptr;
   capturedJpegLen = 0;
+}
+
+// ════════════════════════════════════════════════════════════════
+//  Video recording helpers
+// ════════════════════════════════════════════════════════════════
+void sendVideoStartMarker() {
+  if (!deviceConnected || pControlChar == nullptr) return;
+  uint8_t pkt[2] = {'V', 0};
+  pControlChar->setValue(pkt, 2);
+  pControlChar->notify();
+  delay(10);
+}
+
+// Capture one JPEG frame and stream it immediately over BLE.
+// The reserved byte in the control 'I' packet is 0x01 (video frame flag).
+void sendVideoFrame(uint8_t frameIndex) {
+  if (!deviceConnected || pImageTxChar == nullptr) return;
+
+  camera_fb_t *fb = nullptr;
+  for (int attempt = 1; attempt <= 3; attempt++) {
+    fb = esp_camera_fb_get();
+    if (fb) break;
+    delay(50);
+  }
+  if (!fb) {
+    Serial.println("[VID] Frame capture failed");
+    return;
+  }
+
+  // Frame start: 'I' + 0x01 (video flag) + 4-byte LE size
+  uint8_t startPkt[6];
+  startPkt[0] = 'I';
+  startPkt[1] = 0x01;
+  startPkt[2] = (fb->len >>  0) & 0xFF;
+  startPkt[3] = (fb->len >>  8) & 0xFF;
+  startPkt[4] = (fb->len >> 16) & 0xFF;
+  startPkt[5] = (fb->len >> 24) & 0xFF;
+  pControlChar->setValue(startPkt, 6);
+  pControlChar->notify();
+  delay(10);
+
+  // Fragment and send JPEG directly from camera DMA buffer
+  uint8_t imgSeq = 0;
+  size_t sent = 0;
+  while (sent < fb->len) {
+    size_t fragSize = min((size_t)BLE_MAX_PAYLOAD, fb->len - sent);
+    uint8_t pkt[BLE_HEADER_SIZE + fragSize];
+    pkt[0] = 'I';
+    pkt[1] = imgSeq++;
+    memcpy(pkt + BLE_HEADER_SIZE, fb->buf + sent, fragSize);
+    pImageTxChar->setValue(pkt, BLE_HEADER_SIZE + fragSize);
+    pImageTxChar->notify();
+    sent += fragSize;
+    delay(15);
+  }
+
+  // Frame end: 'J' + frameIndex
+  uint8_t endPkt[2] = {'J', frameIndex};
+  pControlChar->setValue(endPkt, 2);
+  pControlChar->notify();
+
+  Serial.printf("[VID] Frame %u: %u bytes\n", frameIndex, (unsigned int)fb->len);
+  esp_camera_fb_return(fb);
+}
+
+void sendVideoEndMarker(uint8_t totalFrames) {
+  if (!deviceConnected || pControlChar == nullptr) return;
+  uint8_t pkt[2] = {'W', totalFrames};
+  pControlChar->setValue(pkt, 2);
+  pControlChar->notify();
+  delay(10);
 }
 
 // ════════════════════════════════════════════════════════════════
@@ -460,6 +600,12 @@ void streamPlaybackTick() {
   if (streamState == STREAM_BUFFERING) {
     if (avail >= STREAM_START_THRESHOLD || (endMarkerReceived && avail > 0)) {
       Serial.printf("[STREAM] Starting playback (%u bytes buffered)\n", avail);
+      Serial.printf("[PERF-M5] Ring buffer at playback start: %u/%u bytes (%.1f%%)\n",
+                    (unsigned)avail, RING_SIZE, 100.0f * avail / RING_SIZE);
+      Serial.printf("[PERF-M6] 'S' marker → playback start: %lu ms\n",
+                    millis() - perfRxStartMs);
+      Serial.printf("[PERF-M7] Button press → playback start (round-trip): %lu ms\n",
+                    millis() - perfButtonPressMs);
       i2sSpkInit();
       if (stdTxHandle == NULL) {
         Serial.println("[STREAM] Speaker init failed — aborting playback");
@@ -495,28 +641,29 @@ void streamPlaybackTick() {
     } else if (streamState == STREAM_DRAINING && avail == 0) {
       goto finish;
     } else {
-      // PLAYING but ring is low/empty → brief re-buffer to absorb BLE jitter.
-      // Wait (non-blocking busy-yield) up to ~60 ms for more data to arrive
-      // before giving up and writing silence for this tick.
+      // PLAYING but ring is low → wait for more data rather than inserting
+      // silence. The DMA TX buffer has ~186 ms of headroom and will smoothly
+      // play out while we wait, avoiding the rhythmic "bubbling" that silence
+      // splicing produces on repeated brief underruns.
       unsigned long waitStart = millis();
-      while (ringAvailable() < wantBytes && (millis() - waitStart) < 120) {
+      while (ringAvailable() < wantBytes && (millis() - waitStart) < 300) {
         delay(2);
       }
       if (ringAvailable() >= wantBytes) {
         ringRead(monoReadBuf, wantBytes);
       } else {
-        static unsigned int underruns = 0;
-        if ((++underruns % 20) == 1) {
-          Serial.printf("[STREAM] Underrun #%u (ring=%u)\n", underruns, (unsigned)ringAvailable());
+        if ((++_streamUnderruns % 20) == 1) {
+          Serial.printf("[STREAM] Underrun #%u (ring=%u) — DMA drain\n",
+                        _streamUnderruns, (unsigned)ringAvailable());
         }
-        memset(stereoChunk, 0, sizeof(stereoChunk));
-        size_t written = 0;
-        i2s_channel_write(stdTxHandle, stereoChunk, sizeof(stereoChunk), &written, portMAX_DELAY);
+        // Skip writing — let DMA continue playing its existing buffer.
+        // Next tick will re-check the ring.
         return;
       }
     }
 
-    // Interleave mono → stereo (L=R) with volume attenuation
+    // Interleave mono → stereo (L=R) — MAX98357A expects standard stereo I2S.
+    // Mono-slot mode produces a non-standard waveform that some amps decode as clicks.
     const int16_t* monoSrc = (const int16_t*)monoReadBuf;
     size_t monoSamples = wantBytes / 2;
     for (size_t i = 0; i < monoSamples; i++) {
@@ -537,8 +684,17 @@ void streamPlaybackTick() {
   return;
 
 finish:
-  Serial.printf("[STREAM] Playback complete! (received %u bytes, %u chunks, dropped %u, lost pkts %u)\n",
-                rxTotalBytes, rxChunkCount, rxDroppedBytes, rxLostPackets);
+  {
+    unsigned long _rxMs = (perfRxStartMs > 0) ? (millis() - perfRxStartMs) : 1;
+    float _rxThroughput = rxTotalBytes * 1000.0f / _rxMs;
+    Serial.printf("[STREAM] Playback complete! (rx %u bytes, %u chunks, ringDrop %u, seqGaps %u, underruns %u)\n",
+                  rxTotalBytes, rxChunkCount, rxDroppedBytes, rxLostPackets, _streamUnderruns);
+    Serial.printf("[PERF-M10] BLE RX (Android→ESP32): %u bytes in %lu ms → %.0f B/s (%.1f KB/s)\n",
+                  rxTotalBytes, _rxMs, _rxThroughput, _rxThroughput / 1024.0f);
+    Serial.printf("[PERF-M19] Streaming underruns: %u | dropped: %u bytes | seq gaps: %u packets\n",
+                  _streamUnderruns, rxDroppedBytes, rxLostPackets);
+  }
+  _streamUnderruns = 0;
 
   memset(stereoChunk, 0, sizeof(stereoChunk));
   for (int i = 0; i < 8; i++) {
@@ -554,6 +710,11 @@ finish:
 
   pinMode(AMP_DIN, OUTPUT);
   digitalWrite(AMP_DIN, LOW);
+
+  // Re-enable the PDM mic now that the speaker is torn down
+  if (pdmRxHandle != NULL) {
+    i2s_channel_enable(pdmRxHandle);
+  }
   currentI2SMode = MODE_MIC;  // mic channel is always running on I2S_NUM_1
 
   streamState = STREAM_IDLE;
@@ -654,7 +815,10 @@ class ControlCallbacks : public NimBLECharacteristicCallbacks {
     uint8_t tag = data[0];
 
     if (tag == 'S') {
+      perfRxStartMs = millis();  // M4/M6: start of TTS audio incoming
       Serial.println("[BLE-CTRL] Start marker — buffering audio");
+      Serial.printf("[PERF-M4] BLE RX start (TTS audio incoming, heap: %u KB free)\n",
+                    ESP.getFreeHeap() / 1024);
       ringReset();
       endMarkerReceived = false;
       rxChunkCount = 0;
@@ -690,6 +854,8 @@ void sendMicChunkViaBLE(uint8_t* pcmData, size_t pcmLen) {
     pAudioTxChar->notify();
 
     offset += fragSize;
+    perfAudioTxBytes += fragSize;   // M1: accumulate payload bytes (excludes header)
+    perfAudioTxChunks++;
     delay(2);  // Small yield for BLE stack
   }
 }
@@ -715,6 +881,8 @@ void setup() {
   Serial.printf("[SYS] PSRAM: %u KB\n", ESP.getPsramSize() / 1024);
   Serial.printf("[SYS] Free heap: %u KB\n", ESP.getFreeHeap() / 1024);
   Serial.printf("[SYS] Free PSRAM: %u KB\n", ESP.getFreePsram() / 1024);
+  Serial.printf("[PERF-M13] Heap at boot: %u KB free | PSRAM: %u KB free\n",
+                ESP.getFreeHeap() / 1024, ESP.getFreePsram() / 1024);
 
   // ── Initialize camera FIRST — before any PSRAM/DMA allocations ──
   // The camera driver claims DMA channels and PSRAM frame buffers.
@@ -727,6 +895,8 @@ void setup() {
     Serial.println("[CAM] Camera initialized OK");
   }
   Serial.printf("[SYS] Free PSRAM after camera: %u KB\n", ESP.getFreePsram() / 1024);
+  Serial.printf("[PERF-M13] Heap after camera init: %u KB free | PSRAM: %u KB free\n",
+                ESP.getFreeHeap() / 1024, ESP.getFreePsram() / 1024);
 
   // Allocate ring buffer in PSRAM
   ringBuffer = (uint8_t*)ps_malloc(RING_SIZE);
@@ -739,6 +909,8 @@ void setup() {
   } else {
     Serial.println("[SYS] FATAL: Could not allocate ring buffer!");
   }
+  Serial.printf("[PERF-M13] Heap after ring buffer: %u KB free | PSRAM: %u KB free\n",
+                ESP.getFreeHeap() / 1024, ESP.getFreePsram() / 1024);
 
   // Push-to-talk button (active HIGH — pressed = HIGH, released = LOW)
   pinMode(PTT_PIN, INPUT_PULLDOWN);
@@ -812,12 +984,15 @@ void setup() {
 
   Serial.println("[BLE] GATT server started");
   Serial.println("[BLE] Advertising as 'AIGlasses-ESP32S3'");
+  Serial.printf("[PERF-M13] Heap after BLE init: %u KB free | PSRAM: %u KB free\n",
+                ESP.getFreeHeap() / 1024, ESP.getFreePsram() / 1024);
 
   Serial.println();
   Serial.println("============================================================");
   Serial.println("  READY!");
-  Serial.printf("  Press once + hold GPIO%d  → voice only\n", PTT_PIN);
-  Serial.println("  Press twice + hold       → photo + voice (vision AI)");
+  Serial.printf("  Press once  + hold GPIO%d → voice only\n", PTT_PIN);
+  Serial.println("  Press twice + hold        → photo + voice (vision AI)");
+  Serial.println("  Press 3x    + hold        → video recording");
   Serial.println("  No WiFi hotspot needed — uses BLE directly!");
   Serial.println("============================================================\n");
 }
@@ -838,7 +1013,7 @@ void loop() {
     return;
   }
 
-  // Debounced button read (active HIGH)
+  // Debounced button read (active HIGH — pressed when GPIO reads HIGH)
   bool raw1 = (digitalRead(PTT_PIN) == HIGH);
   delay(10);
   bool raw2 = (digitalRead(PTT_PIN) == HIGH);
@@ -849,29 +1024,57 @@ void loop() {
 
   if (!pressed) {
     if (wasPressed) {
-      // Button released — if recording, send image (if vision mode) then END marker
-      if (isRecording) {
-        if (visionMode) {
-          // Send the captured image first, THEN the audio END
-          Serial.println("[PTT] Released → sending image + audio END");
-          sendCapturedImage();
-          delay(20);
+      unsigned long pressDuration = millis() - pressStartTime;
+
+      if (videoMode) {
+        // Stop video recording
+        Serial.printf("[PTT] Video stopped → %d frames captured\n", videoFrameCount);
+        sendVideoEndMarker((uint8_t)min(videoFrameCount, 255));
+        videoMode = false;
+        videoFrameCount = 0;
+        tapCount = 0;
+
+      } else if (isRecording) {
+        if (pressDuration < QUICK_TAP_MAX_MS) {
+          // Quick tap — track it for multi-tap gesture, discard audio/snapshot
+          lastQuickTapTime = millis();
+          if (visionMode && capturedJpeg) {
+            free(capturedJpeg);
+            capturedJpeg = nullptr;
+            capturedJpegLen = 0;
+          }
+          visionMode = false;
+          isRecording = false;
+          Serial.printf("[PTT] Quick tap (tapCount=%d)\n", tapCount);
         } else {
-          Serial.println("[PTT] Released -> Sent END marker via BLE");
+          // Long press — send image (vision) + audio END
+          unsigned long _recMs = millis() - perfAudioTxStartMs;
+          float _audioThroughput = (_recMs > 0) ? (perfAudioTxBytes * 1000.0f / _recMs) : 0;
+          float _durSec = perfAudioTxBytes / (16000.0f * 2.0f);
+          Serial.printf("[PERF-M11] Utterance: %lu bytes (%.2f s), %lu chunks\n",
+                        perfAudioTxBytes, _durSec, perfAudioTxChunks);
+          Serial.printf("[PERF-M1]  Mic→Android BLE TX: %lu bytes in %lu ms → %.0f B/s (%.1f KB/s)\n",
+                        perfAudioTxBytes, _recMs, _audioThroughput, _audioThroughput / 1024.0f);
+          if (perfMicSampleCount > 0) {
+            Serial.printf("[PERF-M25] Mic amplitude: min=%d max=%d avgAbs=%ld over %lu samples\n",
+                          (int)perfMicMinAmp, (int)perfMicMaxAmp,
+                          perfMicSumAmp / (long)perfMicSampleCount, perfMicSampleCount);
+          }
+          if (visionMode) {
+            Serial.println("[PTT] Released → sending image + audio END");
+            sendCapturedImage();
+            delay(20);
+          } else {
+            Serial.println("[PTT] Released → sending audio END");
+          }
+          uint8_t endPkt[BLE_HEADER_SIZE] = {'E', 0};
+          pControlChar->setValue(endPkt, BLE_HEADER_SIZE);
+          pControlChar->notify();
+          isRecording = false;
+          visionMode = false;
+          tapCount = 0;
         }
-
-        // Send END marker via Control characteristic
-        uint8_t endPkt[BLE_HEADER_SIZE] = {'E', 0};
-        pControlChar->setValue(endPkt, BLE_HEADER_SIZE);
-        pControlChar->notify();
-
-        isRecording = false;
-        visionMode = false;
       }
-
-      // Track release time for double-press detection
-      lastReleaseTime = millis();
-      pressCount++;
     }
     wasPressed = false;
     delay(20);
@@ -880,31 +1083,66 @@ void loop() {
 
   // Button is pressed
   if (!wasPressed) {
-    // Fresh press — check if this is a second press (double-press)
+    pressStartTime = millis();
+    perfButtonPressMs = millis();  // M7: start of round-trip timer
     unsigned long now = millis();
-    if (pressCount >= 1 && (now - lastReleaseTime) < DOUBLE_PRESS_MS) {
-      // Double-press detected → vision mode
-      visionMode = true;
-      pressCount = 0;
-      Serial.println("[PTT] Double-press → VISION MODE (photo + voice)");
+    bool withinWindow = (tapCount > 0) && (now - lastQuickTapTime < TAP_WINDOW_MS);
 
-      // Capture photo now, will send on release
-      captureSnapshot();
+    if (!withinWindow) tapCount = 1;
+    else tapCount++;
 
-      // Start recording voice question
-      txSeqNum = 0;
-      isRecording = true;
-      Serial.println("[PTT] Recording voice question about the image...");
-    } else {
-      // Single press → voice only
+    if (tapCount >= 3) {
+      // Triple-tap + hold → video recording
+      Serial.println("[PTT] Triple-tap + hold → VIDEO RECORDING");
+      videoMode = true;
+      videoFrameCount = 0;
+      isRecording = false;
       visionMode = false;
-      pressCount = 0;
+      sendVideoStartMarker();
+    } else if (tapCount == 2) {
+      // Double-press + hold → vision mode (photo + voice)
+      Serial.println("[PTT] Double-press → VISION MODE (photo + voice)");
+      visionMode = true;
       txSeqNum = 0;
       isRecording = true;
-      Serial.println("[PTT] Pressed -> Streaming audio via BLE...");
+      // Reset M1/M25 accumulators
+      perfAudioTxStartMs = millis();
+      perfAudioTxBytes = 0;
+      perfAudioTxChunks = 0;
+      perfMicMinAmp = 32767;
+      perfMicMaxAmp = -32768;
+      perfMicSumAmp = 0;
+      perfMicSampleCount = 0;
+      captureSnapshot();
+    } else {
+      // Single press + hold → voice only
+      Serial.println("[PTT] Single press → voice only");
+      visionMode = false;
+      txSeqNum = 0;
+      isRecording = true;
+      // Reset M1/M25 accumulators
+      perfAudioTxStartMs = millis();
+      perfAudioTxBytes = 0;
+      perfAudioTxChunks = 0;
+      perfMicMinAmp = 32767;
+      perfMicMaxAmp = -32768;
+      perfMicSumAmp = 0;
+      perfMicSampleCount = 0;
     }
   }
   wasPressed = true;
+
+  // Video mode: capture and stream one frame per loop iteration while held
+  if (videoMode) {
+    sendVideoFrame((uint8_t)(videoFrameCount & 0xFF));
+    videoFrameCount++;
+    return;
+  }
+
+  if (!isRecording) {
+    delay(1);
+    return;
+  }
 
   // Read 16-bit PCM directly from PDM mic (new I2S API, I2S_NUM_0)
   size_t bytesRead = 0;
@@ -933,9 +1171,9 @@ void loop() {
     micBuf[i] = (int16_t)s;
   }
 
-  // Debug: print mic amplitude every 20 chunks to check signal
+  // Debug: print mic amplitude every 20 chunks + accumulate M25 stats
   static int debugChunk = 0;
-  if (++debugChunk % 20 == 0) {
+  {
     int16_t minVal = 32767, maxVal = -32768;
     long sum = 0;
     for (int i = 0; i < samples; i++) {
@@ -943,9 +1181,16 @@ void loop() {
       if (s < minVal) minVal = s;
       if (s > maxVal) maxVal = s;
       sum += abs(s);
+      // M25 rolling stats
+      if (s < perfMicMinAmp) perfMicMinAmp = s;
+      if (s > perfMicMaxAmp) perfMicMaxAmp = s;
+      perfMicSumAmp += abs(s);
     }
-    Serial.printf("[MIC] min=%d max=%d avgAmp=%ld (samples=%d)\n",
-                  minVal, maxVal, sum / samples, samples);
+    perfMicSampleCount += samples;
+    if (++debugChunk % 20 == 0) {
+      Serial.printf("[MIC] min=%d max=%d avgAmp=%ld (samples=%d)\n",
+                    minVal, maxVal, sum / samples, samples);
+    }
   }
 
   // Send 16-bit PCM to Android via BLE NOTIFY
