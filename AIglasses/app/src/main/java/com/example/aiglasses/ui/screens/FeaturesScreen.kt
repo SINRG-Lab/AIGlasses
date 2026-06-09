@@ -47,7 +47,7 @@ fun FeaturesScreen(viewModel: MainViewModel) {
         put("voice", true)
         put("transcription", true)
         put("tts", true)
-        put("vision", false)
+        put("vision", true)
         put("focus", false)
         put("trackpad", false)
         put("display", false)
@@ -91,8 +91,7 @@ fun FeaturesScreen(viewModel: MainViewModel) {
                         "touch_app" -> Icons.Filled.TouchApp
                         else -> Icons.Filled.Widgets
                     }
-                    val isLocked = feature.locked ||
-                            (feature.id == "vision" && !isConnected)
+                    val isLocked = feature.locked
 
                     FeatureToggleCard(
                         icon = icon,

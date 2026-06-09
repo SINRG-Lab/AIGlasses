@@ -27,5 +27,6 @@ data class PipelineStatus(
 data class SavedImage(
     val filename: String,
     val timestamp: Long,
-    val sizeBytes: Int
+    val sizeBytes: Int,
+    val isVideo: Boolean = false
 )
