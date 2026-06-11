@@ -431,6 +431,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 addLog("CAMERA", "Video received: ${event.frames.size} frames")
                 saveVideoToGallery(event.frames)
             }
+            is BleVoiceService.BleEvent.PlaybackCancelled -> {
+                _glassesStatus.update { it.copy(connectionState = ConnectionState.Connected) }
+                _pipelineStatus.update { it.copy(isProcessing = false, isSynthesizing = false) }
+                addLog("AUDIO", "Playback cancelled on glasses (barge-in)")
+            }
             is BleVoiceService.BleEvent.Error -> {
                 addLog("ERROR", event.message)
             }

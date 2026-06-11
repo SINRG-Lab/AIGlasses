@@ -26,9 +26,20 @@ class VoiceAssistantPipeline(
         // Whisper too low and get mis-transcribed. Bigger boost ceiling than the TTS
         // limiter; silence guard avoids amplifying pure noise.
         private const val ASR_TARGET_PEAK = 22000
-        private const val ASR_MAX_BOOST = 12.0   // firmware gain lowered to 4x, so the
-                                                 // app does more of the leveling here
+        private const val ASR_MAX_BOOST = 8.0    // raised from 5x for at-distance speech now
+                                                 // that the firmware clipping source is gone
+                                                 // (MIC_GAIN=1) and silence is trimmed/VAD-
+                                                 // guarded before boosting. Was capped from
+                                                 // 12x because a high ceiling amplifies the
+                                                 // noise floor as much as speech.
         private const val ASR_SILENCE_PEAK = 150 // scaled down with the lower firmware gain
+        // Drop |sample| below this from the head/tail of an utterance before ASR —
+        // Whisper hallucinates filler phrases on the silence window the firmware
+        // always captures between button press and the start of speech.
+        private const val ASR_TRIM_THRESHOLD = 500
+        // If the whole utterance is quieter than this average magnitude, skip the
+        // Whisper call entirely — returning nothing beats returning a hallucination.
+        private const val ASR_MIN_AVG_ABS = 150
     }
 
     sealed class PipelineEvent {
@@ -52,9 +63,17 @@ class VoiceAssistantPipeline(
             val duration = rawPcm.size / (MIC_SAMPLE_RATE * 2.0)
             Log.i(TAG, "Processing utterance: ${rawPcm.size} bytes (${String.format("%.2f", duration)}s)")
 
-            // 1. Save PCM as WAV for Whisper (normalize quiet mic first)
+            // VAD guard: bail out on near-silent buffers rather than letting Whisper
+            // hallucinate a filler phrase from pure noise.
+            val loudness = avgAbs(rawPcm)
+            if (loudness < ASR_MIN_AVG_ABS) {
+                Log.w(TAG, "[ASR] utterance too quiet (avgAbs=${String.format("%.0f", loudness)} < $ASR_MIN_AVG_ABS) — skipping Whisper")
+                return null
+            }
+
+            // 1. Save PCM as WAV for Whisper (trim leading/trailing silence, then normalize quiet mic)
             onEvent(PipelineEvent.Processing)
-            val wavFile = pcmToWav(normalizeForAsr(rawPcm), MIC_SAMPLE_RATE)
+            val wavFile = pcmToWav(normalizeForAsr(trimSilence(rawPcm)), MIC_SAMPLE_RATE)
             Log.i(TAG, "Saved utterance WAV: ${wavFile.length()} bytes")
 
             // 2. Transcribe with Whisper
@@ -63,7 +82,7 @@ class VoiceAssistantPipeline(
             val userText = openAIService.transcribe(wavFile)
             val whisperMs = System.currentTimeMillis() - whisperStartMs
             wavFile.delete()
-            Log.i(TAG, "[PERF-M1] Whisper: ${whisperMs}ms → \"$userText\"")
+            Log.i(TAG, "[PERF-M30] Whisper: ${whisperMs}ms → \"$userText\"")
             onEvent(PipelineEvent.Transcription(userText))
 
             if (userText.isBlank()) {
@@ -76,7 +95,7 @@ class VoiceAssistantPipeline(
             val chatStartMs = System.currentTimeMillis()
             val aiResponse = openAIService.chat(userText)
             val chatMs = System.currentTimeMillis() - chatStartMs
-            Log.i(TAG, "[PERF-M2] GPT-4o-mini: ${chatMs}ms → \"$aiResponse\"")
+            Log.i(TAG, "[PERF-M31] GPT-4o-mini: ${chatMs}ms → \"$aiResponse\"")
             onEvent(PipelineEvent.AiResponse(aiResponse))
 
             // 4. Synthesize with OpenAI TTS (raw 24kHz mono PCM) → resample → limit
@@ -85,14 +104,14 @@ class VoiceAssistantPipeline(
             val ttsStartMs = System.currentTimeMillis()
             val pcm24k = openAIService.speak(aiResponse)
             val ttsMs = System.currentTimeMillis() - ttsStartMs
-            Log.i(TAG, "[PERF-M3] TTS: ${ttsMs}ms → ${pcm24k.size} bytes PCM @ 24kHz")
+            Log.i(TAG, "[PERF-M32] TTS: ${ttsMs}ms → ${pcm24k.size} bytes PCM @ 24kHz")
 
             val ttsPcm = peakLimit(pcm24k)
             val ttsDuration = ttsPcm.size / (TTS_SAMPLE_RATE * 2.0)
             Log.i(TAG, "TTS PCM ready: ${ttsPcm.size} bytes (${String.format("%.2f", ttsDuration)}s)")
 
             val totalMs = System.currentTimeMillis() - pipelineStartMs
-            Log.i(TAG, "[PERF-M7] Voice pipeline total: ${totalMs}ms (whisper=${whisperMs} chat=${chatMs} tts=${ttsMs})")
+            Log.i(TAG, "[PERF-M34] Voice pipeline total: ${totalMs}ms (whisper=${whisperMs} chat=${chatMs} tts=${ttsMs})")
 
             return ttsPcm
         } catch (e: Exception) {
@@ -119,14 +138,15 @@ class VoiceAssistantPipeline(
 
             // 1. Transcribe audio if present
             var whisperMs = 0L
-            val userText = if (rawPcm != null && rawPcm.size >= MIC_SAMPLE_RATE * 2) {
-                val wavFile = pcmToWav(normalizeForAsr(rawPcm), MIC_SAMPLE_RATE)
+            val userText = if (rawPcm != null && rawPcm.size >= MIC_SAMPLE_RATE * 2 &&
+                avgAbs(rawPcm) >= ASR_MIN_AVG_ABS) {
+                val wavFile = pcmToWav(normalizeForAsr(trimSilence(rawPcm)), MIC_SAMPLE_RATE)
                 Log.i(TAG, "Transcribing audio for vision...")
                 val whisperStartMs = System.currentTimeMillis()
                 val text = openAIService.transcribe(wavFile)
                 whisperMs = System.currentTimeMillis() - whisperStartMs
                 wavFile.delete()
-                Log.i(TAG, "[PERF-M1] Whisper (vision): ${whisperMs}ms → \"$text\"")
+                Log.i(TAG, "[PERF-M30] Whisper (vision): ${whisperMs}ms → \"$text\"")
                 onEvent(PipelineEvent.Transcription(text))
                 if (text.isBlank()) "What do you see in this image?" else text
             } else {
@@ -138,7 +158,7 @@ class VoiceAssistantPipeline(
             val visionStartMs = System.currentTimeMillis()
             val aiResponse = openAIService.visionChat(userText, jpegBytes)
             val visionMs = System.currentTimeMillis() - visionStartMs
-            Log.i(TAG, "[PERF-M27] Vision API (GPT-4o): ${visionMs}ms → \"$aiResponse\"")
+            Log.i(TAG, "[PERF-M33] Vision API (GPT-4o): ${visionMs}ms → \"$aiResponse\"")
             onEvent(PipelineEvent.AiResponse(aiResponse))
 
             // 3. Synthesize with OpenAI TTS (raw 24kHz mono PCM) → resample → limit
@@ -147,14 +167,14 @@ class VoiceAssistantPipeline(
             val ttsStartMs = System.currentTimeMillis()
             val pcm24k = openAIService.speak(aiResponse)
             val ttsMs = System.currentTimeMillis() - ttsStartMs
-            Log.i(TAG, "[PERF-M3] TTS (vision): ${ttsMs}ms → ${pcm24k.size} bytes PCM @ 24kHz")
+            Log.i(TAG, "[PERF-M32] TTS (vision): ${ttsMs}ms → ${pcm24k.size} bytes PCM @ 24kHz")
 
             val ttsPcm = peakLimit(pcm24k)
             val ttsDuration = ttsPcm.size / (TTS_SAMPLE_RATE * 2.0)
             Log.i(TAG, "TTS PCM ready: ${ttsPcm.size} bytes (${String.format("%.2f", ttsDuration)}s)")
 
             val totalMs = System.currentTimeMillis() - pipelineStartMs
-            Log.i(TAG, "[PERF-M7] Vision pipeline total: ${totalMs}ms (whisper=${whisperMs} vision=${visionMs} tts=${ttsMs})")
+            Log.i(TAG, "[PERF-M34] Vision pipeline total: ${totalMs}ms (whisper=${whisperMs} vision=${visionMs} tts=${ttsMs})")
 
             return ttsPcm
         } catch (e: Exception) {
@@ -327,6 +347,38 @@ class VoiceAssistantPipeline(
      * a silence guard so near-silent / pure-noise buffers aren't amplified.
      * Mutates the array in place and returns it.
      */
+    /** Mean absolute sample magnitude — used as a cheap loudness/VAD measure. */
+    private fun avgAbs(pcm: ByteArray): Double {
+        val n = pcm.size / 2
+        if (n == 0) return 0.0
+        val bb = ByteBuffer.wrap(pcm).order(ByteOrder.LITTLE_ENDIAN)
+        var sum = 0L
+        for (i in 0 until n) sum += kotlin.math.abs(bb.getShort(i * 2).toInt())
+        return sum.toDouble() / n
+    }
+
+    /**
+     * Trim near-silent samples (|x| < ASR_TRIM_THRESHOLD) from the head and tail of
+     * an utterance. The firmware starts recording the instant the button is pressed,
+     * so every capture has a leading silence window that Whisper tends to hallucinate
+     * on. Returns the trimmed slice (16-bit aligned); falls back to the original if
+     * trimming would empty it.
+     */
+    private fun trimSilence(pcm: ByteArray): ByteArray {
+        val n = pcm.size / 2
+        if (n == 0) return pcm
+        val bb = ByteBuffer.wrap(pcm).order(ByteOrder.LITTLE_ENDIAN)
+        var start = 0
+        while (start < n && kotlin.math.abs(bb.getShort(start * 2).toInt()) < ASR_TRIM_THRESHOLD) start++
+        var end = n - 1
+        while (end > start && kotlin.math.abs(bb.getShort(end * 2).toInt()) < ASR_TRIM_THRESHOLD) end--
+        if (start >= end) return pcm  // all silence — let the VAD guard handle it
+        val from = start * 2
+        val to = (end + 1) * 2
+        if (from == 0 && to == pcm.size) return pcm
+        return pcm.copyOfRange(from, to)
+    }
+
     private fun normalizeForAsr(pcm: ByteArray): ByteArray {
         val n = pcm.size / 2
         if (n == 0) return pcm

@@ -52,6 +52,11 @@ class OpenAIService(private val apiKey: String) {
             .addFormDataPart("model", STT_MODEL)
             .addFormDataPart("language", "en")
             .addFormDataPart("temperature", "0")  // greedy decode → fewer hallucinations
+            // Domain hint: biases the model toward short conversational queries and
+            // makes it less likely to invent filler phrases from marginal audio.
+            .addFormDataPart("prompt",
+                "A short question or command spoken to AI smart glasses, " +
+                "possibly quiet or with background noise.")
             .addFormDataPart(
                 "file",
                 wavFile.name,

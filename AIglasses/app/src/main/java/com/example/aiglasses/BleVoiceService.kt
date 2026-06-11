@@ -60,6 +60,7 @@ class BleVoiceService(
         data class AudioSent(val totalBytes: Int) : BleEvent()
         data class ImageReceived(val jpegBytes: ByteArray) : BleEvent()
         data class VideoReceived(val frames: List<ByteArray>) : BleEvent()
+        data object PlaybackCancelled : BleEvent()
         data class Error(val message: String) : BleEvent()
     }
 
@@ -80,6 +81,11 @@ class BleVoiceService(
 
     @Volatile private var isConnected = false
     @Volatile private var isScanning = false
+    // Set when the glasses send 'X' (user pressed the button during playback —
+    // barge-in on V2 firmware). Aborts the TTS transmit loop so we don't keep
+    // streaming audio into a ring buffer nobody is playing, and so the leftover
+    // stream can't fight a new utterance for BLE airtime.
+    @Volatile private var ttsCancelled = false
 
     // Image reassembly state
     private val imageBuffer = ByteArrayOutputStream()
@@ -94,6 +100,8 @@ class BleVoiceService(
     private var perfImageExpectedSeq = 0    // M24: next expected fragment seq (0-255 wrap)
     private var perfImageSeqGaps     = 0    // M24: dropped image fragments detected
     private var perfAudioRxStartMs   = 0L   // M11: audio receive start
+    private var perfAudioExpectedSeq = -1   // next expected mic-chunk seq (-1 = fresh utterance)
+    private var perfAudioSeqGaps     = 0    // dropped mic fragments detected
 
     // Video reassembly state
     @Volatile private var receivingVideo = false
@@ -210,6 +218,13 @@ class BleVoiceService(
             try {
                 if (newState == BluetoothProfile.STATE_CONNECTED) {
                     Log.i(TAG, "Connected, requesting MTU")
+                    // Ask Android to pick the LOW end of the firmware's 7.5–15ms
+                    // connection-interval range. The peripheral already allows down
+                    // to 7.5ms (updateConnParams 6..12), but the central defaulted to
+                    // 15ms → OTA throughput capped at ~33.8KB/s, below the 46.9KB/s
+                    // real-time playback need (caused the thin ring buffer/underrun).
+                    // HIGH priority ≈ ~11.25ms or lower, lifting OTA above playback rate.
+                    gatt.requestConnectionPriority(BluetoothGatt.CONNECTION_PRIORITY_HIGH)
                     gatt.requestMtu(TARGET_MTU)
                 } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
                     Log.i(TAG, "Disconnected (status=$status)")
@@ -394,9 +409,26 @@ class BleVoiceService(
         if (tag != 'A') return
         val payload = data.copyOfRange(HEADER_SIZE, data.size)
         if (payload.isEmpty()) return
+        val seq = data[1].toInt() and 0xFF
 
         synchronized(audioChunks) {
-            if (audioChunks.isEmpty()) perfAudioRxStartMs = System.currentTimeMillis()  // M11 start
+            if (audioChunks.isEmpty()) {
+                perfAudioRxStartMs = System.currentTimeMillis()  // M11 start
+                perfAudioExpectedSeq = seq                       // anchor to first chunk
+                perfAudioSeqGaps = 0
+            }
+            // Detect dropped notifications via the 1-byte seq (wraps 0..255). A
+            // dropped mic packet both loses audio AND, if left unfilled, shifts
+            // every later int16 sample by a byte → full-scale garbage → Whisper
+            // hallucination. Insert silence (zero bytes) for each missing fragment
+            // so the PCM stream stays byte-aligned and the loss is benign + logged.
+            if (seq != perfAudioExpectedSeq) {
+                val gap = (seq - perfAudioExpectedSeq) and 0xFF
+                perfAudioSeqGaps += gap
+                Log.w(TAG, "[PERF-M11] Audio SEQ gap: expected $perfAudioExpectedSeq got $seq (lost ~$gap fragment(s)) — inserting silence")
+                repeat(gap) { audioChunks.add(ByteArray(payload.size)) }
+            }
+            perfAudioExpectedSeq = (seq + 1) and 0xFF
             audioChunks.add(payload)
             if (audioChunks.size % 50 == 0) {
                 val total = audioChunks.sumOf { it.size }
@@ -414,8 +446,22 @@ class BleVoiceService(
                 processReceivedAudio()
             }
             'S' -> {
+                // Flush stale audio left over from prior quick taps. Firmware emits
+                // exactly one 'S' per utterance and resets its mic seq to 0 at the
+                // same instant, so the next chunk re-anchors the seq tracker cleanly.
                 Log.i(TAG, "Start marker → clearing buffer")
-                synchronized(audioChunks) { audioChunks.clear() }
+                synchronized(audioChunks) {
+                    audioChunks.clear()
+                    perfAudioExpectedSeq = -1
+                    perfAudioSeqGaps = 0
+                }
+            }
+            'X' -> {
+                // V2 firmware barge-in: user pressed the button during playback.
+                // The glasses already tore down their speaker — stop streaming.
+                Log.i(TAG, "Playback cancelled by glasses (barge-in) — aborting TTS send")
+                ttsCancelled = true
+                onEvent(BleEvent.PlaybackCancelled)
             }
             'V' -> {
                 // Video recording start — clear any stale audio and prepare frame list
@@ -463,16 +509,10 @@ class BleVoiceService(
                 }
             }
             'J' -> {
-                if (receivingVideoFrame) {
-                    // Video frame complete — add to list
-                    receivingVideoFrame = false
-                    synchronized(currentVideoFrame) {
-                        val frameBytes = currentVideoFrame.toByteArray()
-                        synchronized(videoFrames) { videoFrames.add(frameBytes) }
-                        currentVideoFrame.reset()
-                    }
-                    Log.d(TAG, "Video frame ${data.getOrNull(1)?.toInt() ?: 0} complete (${videoFrames.size} frames so far)")
-                } else {
+                // Still-image end marker only. Video frame-end ('J') now arrives on
+                // the IMAGE_TX characteristic (see handleImageTx) to avoid the
+                // cross-characteristic delivery race that corrupted video frames.
+                run {
                     // Still image complete — stash until 'E' arrives
                     receivingImage = false
                     synchronized(imageBuffer) {
@@ -500,6 +540,21 @@ class BleVoiceService(
     }
 
     private fun handleImageTx(data: ByteArray) {
+        if (data.isEmpty()) return
+        // End-of-frame marker for video now arrives on THIS characteristic (aa04),
+        // sharing the ordered notification queue with the frame data — so it can
+        // never overtake the last data fragment. Detect it before the size guard
+        // (the marker is header-only: ['J'][frameIndex]).
+        if (data[0].toInt().toChar() == 'J' && receivingVideoFrame) {
+            receivingVideoFrame = false
+            synchronized(currentVideoFrame) {
+                val frameBytes = currentVideoFrame.toByteArray()
+                synchronized(videoFrames) { videoFrames.add(frameBytes) }
+                currentVideoFrame.reset()
+            }
+            Log.d(TAG, "Video frame ${data.getOrNull(1)?.toInt() ?: 0} complete (${videoFrames.size} frames so far)")
+            return
+        }
         if (data.size <= HEADER_SIZE) return
         val payload = data.copyOfRange(HEADER_SIZE, data.size)
         if (receivingVideoFrame) {
@@ -536,7 +591,7 @@ class BleVoiceService(
         val dur = raw.size / (16000.0 * 2)
         val audioRxMs = System.currentTimeMillis() - perfAudioRxStartMs
         Log.i(TAG, "Utterance: ${raw.size} bytes (${String.format("%.2f", dur)}s)")
-        Log.i(TAG, "[PERF-M11] Utterance received: ${raw.size} bytes (${String.format("%.2f", dur)}s) in ${audioRxMs}ms from ESP32")
+        Log.i(TAG, "[PERF-M11] Utterance received: ${raw.size} bytes (${String.format("%.2f", dur)}s) in ${audioRxMs}ms from ESP32 (seqGaps=$perfAudioSeqGaps)")
         Log.i(TAG, "[PERF-M9]  MTU: $negotiatedMtu (payload: ${negotiatedMtu - 3 - HEADER_SIZE} bytes/pkt)")
 
         if (raw.size < MIN_AUDIO_BYTES) {
@@ -581,6 +636,30 @@ class BleVoiceService(
         }
     }
 
+    /**
+     * Write a control marker ('S'/'E') with the same queue-busy retry the audio
+     * fragments get. writeCharacteristic() returns false when another GATT op
+     * holds the single pending slot — ignoring that silently drops the marker.
+     * A dropped 'S' means the ESP32 never arms playback (TTS streams into the
+     * void); a dropped 'E' used to soft-lock it in PLAYING. Returns success.
+     */
+    private fun writeControlMarker(tag: Char): Boolean {
+        val ctrl = controlChar ?: return false
+        val g = gatt ?: return false
+        @Suppress("DEPRECATION")
+        ctrl.value = byteArrayOf(tag.code.toByte(), 0)
+        ctrl.writeType = BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
+        var attempts = 0
+        while (attempts < 100 && isConnected) {
+            @Suppress("DEPRECATION")
+            if (g.writeCharacteristic(ctrl)) return true
+            Thread.sleep(2)
+            attempts++
+        }
+        Log.e(TAG, "Control marker '$tag' write FAILED after $attempts attempts")
+        return false
+    }
+
     private fun sendAudioToEsp32(pcm: ByteArray) {
         val rx = audioRxChar ?: return
         val g = gatt ?: return
@@ -594,17 +673,17 @@ class BleVoiceService(
         Log.i(TAG, "Sending ${pcm.size} bytes (${String.format("%.2f", dur)}s)")
         val bleTxStartMs = System.currentTimeMillis()  // M4/M10
         onEvent(BleEvent.SendingAudio(pcm.size))
+        ttsCancelled = false   // fresh send — clear any cancel from a previous response
 
         try {
-            // Start marker
-            controlChar?.let { ctrl ->
-                @Suppress("DEPRECATION")
-                ctrl.value = byteArrayOf('S'.code.toByte(), 0)
-                ctrl.writeType = BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
-                @Suppress("DEPRECATION")
-                g.writeCharacteristic(ctrl)
-                Thread.sleep(30)
+            // Start marker — abort if it can't be delivered: without 'S' the
+            // firmware ignores everything that follows, so streaming the audio
+            // anyway just wastes ~10s of BLE airtime for silent playback.
+            if (!writeControlMarker('S')) {
+                onEvent(BleEvent.Error("Playback start marker failed — response not sent"))
+                return
             }
+            Thread.sleep(30)
 
             // Audio fragments
             // WRITE_TYPE_NO_RESPONSE writes are queued by Android's BLE stack (typically
@@ -616,7 +695,7 @@ class BleVoiceService(
             var offset = 0
             var chunks = 0
             var dropped = 0
-            while (offset < pcm.size && isConnected) {
+            while (offset < pcm.size && isConnected && !ttsCancelled) {
                 val frag = minOf(maxPayload, pcm.size - offset)
                 val pkt = ByteArray(HEADER_SIZE + frag)
                 pkt[0] = 'A'.code.toByte()
@@ -629,7 +708,7 @@ class BleVoiceService(
 
                 var queued = false
                 var attempts = 0
-                while (!queued && attempts < 100 && isConnected) {
+                while (!queued && attempts < 100 && isConnected && !ttsCancelled) {
                     @Suppress("DEPRECATION")
                     queued = g.writeCharacteristic(rx)
                     if (!queued) {
@@ -653,16 +732,20 @@ class BleVoiceService(
             Log.i(TAG, "[PERF-M4]  BLE TX (Android→ESP32): ${pcm.size} bytes, $chunks chunks, $dropped dropped")
             Log.i(TAG, "[PERF-M10] BLE TX throughput: ${String.format("%.0f", bleThroughput)} B/s (${String.format("%.1f", bleThroughput/1024)} KB/s) in ${bleTxMs}ms")
 
-            // End marker
+            if (ttsCancelled) {
+                // Barge-in: the glasses already reset to idle. Deliberately do NOT
+                // send 'E' — a late 'E' could land after the 'S' of the user's next
+                // question and terminate that stream early.
+                Log.i(TAG, "TTS send aborted at $offset/${pcm.size} bytes (barge-in)")
+                onEvent(BleEvent.AudioSent(offset))
+                return
+            }
+
+            // End marker (retried — a lost 'E' used to strand the firmware in
+            // PLAYING; its stall watchdog now also covers this, belt-and-braces)
             Thread.sleep(30)
             if (isConnected) {
-                controlChar?.let { ctrl ->
-                    @Suppress("DEPRECATION")
-                    ctrl.value = byteArrayOf('E'.code.toByte(), 0)
-                    ctrl.writeType = BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
-                    @Suppress("DEPRECATION")
-                    g.writeCharacteristic(ctrl)
-                }
+                writeControlMarker('E')
             }
 
             Log.i(TAG, "Sent $chunks chunks (${pcm.size} bytes)")
