@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Target="/Metadata/thumbnail.png" Type="http://schemas.openxmlformats.org/package/2006/relationships/metadata/thumbnail" Id="rel0" />
+  <Relationship Target="/Materials/generic_pla.xml.fdm_material" Type="http://schemas.ultimaker.org/package/2018/relationships/material" Id="rel1" />
+  <Relationship Target="/Materials/ultimaker_pla_blue.xml.fdm_material" Type="http://schemas.ultimaker.org/package/2018/relationships/material" Id="rel2" />
+</Relationships>

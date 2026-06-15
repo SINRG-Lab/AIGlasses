@@ -1,0 +1,24 @@
+{
+    "metadata": {
+        "objects": [
+            {
+                "name": "Body1.stl"
+            },
+            {
+                "name": "Body2.stl"
+            },
+            {
+                "name": "Body3.stl"
+            },
+            {
+                "name": "HInge.stl"
+            },
+            {
+                "name": "HingeTop.stl"
+            },
+            {
+                "name": "Nut.stl"
+            }
+        ]
+    }
+}

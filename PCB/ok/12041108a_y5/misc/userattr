@@ -1,0 +1,109 @@
+
+FORCE_LIB=NO
+
+BOOLEAN {
+  NAME   = .marker
+  ENTITY = FEATURE
+  DEF = NO
+  PROMPT = NO
+}
+
+BOOLEAN {
+  NAME   = .ng_marker
+  ENTITY = FEATURE
+  DEF = NO
+  PROMPT = NO
+}
+
+BOOLEAN {
+  NAME   = .goldfigure
+  ENTITY = FEATURE
+  DEF = NO
+  PROMPT = NO
+}
+
+BOOLEAN {
+  NAME   = .silver_neckfill
+  ENTITY = FEATURE
+  DEF = NO
+  PROMPT = NO
+}
+
+BOOLEAN {
+  NAME   = .grid_fill
+  ENTITY = FEATURE
+  DEF = NO
+  PROMPT = NO
+}
+
+BOOLEAN {
+  NAME   = .dynrecoup
+  ENTITY = FEATURE
+  DEF = NO
+  PROMPT = NO
+}
+
+BOOLEAN {
+  NAME   = .copper_bridge
+  ENTITY = FEATURE
+  DEF = NO
+  PROMPT = NO
+}
+
+BOOLEAN {
+  NAME   = .vcut
+  ENTITY = FEATURE
+  DEF = NO
+  PROMPT = NO
+}
+
+BOOLEAN {
+  NAME   = .stamp_hole
+  ENTITY = FEATURE
+  DEF = NO
+  PROMPT = NO
+}
+
+BOOLEAN {
+  NAME   = .stamp_connection
+  ENTITY = FEATURE
+  DEF = NO
+  PROMPT = NO
+}
+
+BOOLEAN {
+  NAME   = .notmoveable
+  ENTITY = FEATURE
+  DEF = NO
+  PROMPT = NO
+}
+
+BOOLEAN {
+  NAME   = .fpc_slot
+  ENTITY = FEATURE
+  DEF = NO
+  PROMPT = NO
+}
+
+BOOLEAN {
+  NAME   = .location_hole
+  ENTITY = FEATURE
+  DEF = NO
+  PROMPT = NO
+}
+
+BOOLEAN {
+  NAME   = .stiffener_indicate
+  ENTITY = FEATURE
+  DEF = NO
+  PROMPT = NO
+}
+
+BOOLEAN {
+  NAME   = .bridge_mark
+  ENTITY = FEATURE
+  DEF = NO
+  PROMPT = NO
+}
+
+
