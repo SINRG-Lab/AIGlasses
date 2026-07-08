@@ -21,8 +21,10 @@
 // ────────────────────────────────────────────────────────────────
 #define BLE_MTU             512
 #define BLE_HEADER_SIZE     2       // TAG(1) + SEQ(1)
-// Max payload per notification = MTU - 3 (ATT overhead) - header
-#define BLE_MAX_PAYLOAD     (BLE_MTU - 3 - BLE_HEADER_SIZE)
+// Max payload per notification = MTU - 3 (ATT overhead) - header, rounded
+// DOWN TO EVEN so a lost PCM16 fragment can never flip byte parity and turn
+// every subsequent sample into full-scale noise (the Session-2 "clipping").
+#define BLE_MAX_PAYLOAD     (((BLE_MTU - 3 - BLE_HEADER_SIZE) / 2) * 2)
 // Pacing between fragments: one fragment per connection event
 #define BLE_FRAG_DELAY_MS       5   // mic audio fragments
 #define BLE_IMG_FRAG_DELAY_MS  15   // image/video fragments (larger bursts)

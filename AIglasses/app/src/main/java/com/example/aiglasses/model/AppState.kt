@@ -6,6 +6,9 @@ enum class ConnectionState { Disconnected, Scanning, Connected, Active }
 
 enum class InputSource { Voice, Vision }
 
+/** Live GPT Realtime conversation state (mirrors realtime_ble.py's console states). */
+enum class VoiceState { Idle, Listening, Hearing, Thinking, Speaking }
+
 data class GlassesStatus(
     val connectionState: ConnectionState = ConnectionState.Disconnected,
     val deviceName: String = "",
@@ -21,7 +24,8 @@ data class PipelineStatus(
     val lastTranscription: String = "",
     val lastAiResponse: String = "",
     val isSynthesizing: Boolean = false,
-    val lastInferenceMs: Long = 0L
+    val lastInferenceMs: Long = 0L,
+    val voiceState: VoiceState = VoiceState.Idle
 )
 
 data class SavedImage(

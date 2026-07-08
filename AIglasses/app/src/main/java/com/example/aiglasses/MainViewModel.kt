@@ -27,6 +27,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         private const val PREFS_NAME = "aiglasses_prefs"
         private const val KEY_API_KEY = "openai_api_key"
         private const val KEY_AUTO_SAVE_IMAGES = "auto_save_images"
+        private const val KEY_REALTIME_ENGINE = "voice_engine_realtime"
         private const val MAX_LOG_ENTRIES = 100
         private const val GALLERY_DIR = "gallery"
     }
@@ -35,6 +36,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     private var bleService: BleVoiceService? = null
     private var pipeline: VoiceAssistantPipeline? = null
+    private var realtimeClient: RealtimeVoiceClient? = null
+    // Assistant transcript accumulates delta-by-delta; main thread only.
+    private val assistantTranscript = StringBuilder()
 
     // Permission callback bridge — set by MainActivity, called when scan needs permissions
     private var permissionRequestCallback: ((onGranted: () -> Unit) -> Unit)? = null
@@ -56,6 +60,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     private val _autoSaveImages = MutableStateFlow(prefs.getBoolean(KEY_AUTO_SAVE_IMAGES, false))
     val autoSaveImages: StateFlow<Boolean> = _autoSaveImages.asStateFlow()
+
+    // Voice engine: GPT Realtime speech-to-speech (default) vs legacy STT→LLM→TTS.
+    private val _realtimeEnabled = MutableStateFlow(prefs.getBoolean(KEY_REALTIME_ENGINE, true))
+    val realtimeEnabled: StateFlow<Boolean> = _realtimeEnabled.asStateFlow()
 
     private val _savedImages = MutableStateFlow<List<SavedImage>>(emptyList())
     val savedImages: StateFlow<List<SavedImage>> = _savedImages.asStateFlow()
@@ -88,6 +96,36 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     fun setAutoSaveImages(enabled: Boolean) {
         _autoSaveImages.update { enabled }
         prefs.edit().putBoolean(KEY_AUTO_SAVE_IMAGES, enabled).apply()
+    }
+
+    /** Switch voice engines. Takes effect immediately, even mid-session. */
+    fun setRealtimeEnabled(enabled: Boolean) {
+        _realtimeEnabled.update { enabled }
+        prefs.edit().putBoolean(KEY_REALTIME_ENGINE, enabled).apply()
+        bleService?.setRealtimeMode(enabled)
+        if (enabled) {
+            if (bleService != null) startRealtimeClient()
+        } else {
+            stopRealtimeClient()
+            _pipelineStatus.update { it.copy(voiceState = VoiceState.Idle) }
+        }
+        addLog("ENGINE", if (enabled) "GPT Realtime engine selected" else "Legacy pipeline selected")
+    }
+
+    private fun startRealtimeClient() {
+        if (realtimeClient != null) return
+        val key = _apiKey.value
+        if (key.isBlank()) return
+        val client = RealtimeVoiceClient(key) { event -> handleRealtimeEvent(event) }
+        realtimeClient = client
+        bleService?.setRealtimeClient(client)
+        client.connect()
+    }
+
+    private fun stopRealtimeClient() {
+        bleService?.setRealtimeClient(null)
+        realtimeClient?.close()
+        realtimeClient = null
     }
 
     fun deleteImage(filename: String) {
@@ -325,6 +363,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                         }
                     }
                 )
+                if (_realtimeEnabled.value) {
+                    // The realtime session owns the conversation and outlives any
+                    // number of BLE drops — bring it up before the radio.
+                    bleService?.setRealtimeMode(true)
+                    startRealtimeClient()
+                }
                 bleService?.startScan()
 
             } catch (e: Exception) {
@@ -337,6 +381,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun stopScan() {
+        stopRealtimeClient()
         bleService?.disconnect()
         bleService = null
         pipeline?.destroy()
@@ -442,6 +487,67 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    /**
+     * Realtime engine events. Called on OkHttp's WebSocket threads: audio is
+     * forwarded to the BLE downlink synchronously (queueRealtimeAudio only
+     * µ-law-encodes + enqueues — routing it through the main dispatcher would
+     * add jitter); UI state is marshalled to the main thread.
+     */
+    private fun handleRealtimeEvent(event: RealtimeVoiceClient.RealtimeEvent) {
+        when (event) {
+            is RealtimeVoiceClient.RealtimeEvent.AudioDelta -> {
+                bleService?.queueRealtimeAudio(event.pcm, event.first)
+                if (!event.first) return   // only the first delta updates UI state
+            }
+            is RealtimeVoiceClient.RealtimeEvent.ResponseDone -> {
+                bleService?.endRealtimeResponse()
+            }
+            else -> {}
+        }
+        viewModelScope.launch(Dispatchers.Main.immediate) {
+            when (event) {
+                is RealtimeVoiceClient.RealtimeEvent.Connected -> {
+                    addLog("REALTIME", "GPT Realtime connected")
+                    _pipelineStatus.update { it.copy(voiceState = VoiceState.Listening) }
+                }
+                is RealtimeVoiceClient.RealtimeEvent.Disconnected -> {
+                    addLog("REALTIME", "Realtime link down (${event.reason}) — reconnecting")
+                    _pipelineStatus.update { it.copy(voiceState = VoiceState.Idle) }
+                }
+                is RealtimeVoiceClient.RealtimeEvent.SpeechStarted -> {
+                    _pipelineStatus.update { it.copy(voiceState = VoiceState.Hearing) }
+                }
+                is RealtimeVoiceClient.RealtimeEvent.SpeechStopped -> {
+                    _pipelineStatus.update { it.copy(voiceState = VoiceState.Thinking) }
+                }
+                is RealtimeVoiceClient.RealtimeEvent.AudioDelta -> {
+                    // First delta of a response: the glasses start speaking.
+                    _pipelineStatus.update { it.copy(voiceState = VoiceState.Speaking) }
+                }
+                is RealtimeVoiceClient.RealtimeEvent.ResponseDone -> {
+                    if (assistantTranscript.isNotEmpty()) {
+                        addLog("AI", assistantTranscript.toString())
+                        assistantTranscript.setLength(0)   // next response starts fresh
+                    }
+                    _pipelineStatus.update { it.copy(voiceState = VoiceState.Listening) }
+                }
+                is RealtimeVoiceClient.RealtimeEvent.AssistantTranscriptDelta -> {
+                    assistantTranscript.append(event.text)
+                    _pipelineStatus.update {
+                        it.copy(lastAiResponse = assistantTranscript.toString())
+                    }
+                }
+                is RealtimeVoiceClient.RealtimeEvent.UserTranscript -> {
+                    addLog("USER", event.text)
+                    _pipelineStatus.update { it.copy(lastTranscription = event.text) }
+                }
+                is RealtimeVoiceClient.RealtimeEvent.Error -> {
+                    addLog("ERROR", "Realtime: ${event.message}")
+                }
+            }
+        }
+    }
+
     private fun addLog(tag: String, message: String) {
         _logMessages.update { current ->
             val updated = current + LogEntry(tag, message)
@@ -452,6 +558,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     override fun onCleared() {
         super.onCleared()
+        stopRealtimeClient()
         bleService?.disconnect()
         pipeline?.destroy()
     }
