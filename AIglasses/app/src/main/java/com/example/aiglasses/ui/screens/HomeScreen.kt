@@ -27,6 +27,8 @@ import com.example.aiglasses.model.ConnectionState
 import com.example.aiglasses.model.GlassesStatus
 import com.example.aiglasses.model.InputSource
 import com.example.aiglasses.model.LogEntry
+import com.example.aiglasses.model.PipelineStatus
+import com.example.aiglasses.model.VoiceState
 import com.example.aiglasses.ui.components.*
 import com.example.aiglasses.ui.theme.*
 import java.text.SimpleDateFormat
@@ -42,6 +44,7 @@ fun HomeScreen(
     val glassesStatus by viewModel.glassesStatus.collectAsStateWithLifecycle()
     val pipelineStatus by viewModel.pipelineStatus.collectAsStateWithLifecycle()
     val logMessages by viewModel.logMessages.collectAsStateWithLifecycle()
+    val realtimeEnabled by viewModel.realtimeEnabled.collectAsStateWithLifecycle()
     val connectionState = glassesStatus.connectionState
 
     val recentActivity = remember(logMessages) {
@@ -64,6 +67,11 @@ fun HomeScreen(
                 viewModel = viewModel,
                 onDevModeReveal = onDevModeReveal
             )
+
+            // Live realtime conversation state + transcripts
+            if (realtimeEnabled && connectionState != ConnectionState.Disconnected) {
+                RealtimeLiveCard(pipelineStatus = pipelineStatus)
+            }
 
             // Input source strip
             InputSourceStrip(
@@ -203,6 +211,87 @@ private fun HeroCard(
                 enabled = true,
                 modifier = Modifier.fillMaxWidth()
             )
+        }
+    }
+}
+
+/**
+ * Live GPT Realtime state (listening / hearing / thinking / speaking) plus
+ * both running transcripts, driven by the realtime WebSocket events.
+ */
+@Composable
+private fun RealtimeLiveCard(pipelineStatus: PipelineStatus) {
+    val state = pipelineStatus.voiceState
+    val (label, color) = when (state) {
+        VoiceState.Idle -> "Connecting…" to TextTertiary
+        VoiceState.Listening -> "Listening" to Blue
+        VoiceState.Hearing -> "Hearing you…" to Orange
+        VoiceState.Thinking -> "Thinking…" to Purple
+        VoiceState.Speaking -> "Speaking" to Green
+    }
+
+    val pulse = state == VoiceState.Hearing || state == VoiceState.Speaking
+    val infiniteTransition = rememberInfiniteTransition(label = "voice_pulse")
+    val pulseAlpha by infiniteTransition.animateFloat(
+        initialValue = 0.4f,
+        targetValue = 1f,
+        animationSpec = infiniteRepeatable(
+            tween(600, easing = FastOutSlowInEasing),
+            RepeatMode.Reverse
+        ),
+        label = "voice_pulse_alpha"
+    )
+
+    GlassCard(depth = 1, cornerRadius = 14.dp) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp)
+        ) {
+            Row(
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Box(
+                    modifier = Modifier
+                        .size(10.dp)
+                        .background(
+                            color = color.copy(alpha = if (pulse) pulseAlpha else 1f),
+                            shape = RoundedCornerShape(5.dp)
+                        )
+                )
+                Text(
+                    text = label,
+                    fontSize = 14.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    color = TextPrimary
+                )
+                Spacer(Modifier.weight(1f))
+                Text(
+                    text = "GPT REALTIME",
+                    fontSize = 10.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    letterSpacing = 1.sp,
+                    color = TextTertiary
+                )
+            }
+            if (pipelineStatus.lastTranscription.isNotBlank()) {
+                Text(
+                    text = "You: ${pipelineStatus.lastTranscription}",
+                    fontSize = 13.sp,
+                    color = TextSecondary,
+                    lineHeight = 18.sp
+                )
+            }
+            if (pipelineStatus.lastAiResponse.isNotBlank()) {
+                Text(
+                    text = pipelineStatus.lastAiResponse,
+                    fontSize = 13.sp,
+                    color = TextPrimary,
+                    lineHeight = 18.sp
+                )
+            }
         }
     }
 }

@@ -25,6 +25,9 @@ static volatile uint8_t sExpectedSeq = 0;
 // Stall watchdog: when the last audio packet (or 'S') arrived. If the app dies
 // mid-stream or a marker is lost, this lets the state machine recover.
 static volatile unsigned long sLastRxMs = 0;
+// [PERF] timestamps: question end (button release) and stream open ('S')
+static volatile unsigned long sQuestionEndMs = 0;
+static volatile unsigned long sStreamStartMs = 0;
 // Audio arriving with no open stream — the signature of a lost 'S' marker.
 static volatile unsigned sIdleDropBytes = 0;
 
@@ -46,6 +49,7 @@ void playbackOnStart() {
   sRxChunks = sRxBytes = sRxDropped = sRxSeqGaps = 0;
   sIdleDropBytes = 0;
   sLastRxMs = millis();
+  sStreamStartMs = millis();
   sState = STREAM_BUFFERING;
 }
 
@@ -87,8 +91,15 @@ void playbackOnAudioData(const uint8_t* data, size_t len, uint8_t seq) {
 
 void playbackOnEndMarker() {
   LOGI("[STREAM] End marker — %u bytes received (%u chunks)", sRxBytes, sRxChunks);
+  unsigned long ms = millis() - sStreamStartMs;
+  if (ms > 0) {
+    LOGI("[PERF-M10] TTS BLE RX: %u bytes in %lu ms (%.1f KB/s)",
+         sRxBytes, ms, (double)sRxBytes * 1000.0 / ((double)ms * 1024.0));
+  }
   sEndMarker = true;
 }
+
+void playbackMarkQuestionEnd() { sQuestionEndMs = millis(); }
 
 // ────────────────────────────────────────────────────────────────
 //  Main-loop side
@@ -154,6 +165,10 @@ void playbackTick() {
         return;
       }
       delay(30);
+      if (sQuestionEndMs) {
+        LOGI("[PERF-M7] Button release → playback start: %lu ms", millis() - sQuestionEndMs);
+        sQuestionEndMs = 0;
+      }
       sState = STREAM_PLAYING;
     }
     return;

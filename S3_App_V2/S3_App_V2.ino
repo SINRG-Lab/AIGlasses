@@ -45,6 +45,13 @@ static unsigned long sPhotoPendingAt = 0;
 
 static int16_t sMicBuf[SAMPLES_PER_CHUNK];
 
+// [PERF-M25] per-utterance mic stats: bytes streamed and post-filter peak.
+// The peak here is what actually leaves the device — compare against the
+// app-side pre-normalization peak ([ASR] log) to prove the BLE path is
+// bit-transparent (Session 2 saw fw peak 13,745 vs app peak 32,768).
+static unsigned long sUttBytesSent = 0;
+static int           sUttPeak = 0;
+
 // ────────────────────────────────────────────────────────────────
 //  Helpers
 // ────────────────────────────────────────────────────────────────
@@ -53,6 +60,10 @@ static void flushPendingPhoto() {
   sPhotoPending = false;
   LOGI("[APP] Sending standalone photo");
   bleSendCapturedImage();
+  // When a question's audio 'E' (CONTROL) follows right behind — the photo-
+  // then-ask flow in stopRecordingAndSend() — it must not overtake the image
+  // tail + in-band 'J' still draining on IMAGE_TX.
+  delay(50);
 }
 
 static void startRecording(bool withVision) {
@@ -63,6 +74,8 @@ static void startRecording(bool withVision) {
 
   sVisionMode = withVision;
   sRecording = true;
+  sUttBytesSent = 0;
+  sUttPeak = 0;
   bleResetAudioSeq();
   micFlush();            // drop stale pre-roll the DMA collected while idle
   bleSendAudioStart();   // phone flushes stale audio chunks from quick taps
@@ -89,10 +102,16 @@ static void stopRecordingAndSend() {
   if (sVisionMode) {
     LOGI("[APP] Released → sending image + audio END");
     bleSendCapturedImage();
-    delay(20);
+    // The image (incl. its in-band 'J' on IMAGE_TX) and the audio 'E' (CONTROL)
+    // cross characteristics — give the IMAGE_TX queue time to drain so 'E'
+    // can't overtake the image tail, or the phone answers voice-only.
+    delay(50);
   } else {
     LOGI("[APP] Released → sending audio END");
   }
+  LOGI("[PERF-M25] Mic utterance: %lu bytes (%.2f s), post-filter peak=%d",
+       sUttBytesSent, (double)sUttBytesSent / (MIC_SAMPLE_RATE * 2.0), sUttPeak);
+  playbackMarkQuestionEnd();   // [PERF-M7] round-trip clock starts here
   bleSendAudioEnd();
   sRecording = false;
   sVisionMode = false;
@@ -182,6 +201,8 @@ void setup() {
   LOGI("CAM: XCLK=GPIO%d | PTT: GPIO%d | LED: GPIO%d", CAM_XCLK, PTT_PIN, STATUS_LED_PIN);
   LOGI("[SYS] PSRAM: %u KB, free heap: %u KB",
        ESP.getPsramSize() / 1024, ESP.getFreeHeap() / 1024);
+  LOGI("[PERF-M13] boot: heap=%u KB psram=%u KB",
+       ESP.getFreeHeap() / 1024, ESP.getFreePsram() / 1024);
 
   ledInit();
 
@@ -194,12 +215,16 @@ void setup() {
     LOGI("[CAM] FAILED — continuing in voice-only mode");
   }
   LOGI("[SYS] Free PSRAM after camera: %u KB", ESP.getFreePsram() / 1024);
+  LOGI("[PERF-M13] after camera: heap=%u KB psram=%u KB",
+       ESP.getFreeHeap() / 1024, ESP.getFreePsram() / 1024);
 
   if (!ringInit(RING_SIZE)) {
     LOGI("[SYS] FATAL: could not allocate %u KB ring buffer", RING_SIZE / 1024);
   } else {
     LOGI("[SYS] Ring buffer: %u KB", RING_SIZE / 1024);
   }
+  LOGI("[PERF-M13] after ring buffer: heap=%u KB psram=%u KB",
+       ESP.getFreeHeap() / 1024, ESP.getFreePsram() / 1024);
 
   // Push-to-talk button (active HIGH: pressed = HIGH)
   pinMode(PTT_PIN, INPUT_PULLDOWN);
@@ -217,6 +242,8 @@ void setup() {
   }
 
   bleInit();
+  LOGI("[PERF-M13] after BLE init: heap=%u KB psram=%u KB",
+       ESP.getFreeHeap() / 1024, ESP.getFreePsram() / 1024);
 
   LOGI("");
   LOGI("============================================================");
@@ -281,6 +308,11 @@ void loop() {
     size_t bytesRead = micRead(sMicBuf, sizeof(sMicBuf), 100);
     if (bytesRead > 0) {
       micFilter(sMicBuf, bytesRead / 2);   // DC-block high-pass
+      for (size_t i = 0; i < bytesRead / 2; i++) {   // [PERF-M25] post-filter peak
+        int a = abs((int)sMicBuf[i]);
+        if (a > sUttPeak) sUttPeak = a;
+      }
+      sUttBytesSent += bytesRead;
       bleSendMicChunk((uint8_t*)sMicBuf, bytesRead);
     }
     // micRead blocks on I2S DMA, so this path needs no extra delay

@@ -30,6 +30,7 @@ import com.example.aiglasses.ui.theme.*
 fun SettingsScreen(viewModel: MainViewModel) {
     val apiKey by viewModel.apiKey.collectAsStateWithLifecycle()
     val glassesStatus by viewModel.glassesStatus.collectAsStateWithLifecycle()
+    val realtimeEnabled by viewModel.realtimeEnabled.collectAsStateWithLifecycle()
     var localApiKey by remember(apiKey) { mutableStateOf(apiKey) }
     var showApiKey by remember { mutableStateOf(false) }
     val isConnected = glassesStatus.connectionState != ConnectionState.Disconnected
@@ -97,6 +98,28 @@ fun SettingsScreen(viewModel: MainViewModel) {
                             variant = ButtonVariant.Accent,
                             enabled = localApiKey != apiKey,
                             modifier = Modifier.fillMaxWidth()
+                        )
+                    }
+                }
+            }
+
+            // Voice engine section
+            item {
+                SettingsSection(title = "Voice engine") {
+                    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                        SettingsToggleRow(
+                            label = "GPT Realtime (recommended)",
+                            value = realtimeEnabled,
+                            onToggle = { viewModel.setRealtimeEnabled(it) }
+                        )
+                        Text(
+                            text = if (realtimeEnabled)
+                                "Live speech-to-speech over WebSocket — lowest latency, barge-in, live transcripts."
+                            else
+                                "Legacy pipeline: Whisper → GPT-4o-mini → TTS (sequential, higher latency).",
+                            fontSize = 12.sp,
+                            color = TextTertiary,
+                            lineHeight = 16.sp
                         )
                     }
                 }

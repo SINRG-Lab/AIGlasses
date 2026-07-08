@@ -21,6 +21,33 @@ static uint8_t sPkt[BLE_MTU];
 bool bleConnected() { return sConnected; }
 
 // ────────────────────────────────────────────────────────────────
+//  Realtime voice mode (opt-in, 'M'/'m' on CONTROL): audio runs as
+//  G.711 µ-law, 1 byte/sample both directions. Halves the BLE packet
+//  rate — bench-measured centrals drop notifications above ~40/s,
+//  which continuous PCM16 mic audio exceeds. Without 'M' everything
+//  behaves exactly as V2 (PCM16 bursts) — old apps keep working.
+// ────────────────────────────────────────────────────────────────
+static volatile bool sVoiceUlaw = false;
+
+static uint8_t ulawEncode(int16_t pcm) {
+  const int16_t CLIP = 32635;
+  uint8_t sign = (pcm >> 8) & 0x80;
+  if (sign) pcm = -pcm;
+  if (pcm > CLIP) pcm = CLIP;
+  pcm += 0x84;
+  uint8_t exp = 7;
+  for (uint16_t mask = 0x4000; (pcm & mask) == 0 && exp > 0; mask >>= 1) exp--;
+  return ~(sign | (exp << 4) | ((pcm >> (exp + 3)) & 0x0F));
+}
+
+static int16_t ulawDecode(uint8_t u) {
+  u = ~u;
+  int16_t t = (((int16_t)(u & 0x0F)) << 3) + 0x84;
+  t <<= (u & 0x70) >> 4;
+  return (u & 0x80) ? (0x84 - t) : (t - 0x84);
+}
+
+// ────────────────────────────────────────────────────────────────
 //  notify() with flow control.
 //  NimBLE's notify() returns false when the host TX buffer is full
 //  (BLE_HS_ENOMEM during a burst). Ignoring that silently drops the
@@ -50,6 +77,26 @@ class ServerCallbacks : public NimBLEServerCallbacks {
     // Fast connection parameters for audio streaming:
     // min interval = 7.5 ms (6), max = 15 ms (12), latency = 0, timeout = 5 s (500)
     server->updateConnParams(connInfo.getConnHandle(), 6, 12, 0, 500);
+    // Request 2M PHY (BLE 5): double the raw symbol rate of the default 1M —
+    // more notification throughput and less airtime (= power) per packet.
+    // Controllers negotiate; falls back to 1M on phones without 2M support.
+    // 2M's shorter range is irrelevant at glasses-to-pocket distance.
+    int rc = ble_gap_set_prefered_le_phy(connInfo.getConnHandle(),
+                                         BLE_GAP_LE_PHY_1M_MASK | BLE_GAP_LE_PHY_2M_MASK,
+                                         BLE_GAP_LE_PHY_1M_MASK | BLE_GAP_LE_PHY_2M_MASK,
+                                         0 /* no coded-PHY preference */);
+    if (rc != 0) LOGI("[BLE] 2M PHY request failed (rc=%d) — staying on 1M", rc);
+    // LL Data Length Extension: without it every radio packet carries 27 B and
+    // an MTU-sized notification fragments into ~19 packets across 2-3
+    // connection events — measured on the bench as ~2/3 of continuous mic
+    // audio dropped. With DLE one packet carries 251 B.
+    rc = ble_gap_set_data_len(connInfo.getConnHandle(), 251, 2120);
+    if (rc != 0) LOGI("[BLE] data-length extension request failed (rc=%d)", rc);
+  }
+
+  void onPhyUpdate(NimBLEConnInfo& connInfo, uint8_t txPhy, uint8_t rxPhy) override {
+    // 1 = 1M, 2 = 2M, 3 = coded
+    LOGI("[BLE] PHY updated: tx=%u rx=%u (1=1M, 2=2M, 3=coded)", txPhy, rxPhy);
   }
 
   void onDisconnect(NimBLEServer* server, NimBLEConnInfo& connInfo, int reason) override {
@@ -72,7 +119,18 @@ class AudioRxCallbacks : public NimBLECharacteristicCallbacks {
     size_t len = val.size();
     if (len < BLE_HEADER_SIZE) return;
     if (data[0] != 'A') return;
-    playbackOnAudioData(data + BLE_HEADER_SIZE, len - BLE_HEADER_SIZE, data[1]);
+    if (sVoiceUlaw) {
+      // µ-law → PCM16 as it enters the playback ring (rate is 24 kHz
+      // either way — GPT Realtime's native output matches SPK_SAMPLE_RATE)
+      static int16_t dec[BLE_MAX_PAYLOAD];      // NimBLE task only
+      size_t n = len - BLE_HEADER_SIZE;
+      if (n > (size_t)BLE_MAX_PAYLOAD) n = BLE_MAX_PAYLOAD;
+      const uint8_t* p = data + BLE_HEADER_SIZE;
+      for (size_t i = 0; i < n; i++) dec[i] = ulawDecode(p[i]);
+      playbackOnAudioData((const uint8_t*)dec, n * 2, data[1]);
+    } else {
+      playbackOnAudioData(data + BLE_HEADER_SIZE, len - BLE_HEADER_SIZE, data[1]);
+    }
   }
 };
 
@@ -84,6 +142,8 @@ class ControlCallbacks : public NimBLECharacteristicCallbacks {
     switch (val.data()[0]) {
       case 'S': playbackOnStart();     break;
       case 'E': playbackOnEndMarker(); break;
+      case 'M': sVoiceUlaw = true;  LOGI("[BLE] realtime voice mode ON (u-law)");  break;
+      case 'm': sVoiceUlaw = false; LOGI("[BLE] realtime voice mode OFF"); break;
       default:  break;
     }
   }
@@ -96,6 +156,10 @@ bool bleInit() {
   NimBLEDevice::init(BLE_DEVICE_NAME);
   NimBLEDevice::setMTU(BLE_MTU);
   NimBLEDevice::setPower(ESP_PWR_LVL_P9);
+  // Advertise 1M+2M as our preferred PHYs for all future connections; the
+  // per-connection request in onConnect() does the actual negotiation.
+  ble_gap_set_prefered_default_le_phy(BLE_GAP_LE_PHY_1M_MASK | BLE_GAP_LE_PHY_2M_MASK,
+                                      BLE_GAP_LE_PHY_1M_MASK | BLE_GAP_LE_PHY_2M_MASK);
 
   sServer = NimBLEDevice::createServer();
   sServer->setCallbacks(new ServerCallbacks());
@@ -153,12 +217,25 @@ void bleSendAudioEnd() {
 
 void bleSendMicChunk(const uint8_t* pcm, size_t len) {
   if (!sConnected || !sAudioTx) return;
+
+  // Realtime voice mode: µ-law halves both the bytes and the packet count
+  // (a 1024 B PCM chunk becomes 512 B ≈ one notification instead of three).
+  static uint8_t enc[BLE_MTU];
+  const uint8_t* src = pcm;
+  if (sVoiceUlaw) {
+    const int16_t* s = (const int16_t*)pcm;
+    size_t samples = min(len / 2, sizeof(enc));
+    for (size_t i = 0; i < samples; i++) enc[i] = ulawEncode(s[i]);
+    src = enc;
+    len = samples;
+  }
+
   size_t offset = 0;
   while (offset < len) {
     size_t fragSize = min((size_t)BLE_MAX_PAYLOAD, len - offset);
     sPkt[0] = 'A';
     sPkt[1] = sTxSeq++;          // wraps at 255 by design
-    memcpy(sPkt + BLE_HEADER_SIZE, pcm + offset, fragSize);
+    memcpy(sPkt + BLE_HEADER_SIZE, src + offset, fragSize);
     // Retried, not fire-and-forget: a dropped mic notification both loses
     // audio and byte-shifts every later int16 sample — the exact signature
     // behind earlier Whisper hallucinations.
@@ -186,15 +263,19 @@ static void sendJpegFragments(const uint8_t* jpeg, size_t len) {
 }
 
 static void sendImageHeader(size_t len, uint8_t flags) {
-  // 'I' + flags + 4-byte LE total size on the CONTROL characteristic
+  // 'H' + flags + 4-byte LE total size — in-band on IMAGE_TX. BLE guarantees
+  // delivery order only within a single characteristic, so riding the same
+  // queue as the fragments makes it impossible for the header to arrive after
+  // data (the old CONTROL-channel header needed a 40 ms guard delay and still
+  // raced under load — Android reset its reassembly buffer mid-image).
   uint8_t hdr[6];
-  hdr[0] = 'I';
+  hdr[0] = 'H';
   hdr[1] = flags;                  // 0x00 = snapshot, 0x01 = video frame
   hdr[2] = (len >>  0) & 0xFF;
   hdr[3] = (len >>  8) & 0xFF;
   hdr[4] = (len >> 16) & 0xFF;
   hdr[5] = (len >> 24) & 0xFF;
-  notifyWithRetry(sControl, hdr, sizeof(hdr));
+  notifyWithRetry(sImageTx, hdr, sizeof(hdr));
 }
 
 // ────────────────────────────────────────────────────────────────
@@ -207,19 +288,13 @@ void bleSendCapturedImage() {
   if (!sConnected || !sImageTx) return;
 
   sendImageHeader(len, 0x00);
-  // Let the header (CONTROL char) land before the first fragment (IMAGE_TX
-  // char). Too short a gap = Android resets its reassembly buffer after
-  // fragments already arrived → corrupt image.
-  delay(40);
-
   sendJpegFragments(jpeg, len);
 
-  // Guard so the last IMAGE_TX fragments drain before the 'J' end marker on
-  // the CONTROL characteristic — prevents the end marker racing ahead and
-  // closing Android's reassembly buffer early.
-  delay(30);
-  uint8_t endPkt[2] = {'J', 0};
-  notifyWithRetry(sControl, endPkt, sizeof(endPkt));
+  // End marker rides IMAGE_TX too — strictly ordered behind the last data
+  // fragment, so it can't close Android's reassembly buffer early. Same fix
+  // that eliminated the ~25% video-frame corruption; no guard delays needed.
+  uint8_t endPkt[BLE_HEADER_SIZE] = {'J', 0};
+  notifyWithRetry(sImageTx, endPkt, sizeof(endPkt));
 
   cameraDiscardSnapshot();
 }
@@ -243,9 +318,7 @@ void bleSendVideoFrame(uint8_t frameIdx) {
     return;
   }
 
-  sendImageHeader(fb->len, 0x01);   // 0x01 = video frame flag
-  delay(10);
-
+  sendImageHeader(fb->len, 0x01);   // 0x01 = video frame flag (in-band on IMAGE_TX)
   sendJpegFragments(fb->buf, fb->len);
 
   // Frame end: 'J' + frameIdx — sent on IMAGE_TX (same notification queue as
@@ -261,6 +334,11 @@ void bleSendVideoFrame(uint8_t frameIdx) {
 
 void bleSendVideoEnd(uint8_t totalFrames) {
   if (!sConnected || !sControl) return;
+  // 'W' rides CONTROL while the last frame's data + 'J' ride IMAGE_TX — a
+  // cross-characteristic pair, so 'W' could overtake the final frame. Give
+  // the IMAGE_TX queue a moment to drain (the app additionally salvages a
+  // complete in-flight frame when 'W' arrives early, belt-and-braces).
+  delay(50);
   uint8_t pkt[2] = {'W', totalFrames};
   notifyWithRetry(sControl, pkt, sizeof(pkt));
   delay(10);
