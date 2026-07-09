@@ -525,13 +525,17 @@ final class BleManager: NSObject {
         }
     }
 
-    /// One live MJPEG frame complete. Unlike stills, a corrupt frame is dropped
-    /// silently — the next frame is ~200 ms away, so there's nothing to recover.
+    /// One live MJPEG frame complete. Unlike stills, a bad frame is dropped
+    /// silently — the next is ~80 ms away, nothing to recover. A frame that
+    /// lost any fragment (seqGaps > 0) is *partially* corrupt: it still has a
+    /// valid SOI but decodes with wrong colors/blocks, so drop those too rather
+    /// than flash garbage.
     private func finishVideoFrame() {
         receivingVideoFrame = false
         let jpeg = imageBuffer
         imageBuffer = Data()
-        guard jpeg.count >= 2,
+        guard imageSeqGaps == 0,
+              jpeg.count >= 2,
               jpeg[jpeg.startIndex] == 0xFF, jpeg[jpeg.startIndex + 1] == 0xD8 else { return }
         videoFrameCount += 1
         onVideoFrame?(jpeg)

@@ -145,6 +145,7 @@ static void handleGestureEvent(GestureEvent ev) {
       LOGI("[APP] Quick triple-tap → VIDEO START");
       sPhotoPending = false;       // video supersedes the pending photo
       cameraDiscardSnapshot();
+      cameraSetVideoMode(true);    // QQVGA + high compression for ~12 fps
       sRecording = false;
       sVisionMode = false;
       sVideoMode = true;
@@ -166,6 +167,7 @@ static void handleGestureEvent(GestureEvent ev) {
     case GESTURE_VIDEO_STOP:
       LOGI("[APP] Video stopped → %d frames", sVideoFrameCount);
       bleSendVideoEnd((uint8_t)min(sVideoFrameCount, 255));
+      cameraSetVideoMode(false);   // restore full-quality QVGA for photos
       sVideoMode = false;
       sVideoFrameCount = 0;
       break;

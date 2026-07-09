@@ -248,6 +248,10 @@ void bleSendMicChunk(const uint8_t* pcm, size_t len) {
 // ────────────────────────────────────────────────────────────────
 //  JPEG fragmentation helper (snapshot + video share this)
 // ────────────────────────────────────────────────────────────────
+// Per-fragment pacing: BLE_IMG_FRAG_DELAY_MS for one-shot photos, tighter
+// BLE_VID_FRAG_DELAY_MS during live video (set in bleSendVideoStart/End).
+static int sImgFragDelay = BLE_IMG_FRAG_DELAY_MS;
+
 static void sendJpegFragments(const uint8_t* jpeg, size_t len) {
   uint8_t imgSeq = 0;
   size_t sent = 0;
@@ -258,7 +262,7 @@ static void sendJpegFragments(const uint8_t* jpeg, size_t len) {
     memcpy(sPkt + BLE_HEADER_SIZE, jpeg + sent, fragSize);
     notifyWithRetry(sImageTx, sPkt, BLE_HEADER_SIZE + fragSize);
     sent += fragSize;
-    delay(BLE_IMG_FRAG_DELAY_MS);  // one fragment per connection event
+    delay(sImgFragDelay);  // one fragment per connection event
   }
 }
 
@@ -280,7 +284,7 @@ static void sendImageHeader(size_t len, uint8_t flags) {
   // fragment below. Without this the header and the first fragment share one
   // event and the header is the one that gets dropped — the receiver then
   // orphans every fragment ("no open transfer").
-  delay(BLE_IMG_FRAG_DELAY_MS);
+  delay(sImgFragDelay);
 }
 
 // ────────────────────────────────────────────────────────────────
@@ -309,6 +313,7 @@ void bleSendCapturedImage() {
 // ────────────────────────────────────────────────────────────────
 void bleSendVideoStart() {
   if (!sConnected || !sControl) return;
+  sImgFragDelay = BLE_VID_FRAG_DELAY_MS;   // tighter pacing for the frame burst
   uint8_t pkt[2] = {'V', 0};
   notifyWithRetry(sControl, pkt, sizeof(pkt));
   delay(10);
@@ -347,4 +352,5 @@ void bleSendVideoEnd(uint8_t totalFrames) {
   uint8_t pkt[2] = {'W', totalFrames};
   notifyWithRetry(sControl, pkt, sizeof(pkt));
   delay(10);
+  sImgFragDelay = BLE_IMG_FRAG_DELAY_MS;   // restore photo pacing
 }
