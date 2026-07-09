@@ -42,6 +42,9 @@ static int  sVideoFrameCount = 0;
 // the tap window closes so a third tap can upgrade the gesture to video.
 static bool sPhotoPending = false;
 static unsigned long sPhotoPendingAt = 0;
+// Realtime vision: the photo was sent up front (at the start of the hold) so
+// the app can inject it into the conversation before the question turn closes.
+static bool sVisionPhotoSent = false;
 
 static int16_t sMicBuf[SAMPLES_PER_CHUNK];
 
@@ -81,13 +84,20 @@ static void startRecording(bool withVision) {
   bleSendAudioStart();   // phone flushes stale audio chunks from quick taps
 
   if (withVision) {
-    LOGI("[APP] Double-tap press → capturing photo");
+    LOGI("[APP] Vision press → capturing photo");
     // If capture fails, fall back to voice-only instead of silently sending
-    // audio with no image — otherwise Android waits for a JPEG that never
+    // audio with no image — otherwise the phone waits for a JPEG that never
     // arrives.
     if (!cameraCaptureSnapshot()) {
       LOGI("[CAM] Capture failed → voice-only for this utterance");
       sVisionMode = false;
+    } else if (bleRealtimeMode()) {
+      // Realtime: send the photo NOW (flags 0x02 = vision) so the app injects
+      // it into the conversation before the spoken question's turn closes. The
+      // voice streamed during the hold becomes the question about this image.
+      LOGI("[APP] Realtime vision → sending photo up front");
+      bleSendCapturedImage(0x02);
+      sVisionPhotoSent = true;
     }
   } else {
     LOGI("[APP] Press → voice recording");
@@ -99,7 +109,11 @@ static void stopRecordingAndSend() {
   // marker, so Android sees photo-then-question and attaches it (the "ask
   // within 5 s" flow). Mutually exclusive with sVisionMode by construction.
   flushPendingPhoto();
-  if (sVisionMode) {
+  if (sVisionMode && sVisionPhotoSent) {
+    // Realtime: the photo was already sent up front in startRecording(); the
+    // app has it in the conversation. Just end the voice turn.
+    LOGI("[APP] Released → vision photo already sent; ending turn");
+  } else if (sVisionMode) {
     LOGI("[APP] Released → sending image + audio END");
     bleSendCapturedImage();
     // The image (incl. its in-band 'J' on IMAGE_TX) and the audio 'E' (CONTROL)
@@ -115,6 +129,7 @@ static void stopRecordingAndSend() {
   bleSendAudioEnd();
   sRecording = false;
   sVisionMode = false;
+  sVisionPhotoSent = false;
 }
 
 static void handleGestureEvent(GestureEvent ev) {

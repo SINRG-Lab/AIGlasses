@@ -19,6 +19,7 @@ static uint8_t sTxSeq = 0;
 static uint8_t sPkt[BLE_MTU];
 
 bool bleConnected() { return sConnected; }
+bool bleRealtimeMode();   // defined after sVoiceUlaw below
 
 // ────────────────────────────────────────────────────────────────
 //  Realtime voice mode (opt-in, 'M'/'m' on CONTROL): audio runs as
@@ -28,6 +29,8 @@ bool bleConnected() { return sConnected; }
 //  behaves exactly as V2 (PCM16 bursts) — old apps keep working.
 // ────────────────────────────────────────────────────────────────
 static volatile bool sVoiceUlaw = false;
+
+bool bleRealtimeMode() { return sVoiceUlaw; }
 
 static uint8_t ulawEncode(int16_t pcm) {
   const int16_t CLIP = 32635;
@@ -290,13 +293,13 @@ static void sendImageHeader(size_t len, uint8_t flags) {
 // ────────────────────────────────────────────────────────────────
 //  Snapshot (photo / vision)
 // ────────────────────────────────────────────────────────────────
-void bleSendCapturedImage() {
+void bleSendCapturedImage(uint8_t flags) {
   const uint8_t* jpeg = cameraJpeg();
   size_t len = cameraJpegLen();
   if (!jpeg || len == 0) return;
   if (!sConnected || !sImageTx) return;
 
-  sendImageHeader(len, 0x00);
+  sendImageHeader(len, flags);   // 0x00 photo, 0x02 vision photo
   sendJpegFragments(jpeg, len);
 
   // End marker rides IMAGE_TX too — strictly ordered behind the last data

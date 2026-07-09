@@ -68,6 +68,7 @@ final class BleManager: NSObject {
 
     @ObservationIgnored var onMicAudio: ((Data) -> Void)?   // PCM16 @16 kHz, seq-filtered
     @ObservationIgnored var onPhoto: ((Data) -> Void)?      // complete JPEG
+    @ObservationIgnored var onVisionPhoto: ((Data) -> Void)? // vision-gesture photo → realtime
     @ObservationIgnored var onVideoFrame: ((Data) -> Void)? // one live MJPEG frame
     @ObservationIgnored var onVideoStart: (() -> Void)?
     @ObservationIgnored var onVideoEnd: (() -> Void)?
@@ -104,6 +105,7 @@ final class BleManager: NSObject {
     // Image reassembly
     @ObservationIgnored private var receivingImage = false
     @ObservationIgnored private var receivingVideoFrame = false
+    @ObservationIgnored private var pendingImageIsVision = false   // header flags 0x02
     @ObservationIgnored private var videoSessionActive = false
     @ObservationIgnored private var videoFrameCount = 0
     @ObservationIgnored private var expectedImageSize = 0
@@ -470,7 +472,9 @@ final class BleManager: NSObject {
         switch Character(UnicodeScalar(first)) {
         case "H":
             guard data.count >= 6 else { return }
-            let isVideoFrame = data[data.startIndex + 1] == 0x01
+            let flags = data[data.startIndex + 1]
+            let isVideoFrame = flags == 0x01
+            pendingImageIsVision = (flags == 0x02)   // vision-gesture photo
             let expected = Int(data.subdata(in: (data.startIndex + 2)..<(data.startIndex + 6))
                 .withUnsafeBytes { $0.loadUnaligned(as: UInt32.self) })
             startImageReceive(isVideoFrame: isVideoFrame, expectedSize: expected, legacy: false)
@@ -552,8 +556,10 @@ final class BleManager: NSObject {
         }
         let sizeNote = expectedImageSize > 0 && jpeg.count != expectedImageSize
             ? " (SIZE MISMATCH, expected \(expectedImageSize))" : ""
-        log("photo complete: \(jpeg.count) B, seqGaps=\(imageSeqGaps)\(sizeNote)")
-        onPhoto?(jpeg)
+        let isVision = pendingImageIsVision
+        pendingImageIsVision = false
+        log("\(isVision ? "vision" : "photo") complete: \(jpeg.count) B, seqGaps=\(imageSeqGaps)\(sizeNote)")
+        if isVision { onVisionPhoto?(jpeg) } else { onPhoto?(jpeg) }
     }
 
     // MARK: Stats
