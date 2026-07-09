@@ -27,7 +27,11 @@
 #define BLE_MAX_PAYLOAD     (((BLE_MTU - 3 - BLE_HEADER_SIZE) / 2) * 2)
 // Pacing between fragments: one fragment per connection event
 #define BLE_FRAG_DELAY_MS       5   // mic audio fragments
-#define BLE_IMG_FRAG_DELAY_MS  15   // image/video fragments (larger bursts)
+#define BLE_IMG_FRAG_DELAY_MS  15   // photo fragments (large one-shot bursts)
+#define BLE_VID_FRAG_DELAY_MS   7   // live-video fragments (small QQVGA frames,
+                                    // paced tighter for ~12 fps; each frame is
+                                    // self-contained so an occasional drop just
+                                    // skips one frame)
 // notifyWithRetry: max retries while the NimBLE TX buffer drains
 #define BLE_NOTIFY_MAX_TRIES   50   // x 5 ms = ~250 ms worst case
 
