@@ -30,8 +30,14 @@ void bleResetAudioSeq();                               // call at the start of e
 // which is the pre-V2 behavior (harmless, the ESP32 discards it).
 void bleNotifyPlaybackCancelled();
 
-// Snapshot (photo / vision) — sends the snapshot held by camera_ctl, then frees it
-void bleSendCapturedImage();
+// Snapshot — sends the snapshot held by camera_ctl, then frees it.
+// flags: 0x00 = standalone photo, 0x02 = vision photo (app injects it into the
+// live GPT Realtime conversation as an image for the spoken question).
+void bleSendCapturedImage(uint8_t flags = 0x00);
+
+// True once the app has enabled realtime voice mode (wrote 'M'). Lets the
+// gesture layer route a vision photo into the realtime conversation.
+bool bleRealtimeMode();
 
 // Video streaming
 void bleSendVideoStart();                  // 'V'

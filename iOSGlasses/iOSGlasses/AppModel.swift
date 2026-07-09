@@ -109,6 +109,21 @@ final class AppModel {
             self.videoFps = Double(self.frameTimes.count) / 2.0
         }
 
+        // Vision gesture (tap-then-hold on the glasses): the photo arrives up
+        // front and is injected straight into the live conversation; the voice
+        // spoken during the hold is the question. Fully hands-free.
+        ble.onVisionPhoto = { [weak self] jpeg in
+            guard let self else { return }
+            if let photo = try? self.gallery.save(jpeg: jpeg) { self.pendingPhoto = photo }
+            if self.voiceEnabled, let rt = self.realtime {
+                rt.attachImage(jpeg: jpeg)
+                self.photoAttached = true
+                self.log("vision photo attached — answering your spoken question")
+            } else {
+                self.log("vision photo received but voice is off — saved to gallery")
+            }
+        }
+
         ble.onBargeIn = { [weak self] in
             guard let self else { return }
             if self.voiceEnabled { self.voiceStatus = .listening }
