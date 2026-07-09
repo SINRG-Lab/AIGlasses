@@ -276,6 +276,11 @@ static void sendImageHeader(size_t len, uint8_t flags) {
   hdr[4] = (len >> 16) & 0xFF;
   hdr[5] = (len >> 24) & 0xFF;
   notifyWithRetry(sImageTx, hdr, sizeof(hdr));
+  // Pace the header into its OWN connection event, exactly like every
+  // fragment below. Without this the header and the first fragment share one
+  // event and the header is the one that gets dropped — the receiver then
+  // orphans every fragment ("no open transfer").
+  delay(BLE_IMG_FRAG_DELAY_MS);
 }
 
 // ────────────────────────────────────────────────────────────────

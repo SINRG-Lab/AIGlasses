@@ -68,6 +68,9 @@ final class BleManager: NSObject {
 
     @ObservationIgnored var onMicAudio: ((Data) -> Void)?   // PCM16 @16 kHz, seq-filtered
     @ObservationIgnored var onPhoto: ((Data) -> Void)?      // complete JPEG
+    @ObservationIgnored var onVideoFrame: ((Data) -> Void)? // one live MJPEG frame
+    @ObservationIgnored var onVideoStart: (() -> Void)?
+    @ObservationIgnored var onVideoEnd: (() -> Void)?
     @ObservationIgnored var onBargeIn: (() -> Void)?        // 'X' from the glasses
     @ObservationIgnored var onLog: ((String) -> Void)?
     @ObservationIgnored var onConnected: (() -> Void)?
@@ -101,6 +104,8 @@ final class BleManager: NSObject {
     // Image reassembly
     @ObservationIgnored private var receivingImage = false
     @ObservationIgnored private var receivingVideoFrame = false
+    @ObservationIgnored private var videoSessionActive = false
+    @ObservationIgnored private var videoFrameCount = 0
     @ObservationIgnored private var expectedImageSize = 0
     @ObservationIgnored private var imageBuffer = Data()
     @ObservationIgnored private var imageSeqExpected = 0
@@ -212,6 +217,7 @@ final class BleManager: NSObject {
         cancelResponse()
         receivingImage = false
         receivingVideoFrame = false
+        if videoSessionActive { videoSessionActive = false; onVideoEnd?() }
         imageBuffer.removeAll()
         connectionState = .disconnected
         if wasConnected {
@@ -428,10 +434,16 @@ final class BleManager: NSObject {
             cancelResponse()
             onBargeIn?()
         case "V":
-            log("glasses: video session start (video streaming not supported on iOS yet — frames discarded)")
-        case "W":
-            log("glasses: video session end")
+            videoSessionActive = true
+            videoFrameCount = 0
             receivingVideoFrame = false
+            log("glasses: video session start — live view")
+            onVideoStart?()
+        case "W":
+            videoSessionActive = false
+            receivingVideoFrame = false
+            log("glasses: video session end (\(videoFrameCount) frames)")
+            onVideoEnd?()
         case "I":
             // LEGACY (pre-in-band firmware): image header on CONTROL.
             // ['I'][flags][len u32 LE]
@@ -464,26 +476,35 @@ final class BleManager: NSObject {
             startImageReceive(isVideoFrame: isVideoFrame, expectedSize: expected, legacy: false)
         case "J":
             if receivingVideoFrame {
-                receivingVideoFrame = false   // video frames discarded (no LiveView yet)
-                imageBuffer.removeAll()
+                finishVideoFrame()
             } else if receivingImage {
                 finishStillImage()
             }
         case "I":
             guard data.count > 2 else { return }
             let payload = data.subdata(in: (data.startIndex + 2)..<data.endIndex)
-            if receivingVideoFrame {
-                return  // discard
-            }
-            guard receivingImage else {
-                log("stray image fragment (\(payload.count) B) with no open transfer — dropped")
-                return
-            }
             let seq = Int(data[data.startIndex + 1])
+            if !receivingImage && !receivingVideoFrame {
+                // Recover a dropped 'H' header: fragments always start at seq 0,
+                // so a seq-0 fragment with no open transfer means the header was
+                // lost in its connection event — open an implicit transfer. During
+                // a video session it's a video frame; otherwise a still photo.
+                // Integrity is still guarded at frame completion. A non-zero seq
+                // is a genuine mid-stream orphan and stays dropped.
+                if seq == 0 {
+                    startImageReceive(isVideoFrame: videoSessionActive, expectedSize: 0, legacy: false)
+                    if !videoSessionActive { log("image header missed — recovering from seq-0 fragment") }
+                } else {
+                    log("stray image fragment (\(payload.count) B, seq \(seq)) — dropped")
+                    return
+                }
+            }
             if seq != imageSeqExpected {
                 let gap = (seq - imageSeqExpected) & 0xFF
                 imageSeqGaps += gap
-                log("image SEQ gap: expected \(imageSeqExpected) got \(seq) (~\(gap) lost)")
+                if !receivingVideoFrame {   // gaps are normal/expected in live video
+                    log("image SEQ gap: expected \(imageSeqExpected) got \(seq) (~\(gap) lost)")
+                }
             }
             imageSeqExpected = (seq + 1) & 0xFF
             imageBuffer.append(payload)
@@ -493,18 +514,27 @@ final class BleManager: NSObject {
     }
 
     private func startImageReceive(isVideoFrame: Bool, expectedSize: Int, legacy: Bool) {
-        if isVideoFrame {
-            receivingVideoFrame = true
-            imageBuffer.removeAll()
-            return
-        }
-        receivingImage = true
-        receivingVideoFrame = false
+        receivingImage = !isVideoFrame
+        receivingVideoFrame = isVideoFrame
         expectedImageSize = expectedSize
         imageSeqExpected = 0
         imageSeqGaps = 0
         imageBuffer.removeAll()
-        log("photo incoming\(legacy ? " (legacy header)" : ""): \(expectedSize) B expected")
+        if !isVideoFrame {
+            log("photo incoming\(legacy ? " (legacy header)" : ""): \(expectedSize) B expected")
+        }
+    }
+
+    /// One live MJPEG frame complete. Unlike stills, a corrupt frame is dropped
+    /// silently — the next frame is ~200 ms away, so there's nothing to recover.
+    private func finishVideoFrame() {
+        receivingVideoFrame = false
+        let jpeg = imageBuffer
+        imageBuffer = Data()
+        guard jpeg.count >= 2,
+              jpeg[jpeg.startIndex] == 0xFF, jpeg[jpeg.startIndex + 1] == 0xD8 else { return }
+        videoFrameCount += 1
+        onVideoFrame?(jpeg)
     }
 
     private func finishStillImage() {

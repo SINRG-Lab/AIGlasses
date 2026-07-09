@@ -722,6 +722,15 @@ class BleVoiceService(
         if (data[0].toInt().toChar() != 'I') return
         if (data.size <= HEADER_SIZE) return
         val payload = data.copyOfRange(HEADER_SIZE, data.size)
+        val fragSeq = data[1].toInt() and 0xFF
+        // Recover a dropped 'H' header: fragments always start at seq 0, so a
+        // seq-0 fragment with no open transfer means the header was lost in its
+        // connection event — open an implicit transfer (final JPEG decode still
+        // guards integrity). A non-zero seq is a genuine mid-stream orphan.
+        if (!receivingImage && !receivingVideoFrame && fragSeq == 0) {
+            Log.w(TAG, "Image header missed — recovering from seq-0 fragment")
+            startImageReceive(false, 0)
+        }
         if (receivingVideoFrame) {
             synchronized(currentVideoFrame) { currentVideoFrame.write(payload) }
         } else if (receivingImage) {
