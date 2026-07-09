@@ -1,5 +1,6 @@
 import Foundation
 import Observation
+import UIKit
 
 /// Top-level coordinator: owns the BLE link, the OpenAI Realtime session, the
 /// gallery and settings, and publishes UI state.
@@ -50,6 +51,12 @@ final class AppModel {
     private(set) var pendingPhoto: GalleryStore.Photo?
     private(set) var photoAttached = false
 
+    // Live video (MJPEG frames from the glasses camera)
+    private(set) var isReceivingVideo = false
+    private(set) var liveFrame: UIImage?
+    private(set) var videoFps = 0.0
+    @ObservationIgnored private var frameTimes: [Date] = []
+
     init() {
         wireBle()
         log("app started")
@@ -78,6 +85,28 @@ final class AppModel {
             } catch {
                 self.log("photo save failed: \(error.localizedDescription)")
             }
+        }
+
+        // Live video (triple-tap the glasses to start; tap to stop). BLE
+        // callbacks fire on the main queue (CBCentralManager queue: nil), so
+        // touching @Observable UI state directly here is safe.
+        ble.onVideoStart = { [weak self] in
+            self?.isReceivingVideo = true
+            self?.frameTimes.removeAll()
+            self?.log("live video started")
+        }
+        ble.onVideoEnd = { [weak self] in
+            self?.isReceivingVideo = false
+            self?.videoFps = 0
+            self?.log("live video ended")
+        }
+        ble.onVideoFrame = { [weak self] jpeg in
+            guard let self else { return }
+            if let img = UIImage(data: jpeg) { self.liveFrame = img }
+            let now = Date()
+            self.frameTimes.append(now)
+            self.frameTimes.removeAll { now.timeIntervalSince($0) > 2 }
+            self.videoFps = Double(self.frameTimes.count) / 2.0
         }
 
         ble.onBargeIn = { [weak self] in
