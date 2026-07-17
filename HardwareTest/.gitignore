@@ -1,0 +1,5 @@
+# runtime/debug artifacts — not source
+*.wav
+photo_*.jpg
+*_latency_log.csv
+__pycache__/

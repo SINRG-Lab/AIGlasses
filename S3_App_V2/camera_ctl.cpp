@@ -131,3 +131,24 @@ camera_fb_t* cameraGrabFrame(int retries) {
 void cameraReturnFrame(camera_fb_t* fb) {
   if (fb) esp_camera_fb_return(fb);
 }
+
+void cameraSetVideoMode(bool on) {
+  if (!sCameraOk) return;
+  sensor_t* s = esp_camera_sensor_get();
+  if (!s) return;
+  if (on) {
+    // QQVGA 160x120 + high compression → ~1.5-2 KB/frame ≈ 4-5 BLE fragments,
+    // vs QVGA's ~6 KB ≈ 12+. Framesize change reallocates internally; the
+    // pre-allocated PSRAM buffers (sized for QVGA at init) comfortably fit.
+    s->set_framesize(s, FRAMESIZE_QQVGA);
+    s->set_quality(s, 24);          // higher number = smaller file
+  } else {
+    s->set_framesize(s, FRAMESIZE_QVGA);
+    s->set_quality(s, 12);
+  }
+  // Let AEC/AGC resettle after the mode switch (first frames may be dark).
+  for (int i = 0; i < 2; i++) {
+    camera_fb_t* w = esp_camera_fb_get();
+    if (w) esp_camera_fb_return(w);
+  }
+}

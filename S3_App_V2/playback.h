@@ -25,3 +25,8 @@ void playbackTick();          // advance the state machine (no-op when idle)
 bool playbackActive();        // true in BUFFERING/PLAYING/DRAINING
 void playbackCancel(const char* reason);  // barge-in: stop now, tear down speaker
 void playbackResetOnDisconnect();         // BLE dropped: clear state without touching I2S
+
+// [PERF-M7] instrumentation: called when the user releases the button (end of
+// question). The next playback start logs the button-release → first-audio
+// round-trip time.
+void playbackMarkQuestionEnd();

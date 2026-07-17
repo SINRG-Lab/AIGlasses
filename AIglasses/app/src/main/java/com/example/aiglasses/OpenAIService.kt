@@ -24,10 +24,12 @@ class OpenAIService(private val apiKey: String) {
 
     companion object {
         private const val WHISPER_URL = "https://api.openai.com/v1/audio/transcriptions"
-        // STT model. "gpt-4o-transcribe" is the most accurate (best for imperfect
-        // mic audio); "gpt-4o-mini-transcribe" is faster/cheaper; "whisper-1" is
-        // the legacy fallback.
-        private const val STT_MODEL = "gpt-4o-transcribe"
+        // STT model, pinned to the 2025-12-15 mini-transcribe snapshot: OpenAI
+        // reports ~90% fewer hallucinations than Whisper v2 and ~70% fewer than
+        // earlier gpt-4o-transcribe snapshots on silence/background noise — the
+        // exact failure mode this pipeline hit (see MIC_ROOT_CAUSE_ANALYSIS.md).
+        // "whisper-1" remains the legacy fallback.
+        private const val STT_MODEL = "gpt-4o-mini-transcribe-2025-12-15"
         private const val CHAT_URL = "https://api.openai.com/v1/chat/completions"
         private const val TTS_URL = "https://api.openai.com/v1/audio/speech"
         private const val SYSTEM_PROMPT =
