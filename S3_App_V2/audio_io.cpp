@@ -26,6 +26,12 @@ bool micInit() {
       .invert_flags = { .clk_inv = false },
     },
   };
+  // Run the PDM clock at 128× the sample rate (2.048 MHz @ 16 kHz) instead of
+  // the driver default 64× (1.024 MHz). The MSM261D3526H1CPM datasheet only
+  // specifies Low-Power mode up to 0.9 MHz and Standard mode from 1.1 MHz —
+  // the default clock lands in the uncharacterized gap between them; 128×
+  // puts the mic squarely in Standard mode (64 dB(A) SNR). PCM rate unchanged.
+  pdmCfg.clk_cfg.dn_sample_mode = I2S_PDM_DSR_16S;
 
   e = i2s_channel_init_pdm_rx_mode(sPdmRx, &pdmCfg);
   if (e != ESP_OK) { LOGI("[MIC] init_pdm_rx failed: %d", (int)e); return false; }

@@ -54,8 +54,9 @@ races a concurrent `i2s_channel_write`.
 ### Photo / video
 Snapshots are copied to a module-owned PSRAM buffer so the camera frame buffer
 returns to the driver immediately. Video frames stream straight from the frame
-buffer. Both share one fragmentation path in `ble_link` (`'I'` header on CONTROL,
-`'I'`+seq fragments on IMAGE_TX, `'J'` end marker).
+buffer. Both share one fragmentation path in `ble_link`, entirely in-band on IMAGE_TX
+(`'H'` header, `'I'`+seq fragments, `'J'` end marker) so no marker can be
+reordered against the data it frames.
 
 ## Concurrency model
 

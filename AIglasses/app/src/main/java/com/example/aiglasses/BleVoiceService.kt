@@ -4,6 +4,7 @@ import android.annotation.SuppressLint
 import android.bluetooth.*
 import android.bluetooth.le.*
 import android.content.Context
+import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.os.ParcelUuid
@@ -45,6 +46,17 @@ class BleVoiceService(
         // this window. Older photos are considered stale and the question runs
         // voice-only. (Bundled vision via double-tap+hold lands well inside this.)
         private const val VISION_WINDOW_MS = 5000L
+
+        // ── Realtime (GPT speech-to-speech) mode — values validated on hardware
+        //    by HardwareTest/realtime_ble.py ──
+        // Downlink token bucket: µ-law @24 kHz consumes 24000 B/s on the glasses;
+        // burst fills the firmware prebuffer fast, then ~1.35× realtime sustains it.
+        private const val RT_DL_BURST = 24L * 1024L
+        private const val RT_DL_BPS = 32400L          // 1.35 × 24000 B/s of µ-law
+        // Button released → mic frames stop. After this quiet gap, feed the server
+        // VAD 600 ms of silence once so it closes the turn (it must HEAR silence).
+        private const val RT_SILENCE_AFTER_MS = 250L
+        private const val RT_SILENCE_BYTES = 2 * 24000 * 6 / 10   // 600 ms PCM16 @24 kHz
     }
 
     sealed class BleEvent {
@@ -112,6 +124,34 @@ class BleVoiceService(
 
     private val mainHandler = Handler(Looper.getMainLooper())
 
+    // ── Realtime (GPT speech-to-speech) mode state ──
+    // When enabled, mic 'A' frames carry µ-law @16 kHz and stream live to the
+    // RealtimeVoiceClient instead of accumulating for the legacy pipeline, and
+    // response audio streams back as µ-law @24 kHz. Photo/video handling is
+    // untouched. The client reference is set by MainViewModel.
+    @Volatile private var realtimeMode = false
+    @Volatile private var realtimeClient: RealtimeVoiceClient? = null
+    @Volatile private var rtMicSeqValid = false
+    @Volatile private var rtMicLastSeq = 0
+    @Volatile private var rtTalking = false
+    private val rtMicConditioner = MicConditioner()   // BLE notify thread only
+    private val rtDownQueue = java.util.concurrent.LinkedBlockingQueue<RtDown>()
+    private var rtDownThread: Thread? = null          // guarded by rtDownQueue
+
+    private sealed class RtDown {
+        class Audio(val ulaw: ByteArray, val first: Boolean) : RtDown()
+        data object End : RtDown()
+    }
+
+    // Push-to-talk release: frames stop, but server VAD needs to HEAR silence
+    // to close the turn — feed it 600 ms of zeros once, then go quiet.
+    private val rtSilenceRunnable = Runnable {
+        if (rtTalking) {
+            rtTalking = false
+            realtimeClient?.appendAudio(ByteArray(RT_SILENCE_BYTES))
+        }
+    }
+
     // ── Public API ──
 
     fun startScan() {
@@ -159,9 +199,63 @@ class BleVoiceService(
         onEvent(BleEvent.ScanStopped)
     }
 
+    /** Wire (or clear) the GPT Realtime client used when realtime mode is on. */
+    fun setRealtimeClient(client: RealtimeVoiceClient?) {
+        realtimeClient = client
+    }
+
+    /**
+     * Toggle realtime (µ-law) voice mode. Tells the firmware with 'M'/'m' on
+     * CONTROL when connected; also sent on every connect (the glasses keep
+     * sVoiceUlaw across connections, so an explicit marker un-sticks a stale
+     * mode from a previous session).
+     */
+    fun setRealtimeMode(enabled: Boolean) {
+        if (realtimeMode == enabled) return
+        realtimeMode = enabled
+        if (!enabled) resetRealtimeStreams()
+        if (isConnected) {
+            Thread {
+                writeControlMarkerNoResponse(if (enabled) 'M' else 'm')
+            }.apply { isDaemon = true; start() }
+        }
+    }
+
+    /**
+     * Queue a 24 kHz PCM16 response chunk for the glasses. Called by the
+     * realtime event handler directly on the WebSocket reader thread — this
+     * only µ-law-encodes and enqueues; the paced BLE writes happen on the
+     * dedicated downlink thread.
+     */
+    fun queueRealtimeAudio(pcm24k: ByteArray, first: Boolean) {
+        if (!realtimeMode || !isConnected || pcm24k.isEmpty()) return
+        rtDownQueue.offer(RtDown.Audio(AudioCodec.ulawEncode(pcm24k), first))
+        ensureRtDownThread()
+    }
+
+    /** The realtime response finished — flush the 'E' end marker after the audio. */
+    fun endRealtimeResponse() {
+        if (!realtimeMode || !isConnected) return
+        rtDownQueue.offer(RtDown.End)
+        ensureRtDownThread()
+    }
+
+    private fun resetRealtimeStreams() {
+        rtMicSeqValid = false
+        rtTalking = false
+        rtDownQueue.clear()
+        mainHandler.removeCallbacks(rtSilenceRunnable)
+    }
+
     fun disconnect() {
         stopScan()
+        if (isConnected && realtimeMode) {
+            // Best effort: leave the glasses in the legacy protocol so an old
+            // app connecting next doesn't feed PCM16 into the µ-law decoder.
+            try { writeControlMarkerNoResponse('m') } catch (_: Exception) {}
+        }
         isConnected = false
+        resetRealtimeStreams()
         pendingJpeg = null
         receivingImage = false
         receivingVideo = false
@@ -225,10 +319,23 @@ class BleVoiceService(
                     // real-time playback need (caused the thin ring buffer/underrun).
                     // HIGH priority ≈ ~11.25ms or lower, lifting OTA above playback rate.
                     gatt.requestConnectionPriority(BluetoothGatt.CONNECTION_PRIORITY_HIGH)
+                    // Request 2M PHY (BLE 5): double the raw symbol rate of the
+                    // default 1M — more notify/write throughput on the same link.
+                    // The firmware requests the same from its side; controllers
+                    // negotiate and fall back to 1M when unsupported. Result is
+                    // logged in onPhyUpdate as [PERF-M35].
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                        gatt.setPreferredPhy(
+                            BluetoothDevice.PHY_LE_2M_MASK,
+                            BluetoothDevice.PHY_LE_2M_MASK,
+                            BluetoothDevice.PHY_OPTION_NO_PREFERRED
+                        )
+                    }
                     gatt.requestMtu(TARGET_MTU)
                 } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
                     Log.i(TAG, "Disconnected (status=$status)")
                     isConnected = false
+                    resetRealtimeStreams()
                     synchronized(audioChunks) { audioChunks.clear() }
                     audioTxChar = null
                     audioRxChar = null
@@ -241,6 +348,11 @@ class BleVoiceService(
             } catch (e: Exception) {
                 Log.e(TAG, "onConnectionStateChange error", e)
             }
+        }
+
+        override fun onPhyUpdate(gatt: BluetoothGatt, txPhy: Int, rxPhy: Int, status: Int) {
+            // 1 = 1M, 2 = 2M, 3 = Coded. Confirms whether the 2M request stuck.
+            Log.i(TAG, "[PERF-M35] PHY updated: tx=$txPhy rx=$rxPhy status=$status (1=1M, 2=2M, 3=Coded)")
         }
 
         override fun onMtuChanged(gatt: BluetoothGatt, mtu: Int, status: Int) {
@@ -325,6 +437,13 @@ class BleVoiceService(
                     isConnected = true
                     val name = try { gatt.device?.name ?: "ESP32" } catch (_: Exception) { "ESP32" }
                     Log.i(TAG, "Fully connected to $name")
+                    // Announce the voice protocol for this session. Always sent:
+                    // the firmware keeps its µ-law flag across connections, so an
+                    // explicit 'm' clears a stale realtime mode too.
+                    val modeMarker = if (realtimeMode) 'M' else 'm'
+                    Thread {
+                        writeControlMarkerNoResponse(modeMarker)
+                    }.apply { isDaemon = true; start() }
                     onEvent(BleEvent.Connected(name))
                 }
             } catch (e: Exception) {
@@ -411,6 +530,11 @@ class BleVoiceService(
         if (payload.isEmpty()) return
         val seq = data[1].toInt() and 0xFF
 
+        if (realtimeMode) {
+            handleRealtimeMicFrame(seq, payload)
+            return
+        }
+
         synchronized(audioChunks) {
             if (audioChunks.isEmpty()) {
                 perfAudioRxStartMs = System.currentTimeMillis()  // M11 start
@@ -438,18 +562,58 @@ class BleVoiceService(
         }
     }
 
+    /**
+     * Realtime mode uplink: mic 'A' frames carry µ-law @16 kHz and stream live
+     * while the button is held. Per frame (mirrors realtime_ble.py's
+     * on_mic_frame): seq-filter stale duplicates, zero-fill small gaps to keep
+     * VAD timing sane, µ-law-decode, condition, upsample to 24 kHz, forward.
+     * Runs on the BLE notify thread; RealtimeVoiceClient.appendAudio only
+     * enqueues onto OkHttp's writer queue, so nothing here blocks.
+     */
+    private fun handleRealtimeMicFrame(seq: Int, ulawPayload: ByteArray) {
+        val client = realtimeClient ?: return
+        if (rtMicSeqValid) {
+            // Anything at-or-behind the last accepted seq (delta 0 or "negative"
+            // mod 256) is a stale duplicate from a double-subscription: drop it.
+            val delta = (seq - rtMicLastSeq) and 0xFF
+            if (delta == 0 || delta >= 200) return
+            val gap = delta - 1
+            if (gap in 1..8) {
+                // Small real loss: zero-fill so the VAD's clock doesn't jump.
+                // gap × payload µ-law samples @16 kHz = ×3 bytes of PCM16 @24 kHz.
+                client.appendAudio(ByteArray(gap * ulawPayload.size * 3))
+            }
+            // gap > 8: resync after a big jump, don't fill
+        }
+        rtMicLastSeq = seq
+        rtMicSeqValid = true
+        val pcm16k = AudioCodec.ulawDecode(ulawPayload)
+        client.appendAudio(AudioCodec.upsample16kTo24k(rtMicConditioner.process(pcm16k)))
+        rtTalking = true
+        mainHandler.removeCallbacks(rtSilenceRunnable)
+        mainHandler.postDelayed(rtSilenceRunnable, RT_SILENCE_AFTER_MS)
+    }
+
     private fun handleControl(data: ByteArray) {
         if (data.isEmpty()) return
         when (data[0].toInt().toChar()) {
             'E' -> {
-                Log.i(TAG, "End marker → processing")
-                processReceivedAudio()
+                if (realtimeMode) {
+                    // Push-to-talk release: the mic stream stops here. The
+                    // RT_SILENCE_AFTER_MS timer feeds server VAD its closing
+                    // silence — no batch processing in realtime mode.
+                    Log.i(TAG, "End marker (realtime) — turn closes via VAD silence")
+                } else {
+                    Log.i(TAG, "End marker → processing")
+                    processReceivedAudio()
+                }
             }
             'S' -> {
                 // Flush stale audio left over from prior quick taps. Firmware emits
                 // exactly one 'S' per utterance and resets its mic seq to 0 at the
                 // same instant, so the next chunk re-anchors the seq tracker cleanly.
                 Log.i(TAG, "Start marker → clearing buffer")
+                if (realtimeMode) rtMicSeqValid = false
                 synchronized(audioChunks) {
                     audioChunks.clear()
                     perfAudioExpectedSeq = -1
@@ -473,7 +637,22 @@ class BleVoiceService(
                 synchronized(currentVideoFrame) { currentVideoFrame.reset() }
             }
             'W' -> {
-                // Video end — fire event with all collected frames
+                // Video end — fire event with all collected frames.
+                // 'W' rides CONTROL while the last frame's data + 'J' ride IMAGE_TX,
+                // so it can overtake the final frame's end marker. If a frame is
+                // still open, salvage it when its buffer is complete per the header
+                // size; otherwise drop it as truncated.
+                if (receivingVideoFrame) {
+                    synchronized(currentVideoFrame) {
+                        if (expectedVideoFrameSize in 1..currentVideoFrame.size()) {
+                            synchronized(videoFrames) { videoFrames.add(currentVideoFrame.toByteArray()) }
+                            Log.w(TAG, "Video end overtook last frame-end marker — salvaged complete frame (${currentVideoFrame.size()} bytes)")
+                        } else {
+                            Log.w(TAG, "Video end overtook last frame-end marker — dropped incomplete frame (${currentVideoFrame.size()}/$expectedVideoFrameSize bytes)")
+                        }
+                        currentVideoFrame.reset()
+                    }
+                }
                 receivingVideo = false
                 receivingVideoFrame = false
                 val frames: List<ByteArray>
@@ -485,81 +664,76 @@ class BleVoiceService(
                 onEvent(BleEvent.VideoReceived(frames))
             }
             'I' -> {
-                // Image or video-frame start: [tag='I'][reserved/flags][4-byte LE length]
+                // LEGACY (pre-in-band firmware): image/video-frame header on CONTROL.
+                // Current firmware sends the header in-band on IMAGE_TX as 'H' so it
+                // can't race the fragments; this branch keeps old firmware working.
                 val isVideoFrame = data.size >= 2 && data[1] == 0x01.toByte()
                 val expectedSize = if (data.size >= 6) {
                     ByteBuffer.wrap(data, 2, 4).order(ByteOrder.LITTLE_ENDIAN).int
                 } else 0
-                if (isVideoFrame) {
-                    Log.d(TAG, "Video frame start ($expectedSize bytes)")
-                    receivingVideoFrame = true
-                    expectedVideoFrameSize = expectedSize
-                    synchronized(currentVideoFrame) { currentVideoFrame.reset() }
-                } else {
-                    Log.i(TAG, "Image start marker (expected $expectedSize bytes)")
-                    perfImageTxStartMs   = System.currentTimeMillis()  // M17
-                    perfExpectedImageSize = expectedSize               // M24
-                    perfImagePacketCount  = 0                          // M24
-                    perfImageExpectedSeq  = 0                          // M24
-                    perfImageSeqGaps      = 0                          // M24
-                    receivingImage = true
-                    receivingVideoFrame = false
-                    synchronized(imageBuffer) { imageBuffer.reset() }
-                    Log.i(TAG, "[PERF-M17] Image transfer start: expected $expectedSize bytes")
-                }
+                startImageReceive(isVideoFrame, expectedSize)
             }
             'J' -> {
-                // Still-image end marker only. Video frame-end ('J') now arrives on
-                // the IMAGE_TX characteristic (see handleImageTx) to avoid the
-                // cross-characteristic delivery race that corrupted video frames.
-                run {
-                    // Still image complete — stash until 'E' arrives
-                    receivingImage = false
-                    synchronized(imageBuffer) {
-                        pendingJpeg = imageBuffer.toByteArray()
-                        imageBuffer.reset()
-                    }
-                    pendingJpegTime = System.currentTimeMillis()  // start the 5s attach window
-                    val imgBytes = pendingJpeg ?: ByteArray(0)
-                    val imgMs = System.currentTimeMillis() - perfImageTxStartMs
-                    val imgThroughput = if (imgMs > 0) imgBytes.size * 1000.0 / imgMs else 0.0
-                    Log.i(TAG, "[PERF-M17] Image transfer complete: ${imgBytes.size} bytes in ${imgMs}ms, $perfImagePacketCount packets")
-                    Log.i(TAG, "[PERF-M18] Image BLE RX throughput: ${String.format("%.0f", imgThroughput)} B/s (${String.format("%.1f", imgThroughput/1024)} KB/s)")
-                    val sizeMatch = imgBytes.size == perfExpectedImageSize
-                    Log.i(TAG, "[PERF-M24] Reassembly: expected=$perfExpectedImageSize assembled=${imgBytes.size} seqGaps=$perfImageSeqGaps → ${if (sizeMatch) "OK" else "SIZE MISMATCH!"}")
-                    // Attempt JPEG decode to verify integrity
-                    if (imgBytes.isNotEmpty()) {
-                        val bm = android.graphics.BitmapFactory.decodeByteArray(imgBytes, 0, imgBytes.size)
-                        Log.i(TAG, "[PERF-M24] JPEG decode: ${if (bm != null) "SUCCESS (${bm.width}x${bm.height})" else "FAILED — corrupted transfer"}")
-                        bm?.recycle()
-                    }
-                    pendingJpeg?.let { onEvent(BleEvent.ImageReceived(it)) }
-                }
+                // LEGACY (pre-in-band firmware): still-image end marker on CONTROL.
+                // Current firmware sends 'J' in-band on IMAGE_TX (see handleImageTx).
+                // Guarded so a stray/duplicate 'J' can't emit an empty image.
+                if (receivingImage) finishStillImage()
             }
         }
     }
 
+    /**
+     * IMAGE_TX carries the whole image path in-band — header, fragments, end
+     * marker — on one characteristic, whose notifications BLE delivers strictly
+     * in order. That makes header-after-data and end-before-data races (which
+     * the old CONTROL-channel markers only papered over with guard delays)
+     * structurally impossible:
+     *   'H' [flags][u32 LE size]  header — flags 0x00 photo, 0x01 video frame
+     *   'I' [seq][jpeg bytes]     data fragment
+     *   'J' [frameIdx]            end of image / video frame
+     */
     private fun handleImageTx(data: ByteArray) {
         if (data.isEmpty()) return
-        // End-of-frame marker for video now arrives on THIS characteristic (aa04),
-        // sharing the ordered notification queue with the frame data — so it can
-        // never overtake the last data fragment. Detect it before the size guard
-        // (the marker is header-only: ['J'][frameIndex]).
-        if (data[0].toInt().toChar() == 'J' && receivingVideoFrame) {
-            receivingVideoFrame = false
-            synchronized(currentVideoFrame) {
-                val frameBytes = currentVideoFrame.toByteArray()
-                synchronized(videoFrames) { videoFrames.add(frameBytes) }
-                currentVideoFrame.reset()
+        when (data[0].toInt().toChar()) {
+            'H' -> {
+                if (data.size < 6) return
+                val isVideoFrame = data[1] == 0x01.toByte()
+                val expectedSize = ByteBuffer.wrap(data, 2, 4).order(ByteOrder.LITTLE_ENDIAN).int
+                startImageReceive(isVideoFrame, expectedSize)
+                return
             }
-            Log.d(TAG, "Video frame ${data.getOrNull(1)?.toInt() ?: 0} complete (${videoFrames.size} frames so far)")
-            return
+            'J' -> {
+                // Header-only marker: ['J'][frameIndex] — checked before the size
+                // guard below.
+                if (receivingVideoFrame) {
+                    receivingVideoFrame = false
+                    synchronized(currentVideoFrame) {
+                        val frameBytes = currentVideoFrame.toByteArray()
+                        synchronized(videoFrames) { videoFrames.add(frameBytes) }
+                        currentVideoFrame.reset()
+                    }
+                    Log.d(TAG, "Video frame ${data.getOrNull(1)?.toInt() ?: 0} complete (${videoFrames.size} frames so far)")
+                } else if (receivingImage) {
+                    finishStillImage()
+                }
+                return
+            }
         }
+        if (data[0].toInt().toChar() != 'I') return
         if (data.size <= HEADER_SIZE) return
         val payload = data.copyOfRange(HEADER_SIZE, data.size)
+        val fragSeq = data[1].toInt() and 0xFF
+        // Recover a dropped 'H' header: fragments always start at seq 0, so a
+        // seq-0 fragment with no open transfer means the header was lost in its
+        // connection event — open an implicit transfer (final JPEG decode still
+        // guards integrity). A non-zero seq is a genuine mid-stream orphan.
+        if (!receivingImage && !receivingVideoFrame && fragSeq == 0) {
+            Log.w(TAG, "Image header missed — recovering from seq-0 fragment")
+            startImageReceive(false, 0)
+        }
         if (receivingVideoFrame) {
             synchronized(currentVideoFrame) { currentVideoFrame.write(payload) }
-        } else {
+        } else if (receivingImage) {
             // M24: detect dropped fragments via the 1-byte seq in the header.
             // The seq wraps 0..255; any jump > 1 means notification(s) were lost,
             // which corrupts the JPEG. This confirms whether the firmware-side
@@ -573,6 +747,79 @@ class BleVoiceService(
             perfImageExpectedSeq = (seq + 1) and 0xFF
             synchronized(imageBuffer) { imageBuffer.write(payload) }
             perfImagePacketCount++  // M24: count fragments
+        } else {
+            // No open transfer — a fragment arrived before its header (possible
+            // only with legacy CONTROL-header firmware) or after a reset. Dropping
+            // it beats silently corrupting the next image's reassembly buffer.
+            Log.w(TAG, "Stray image fragment (${payload.size} bytes) with no open transfer — dropped")
+        }
+    }
+
+    /**
+     * Begin image/video-frame reassembly — shared by the in-band 'H' header
+     * (current firmware) and the legacy CONTROL 'I' header (old firmware).
+     */
+    private fun startImageReceive(isVideoFrame: Boolean, expectedSize: Int) {
+        if (isVideoFrame) {
+            Log.d(TAG, "Video frame start ($expectedSize bytes)")
+            receivingVideoFrame = true
+            expectedVideoFrameSize = expectedSize
+            synchronized(currentVideoFrame) { currentVideoFrame.reset() }
+        } else {
+            Log.i(TAG, "Image start marker (expected $expectedSize bytes)")
+            perfImageTxStartMs   = System.currentTimeMillis()  // M17
+            perfExpectedImageSize = expectedSize               // M24
+            perfImagePacketCount  = 0                          // M24
+            perfImageExpectedSeq  = 0                          // M24
+            perfImageSeqGaps      = 0                          // M24
+            receivingImage = true
+            receivingVideoFrame = false
+            synchronized(imageBuffer) { imageBuffer.reset() }
+            Log.i(TAG, "[PERF-M17] Image transfer start: expected $expectedSize bytes")
+        }
+    }
+
+    /** Still image complete — stash until 'E' arrives (5 s attach window). */
+    private fun finishStillImage() {
+        receivingImage = false
+        synchronized(imageBuffer) {
+            pendingJpeg = imageBuffer.toByteArray()
+            imageBuffer.reset()
+        }
+        pendingJpegTime = System.currentTimeMillis()  // start the 5s attach window
+        val imgBytes = pendingJpeg ?: ByteArray(0)
+        val imgMs = System.currentTimeMillis() - perfImageTxStartMs
+        val imgThroughput = if (imgMs > 0) imgBytes.size * 1000.0 / imgMs else 0.0
+        Log.i(TAG, "[PERF-M17] Image transfer complete: ${imgBytes.size} bytes in ${imgMs}ms, $perfImagePacketCount packets")
+        Log.i(TAG, "[PERF-M18] Image BLE RX throughput: ${String.format("%.0f", imgThroughput)} B/s (${String.format("%.1f", imgThroughput/1024)} KB/s)")
+        val sizeMatch = imgBytes.size == perfExpectedImageSize
+        Log.i(TAG, "[PERF-M24] Reassembly: expected=$perfExpectedImageSize assembled=${imgBytes.size} seqGaps=$perfImageSeqGaps → ${if (sizeMatch) "OK" else "SIZE MISMATCH!"}")
+        // Attempt JPEG decode to verify integrity
+        if (imgBytes.isNotEmpty()) {
+            val bm = android.graphics.BitmapFactory.decodeByteArray(imgBytes, 0, imgBytes.size)
+            Log.i(TAG, "[PERF-M24] JPEG decode: ${if (bm != null) "SUCCESS (${bm.width}x${bm.height})" else "FAILED — corrupted transfer"}")
+            bm?.recycle()
+        }
+        pendingJpeg?.let { onEvent(BleEvent.ImageReceived(it)) }
+
+        // Realtime mode: feed the photo straight into the realtime conversation
+        // as an input_image — the spoken question (already streaming) references
+        // it. Consumed here so it can never fall through to the legacy vision path.
+        if (realtimeMode) {
+            val client = realtimeClient
+            val jpeg = pendingJpeg
+            pendingJpeg = null
+            if (client != null && jpeg != null && jpeg.isNotEmpty()) {
+                Thread {
+                    try {
+                        if (!client.sendImage(jpeg)) {
+                            Log.w(TAG, "Realtime image send failed (socket down?)")
+                        }
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Realtime image send error", e)
+                    }
+                }.apply { isDaemon = true; start() }
+            }
         }
     }
 
@@ -658,6 +905,137 @@ class BleVoiceService(
         }
         Log.e(TAG, "Control marker '$tag' write FAILED after $attempts attempts")
         return false
+    }
+
+    /**
+     * Control marker via write-WITHOUT-response, with the same queue-busy retry.
+     * Used for the realtime-mode markers ('M'/'m'): a response PDU can fail with
+     * ATT "Insufficient Resource" while the server's buffers are full of mic
+     * notifications (realtime_ble.py hit exactly this). ATT is sequential, so
+     * ordering versus audio writes still holds.
+     */
+    private fun writeControlMarkerNoResponse(tag: Char): Boolean {
+        val ctrl = controlChar ?: return false
+        val g = gatt ?: return false
+        @Suppress("DEPRECATION")
+        ctrl.value = byteArrayOf(tag.code.toByte(), 0)
+        ctrl.writeType = BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
+        var attempts = 0
+        while (attempts < 100 && isConnected) {
+            @Suppress("DEPRECATION")
+            if (g.writeCharacteristic(ctrl)) return true
+            try { Thread.sleep(2) } catch (_: InterruptedException) { return false }
+            attempts++
+        }
+        Log.e(TAG, "Control marker '$tag' (no-response) write FAILED after $attempts attempts")
+        return false
+    }
+
+    // ── Realtime downlink: response audio → glasses speaker ──
+
+    private fun ensureRtDownThread() {
+        synchronized(rtDownQueue) {
+            if (rtDownThread?.isAlive == true) return
+            rtDownThread = Thread { rtDownlinkLoop() }.apply {
+                name = "RtDownlink"
+                isDaemon = true
+                start()
+            }
+        }
+    }
+
+    /**
+     * Drains the realtime downlink queue for as long as the link is up and
+     * realtime mode is on. Per response (mirrors realtime_ble.py):
+     *   first delta  → 'S' marker, reset seq + token bucket
+     *   each chunk   → ['A'][seq][µ-law] packets on AUDIO_RX, WRITE_NO_RESPONSE,
+     *                  paced RT_DL_BURST burst then RT_DL_BPS sustained
+     *   response.done→ 'E' marker
+     * The 'X' barge-in aborts exactly like the TTS path: stop streaming, skip
+     * the rest of this response, and deliberately do NOT send the trailing 'E'.
+     */
+    private fun rtDownlinkLoop() {
+        var respOpen = false
+        var seq = 0
+        var dlT0 = 0L
+        var dlSent = 0L
+        try {
+            while (isConnected && realtimeMode) {
+                val item = rtDownQueue.poll(500, java.util.concurrent.TimeUnit.MILLISECONDS)
+                    ?: continue
+                when (item) {
+                    is RtDown.Audio -> {
+                        if (item.first) {
+                            ttsCancelled = false   // fresh response — clear any barge-in
+                            // Without 'S' the firmware ignores every audio write —
+                            // abort this response rather than stream into the void.
+                            if (!writeControlMarker('S')) {
+                                onEvent(BleEvent.Error("Playback start marker failed — realtime response dropped"))
+                                respOpen = false
+                                continue
+                            }
+                            respOpen = true
+                            seq = 0
+                            dlT0 = System.currentTimeMillis()
+                            dlSent = 0
+                        }
+                        if (!respOpen || ttsCancelled) continue
+                        val rx = audioRxChar ?: continue
+                        val g = gatt ?: continue
+                        // µ-law is 1 byte/sample — no even-byte rounding needed.
+                        val maxPayload = (negotiatedMtu - 3 - HEADER_SIZE).coerceAtLeast(20)
+                        var off = 0
+                        while (off < item.ulaw.size && isConnected && !ttsCancelled) {
+                            val frag = minOf(maxPayload, item.ulaw.size - off)
+                            // Token bucket: RT_DL_BURST up front, then RT_DL_BPS.
+                            while (dlSent + frag > RT_DL_BURST +
+                                (System.currentTimeMillis() - dlT0) * RT_DL_BPS / 1000 &&
+                                isConnected && !ttsCancelled
+                            ) {
+                                Thread.sleep(10)
+                            }
+                            if (!isConnected || ttsCancelled) break
+                            val pkt = ByteArray(HEADER_SIZE + frag)
+                            pkt[0] = 'A'.code.toByte()
+                            pkt[1] = (seq and 0xFF).toByte()
+                            System.arraycopy(item.ulaw, off, pkt, HEADER_SIZE, frag)
+                            @Suppress("DEPRECATION")
+                            rx.value = pkt
+                            rx.writeType = BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
+                            // Same queue-busy retry as the TTS path: a false return
+                            // is a SILENT drop → seq gap → crackle on the glasses.
+                            var queued = false
+                            var attempts = 0
+                            while (!queued && attempts < 100 && isConnected && !ttsCancelled) {
+                                @Suppress("DEPRECATION")
+                                queued = g.writeCharacteristic(rx)
+                                if (!queued) {
+                                    Thread.sleep(2)
+                                    attempts++
+                                }
+                            }
+                            if (!queued) Log.w(TAG, "Realtime BLE write dropped (seq=$seq)")
+                            seq++
+                            off += frag
+                            dlSent += frag
+                        }
+                    }
+                    is RtDown.End -> {
+                        if (respOpen && !ttsCancelled && isConnected) {
+                            Thread.sleep(30)
+                            writeControlMarker('E')
+                        }
+                        // After a barge-in, deliberately no 'E' — a late 'E' could
+                        // land after the 'S' of the next response and kill it.
+                        respOpen = false
+                    }
+                }
+            }
+        } catch (_: InterruptedException) {
+            // teardown
+        } catch (e: Exception) {
+            Log.e(TAG, "Realtime downlink error", e)
+        }
     }
 
     private fun sendAudioToEsp32(pcm: ByteArray) {

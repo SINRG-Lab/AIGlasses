@@ -22,3 +22,8 @@ void   cameraDiscardSnapshot();    // free the held snapshot (safe if none)
 // Video streaming — caller must return every grabbed frame
 camera_fb_t* cameraGrabFrame(int retries);
 void         cameraReturnFrame(camera_fb_t* fb);
+
+// Live-video mode: drop the sensor to a low resolution + high JPEG compression
+// so each frame is only a handful of BLE fragments (~12 fps instead of ~5).
+// Photos/vision use the full-quality mode. Restore before the next snapshot.
+void cameraSetVideoMode(bool on);
