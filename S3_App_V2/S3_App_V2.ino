@@ -194,6 +194,14 @@ static void updateLed() {
 // ────────────────────────────────────────────────────────────────
 void setup() {
   Serial.begin(115200);
+#if ARDUINO_USB_CDC_ON_BOOT
+  // Untethered operation (USB-C power brick / battery, no computer): with
+  // CDC-on-boot, every Serial print BLOCKS up to the CDC TX timeout once the
+  // buffer fills because no host ever drains it — boot crawls and the mic
+  // streaming loop stalls mid-utterance. Timeout 0 = drop log bytes instantly
+  // when nobody is listening; prints behave normally when a computer attaches.
+  Serial.setTxTimeoutMs(0);
+#endif
   delay(1000);
 
   LOGI("\n\n============================================================");
