@@ -6,7 +6,26 @@ static bool     sCameraOk = false;
 static uint8_t* sJpeg = nullptr;
 static size_t   sJpegLen = 0;
 
+// Route-matched quality profile (see cameraSetHighBandwidth)
+static bool sHighBw = false;
+
 bool cameraAvailable() { return sCameraOk; }
+
+// Let AEC/AGC resettle after a sensor mode switch (first frames come out
+// dark/garbled otherwise).
+static void resettle(int frames) {
+  for (int i = 0; i < frames; i++) {
+    camera_fb_t* w = esp_camera_fb_get();
+    if (w) esp_camera_fb_return(w);
+  }
+}
+
+static void applyPhotoMode() {
+  sensor_t* s = esp_camera_sensor_get();
+  if (!s) return;
+  s->set_framesize(s, sHighBw ? CAM_PHOTO_FRAMESIZE_WIFI : CAM_PHOTO_FRAMESIZE_BLE);
+  s->set_quality(s,   sHighBw ? CAM_PHOTO_QUALITY_WIFI   : CAM_PHOTO_QUALITY_BLE);
+}
 
 bool cameraInit() {
   camera_config_t config = {};
@@ -31,8 +50,10 @@ bool cameraInit() {
   config.xclk_freq_hz = 20000000;
   config.pixel_format = PIXFORMAT_JPEG;
   config.grab_mode    = CAMERA_GRAB_LATEST;
-  config.frame_size   = FRAMESIZE_QVGA;   // 320x240 — fewer BLE fragments, less packet loss
-  config.jpeg_quality = 12;
+  // Init at the LARGEST profile size so the PSRAM frame buffers can hold it;
+  // the sensor is immediately switched down to the active profile below.
+  config.frame_size   = CAM_INIT_FRAMESIZE;
+  config.jpeg_quality = CAM_PHOTO_QUALITY_BLE;
   config.fb_count     = 2;
   config.fb_location  = CAMERA_FB_IN_PSRAM;
 
@@ -53,7 +74,9 @@ bool cameraInit() {
     s->set_awb_gain(s, 1);
     s->set_exposure_ctrl(s, 1);
     s->set_gain_ctrl(s, 1);
+    s->set_lenc(s, 1);          // lens shading correction — helps corners a lot
   }
+  applyPhotoMode();             // drop from init size to the active profile
 
   // Warm up the sensor — the OV2640/OV3660 outputs garbage or NULL frames
   // until the AEC/AWB loops have converged (~300–500 ms after clock start).
@@ -117,38 +140,11 @@ void cameraDiscardSnapshot() {
   }
 }
 
-camera_fb_t* cameraGrabFrame(int retries) {
-  if (!sCameraOk) return nullptr;
-  camera_fb_t* fb = nullptr;
-  for (int attempt = 1; attempt <= retries; attempt++) {
-    fb = esp_camera_fb_get();
-    if (fb) break;
-    delay(50);
-  }
-  return fb;
-}
-
-void cameraReturnFrame(camera_fb_t* fb) {
-  if (fb) esp_camera_fb_return(fb);
-}
-
-void cameraSetVideoMode(bool on) {
+void cameraSetHighBandwidth(bool on) {
+  if (sHighBw == on) return;
+  sHighBw = on;
   if (!sCameraOk) return;
-  sensor_t* s = esp_camera_sensor_get();
-  if (!s) return;
-  if (on) {
-    // QQVGA 160x120 + high compression → ~1.5-2 KB/frame ≈ 4-5 BLE fragments,
-    // vs QVGA's ~6 KB ≈ 12+. Framesize change reallocates internally; the
-    // pre-allocated PSRAM buffers (sized for QVGA at init) comfortably fit.
-    s->set_framesize(s, FRAMESIZE_QQVGA);
-    s->set_quality(s, 24);          // higher number = smaller file
-  } else {
-    s->set_framesize(s, FRAMESIZE_QVGA);
-    s->set_quality(s, 12);
-  }
-  // Let AEC/AGC resettle after the mode switch (first frames may be dark).
-  for (int i = 0; i < 2; i++) {
-    camera_fb_t* w = esp_camera_fb_get();
-    if (w) esp_camera_fb_return(w);
-  }
+  LOGI("[CAM] photo profile → %s", on ? "HIGH (WiFi, SVGA)" : "LOW (BLE, QVGA)");
+  applyPhotoMode();
+  resettle(1);
 }

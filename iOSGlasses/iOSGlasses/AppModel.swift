@@ -2,17 +2,19 @@ import Foundation
 import Observation
 import UIKit
 
-/// Top-level coordinator: owns the BLE link, the OpenAI Realtime session, the
-/// gallery and settings, and publishes UI state.
+/// Top-level coordinator: owns the glasses link (BLE + WiFi), the OpenAI
+/// Realtime session, the gallery and settings, and publishes UI state.
 ///
 /// Data flow (mirrors the hardware-validated realtime_ble.py):
-///   glasses mic --BLE 'A' µ-law@16k--> BleManager --decode+AGC+resample-->
+///   glasses mic --BLE 'A' µ-law@16k--> LinkManager --decode+AGC+resample-->
 ///     RealtimeSession (input_audio_buffer.append, PCM16@24k)
 ///   RealtimeSession (response.output_audio.delta, PCM16@24k) --µ-law encode-->
-///     BleManager ('S2' + paced 'A' frames + 'E') --> glasses speaker
+///     LinkManager/BLE ('S2' + paced 'A' frames + 'E') --> glasses speaker
 ///
-/// The realtime session outlives BLE drops: BleManager reconnects, rewrites
-/// 'M' and the conversation continues.
+/// One-step activation: the app connects BLE on launch and starts the voice
+/// session by itself whenever an API key is saved and the glasses are
+/// connected. The websocket reconnects with exponential backoff (2/4/8…30 s)
+/// if it drops; the glasses interaction stays pure push-to-talk.
 @MainActor
 @Observable
 final class AppModel {
@@ -35,7 +37,9 @@ final class AppModel {
     // Sub-systems
     let settings = SettingsStore()
     let gallery = GalleryStore()
-    let ble = BleManager()
+    let link = LinkManager()
+    /// Convenience for views/diagnostics that show radio-level BLE state.
+    var ble: BleManager { link.ble }
     @ObservationIgnored private var realtime: RealtimeSession?
     @ObservationIgnored private let mic = MicConditioner()
 
@@ -51,23 +55,29 @@ final class AppModel {
     private(set) var pendingPhoto: GalleryStore.Photo?
     private(set) var photoAttached = false
 
-    // Live video (MJPEG frames from the glasses camera)
-    private(set) var isReceivingVideo = false
-    private(set) var liveFrame: UIImage?
-    private(set) var videoFps = 0.0
-    @ObservationIgnored private var frameTimes: [Date] = []
+    // One-step activation
+    /// True unless the user explicitly stopped voice (Settings). Auto-start
+    /// fires whenever (wanted && key present && BLE connected && not running).
+    @ObservationIgnored private var voiceWanted = true
+    @ObservationIgnored private var reconnectDelay: TimeInterval = 2
+    @ObservationIgnored private var reconnectTask: Task<Void, Never>?
+
+    var voiceAutoEnabled: Bool { voiceWanted }
 
     init() {
-        wireBle()
+        wireLink()
         log("app started")
+        // One-step activation: bring the radio up immediately; voice follows
+        // as soon as the glasses connect (if an API key is saved).
+        link.connect()
     }
 
-    // MARK: BLE wiring
+    // MARK: Link wiring (BLE + WiFi behind one facade)
 
-    private func wireBle() {
-        ble.onLog = { [weak self] line in self?.log("[ble] \(line)") }
+    private func wireLink() {
+        link.onLog = { [weak self] line in self?.log(line) }
 
-        ble.onMicAudio = { [weak self] pcm16k in
+        link.onMicAudio = { [weak self] pcm16k in
             guard let self, let rt = self.realtime else { return }
             let conditioned = self.mic.process(pcm16k)
             self.micGain = self.mic.gain
@@ -75,7 +85,7 @@ final class AppModel {
             rt.appendMic(pcm24k: Resampler.upsample16to24(conditioned))
         }
 
-        ble.onPhoto = { [weak self] jpeg in
+        link.onPhoto = { [weak self] jpeg in
             guard let self else { return }
             do {
                 let photo = try self.gallery.save(jpeg: jpeg)
@@ -87,32 +97,10 @@ final class AppModel {
             }
         }
 
-        // Live video (triple-tap the glasses to start; tap to stop). BLE
-        // callbacks fire on the main queue (CBCentralManager queue: nil), so
-        // touching @Observable UI state directly here is safe.
-        ble.onVideoStart = { [weak self] in
-            self?.isReceivingVideo = true
-            self?.frameTimes.removeAll()
-            self?.log("live video started")
-        }
-        ble.onVideoEnd = { [weak self] in
-            self?.isReceivingVideo = false
-            self?.videoFps = 0
-            self?.log("live video ended")
-        }
-        ble.onVideoFrame = { [weak self] jpeg in
-            guard let self else { return }
-            if let img = UIImage(data: jpeg) { self.liveFrame = img }
-            let now = Date()
-            self.frameTimes.append(now)
-            self.frameTimes.removeAll { now.timeIntervalSince($0) > 2 }
-            self.videoFps = Double(self.frameTimes.count) / 2.0
-        }
-
         // Vision gesture (tap-then-hold on the glasses): the photo arrives up
         // front and is injected straight into the live conversation; the voice
         // spoken during the hold is the question. Fully hands-free.
-        ble.onVisionPhoto = { [weak self] jpeg in
+        link.onVisionPhoto = { [weak self] jpeg in
             guard let self else { return }
             if let photo = try? self.gallery.save(jpeg: jpeg) { self.pendingPhoto = photo }
             if self.voiceEnabled, let rt = self.realtime {
@@ -124,39 +112,65 @@ final class AppModel {
             }
         }
 
-        ble.onBargeIn = { [weak self] in
+        link.onBargeIn = { [weak self] in
             guard let self else { return }
             if self.voiceEnabled { self.voiceStatus = .listening }
         }
 
-        ble.onConnected = { [weak self] in
+        link.onConnected = { [weak self] in
             guard let self else { return }
             self.mic.reset()
+            self.maybeStartVoice()
         }
     }
 
     // MARK: Connection controls
 
-    func connectGlasses() { ble.connect() }
+    func connectGlasses() { link.connect() }
 
     func disconnectGlasses() {
-        if voiceEnabled { stopVoice() }
-        ble.disconnect()
+        stopVoice()
+        link.disconnectAll()
     }
 
-    // MARK: Voice session
+    // MARK: Voice session (auto-started, self-healing)
 
-    func toggleVoice() {
-        if voiceEnabled { stopVoice() } else { startVoice() }
+    /// Start voice if everything it needs is in place. Called on launch, on
+    /// every glasses connect, after saving an API key, and by the retry timer.
+    private func maybeStartVoice() {
+        guard voiceWanted, !voiceEnabled else { return }
+        guard !settings.apiKey.isEmpty else { return }        // no key — chip explains
+        guard ble.isConnected else { return }                 // voice rides BLE
+        startVoiceSession()
     }
 
-    func startVoice() {
-        guard !voiceEnabled else { return }
-        let key = settings.apiKey
-        guard !key.isEmpty else {
-            lastError = "Set your OpenAI API key in Settings first."
-            return
-        }
+    /// User affordance: clear the error/backoff and try again right now.
+    func retryVoiceNow() {
+        voiceWanted = true
+        reconnectDelay = 2
+        reconnectTask?.cancel()
+        reconnectTask = nil
+        lastError = nil
+        link.connect()
+        maybeStartVoice()
+    }
+
+    /// Manual off switch (Settings) — stays off until retried.
+    func stopVoice() {
+        voiceWanted = false
+        reconnectTask?.cancel()
+        reconnectTask = nil
+        guard voiceEnabled || realtime != nil else { return }
+        voiceEnabled = false
+        voiceStatus = .off
+        link.setVoiceMode(false)
+        link.cancelResponse()
+        realtime?.close()
+        realtime = nil
+        log("voice OFF (manual)")
+    }
+
+    private func startVoiceSession() {
         lastError = nil
         userTranscript = ""
         assistantTranscript = ""
@@ -166,27 +180,28 @@ final class AppModel {
         realtime = rt
         voiceEnabled = true
         voiceStatus = .connecting
-        rt.connect(apiKey: key,
+        rt.connect(apiKey: settings.apiKey,
                    model: settings.model,
                    effort: settings.reasoningEffort,
                    voice: settings.voice)
-
-        // Bring the radio up too (idempotent) and switch the glasses into
-        // realtime µ-law voice mode.
-        ble.connect()
-        ble.setVoiceMode(true)
+        link.setVoiceMode(true)
         log("voice ON (model \(settings.model))")
     }
 
-    func stopVoice() {
-        guard voiceEnabled else { return }
-        voiceEnabled = false
-        voiceStatus = .off
-        ble.setVoiceMode(false)
-        ble.cancelResponse()
-        realtime?.close()
-        realtime = nil
-        log("voice OFF")
+    /// The websocket died while voice is wanted: exponential backoff
+    /// (2/4/8…30 s cap), surfaced through the error banner.
+    private func scheduleVoiceReconnect(reason: String) {
+        guard voiceWanted else { return }
+        let delay = reconnectDelay
+        reconnectDelay = min(reconnectDelay * 2, 30)
+        lastError = "\(reason) — retrying in \(Int(delay)) s"
+        voiceStatus = .connecting
+        reconnectTask?.cancel()
+        reconnectTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+            guard let self, !Task.isCancelled else { return }
+            self.maybeStartVoice()
+        }
     }
 
     private func wireRealtime(_ rt: RealtimeSession) {
@@ -195,17 +210,19 @@ final class AppModel {
         rt.onOpen = { [weak self] in
             guard let self, self.voiceEnabled else { return }
             self.voiceStatus = .listening
+            self.reconnectDelay = 2        // healthy session → fresh backoff
+            self.lastError = nil
         }
 
         rt.onAudioDelta = { [weak self] pcm24k in
             guard let self else { return }
             if self.voiceEnabled { self.voiceStatus = .speaking }
-            self.ble.enqueueResponseAudio(ulaw: ULaw.encode(pcm16: pcm24k))
+            self.link.enqueueResponseAudio(ulaw: ULaw.encode(pcm16: pcm24k))
         }
 
         rt.onResponseDone = { [weak self] in
             guard let self else { return }
-            self.ble.finishResponse()
+            self.link.finishResponse()
             if self.voiceEnabled { self.voiceStatus = .listening }
         }
 
@@ -244,10 +261,14 @@ final class AppModel {
         rt.onClosed = { [weak self] reason in
             guard let self else { return }
             self.log("realtime connection closed: \(reason)")
-            if self.voiceEnabled {
-                self.lastError = "Voice connection closed: \(reason)"
-                self.stopVoice()
-            }
+            guard self.voiceEnabled else { return }
+            self.voiceEnabled = false
+            self.link.cancelResponse()
+            self.realtime?.close()
+            self.realtime = nil
+            // Keep the glasses in voice mode ('M' stays set) — the session is
+            // coming back; flapping 'M'/'m' across a 2 s retry buys nothing.
+            self.scheduleVoiceReconnect(reason: "Voice connection closed: \(reason)")
         }
     }
 
@@ -258,7 +279,7 @@ final class AppModel {
     func askAboutPendingPhoto() {
         guard let photo = pendingPhoto else { return }
         guard let rt = realtime, voiceEnabled else {
-            lastError = "Turn voice on first, then attach the photo."
+            lastError = "Voice isn't connected yet — retry voice first."
             return
         }
         guard let jpeg = try? Data(contentsOf: photo.url) else {

@@ -28,12 +28,58 @@
 // Pacing between fragments: one fragment per connection event
 #define BLE_FRAG_DELAY_MS       5   // mic audio fragments
 #define BLE_IMG_FRAG_DELAY_MS  15   // photo fragments (large one-shot bursts)
-#define BLE_VID_FRAG_DELAY_MS   7   // live-video fragments (small QQVGA frames,
-                                    // paced tighter for ~12 fps; each frame is
-                                    // self-contained so an occasional drop just
-                                    // skips one frame)
 // notifyWithRetry: max retries while the NimBLE TX buffer drains
 #define BLE_NOTIFY_MAX_TRIES   50   // x 5 ms = ~250 ms worst case
+// LL tuning after connect is STAGGERED from bleTick() (three simultaneous LL
+// procedures during iOS's own MTU/discovery is a known early-drop trigger):
+#define BLE_TUNE_CONN_PARAMS_MS  300   // +300 ms: conn params 7.5-15 ms / timeout 5 s
+#define BLE_TUNE_PHY_MS          600   // +600 ms: request 2M PHY (1M+2M mask)
+#define BLE_TUNE_DLE_MS          900   // +900 ms: data-length extension 251/2120
+
+// ────────────────────────────────────────────────────────────────
+//  WiFi link (SoftAP + TCP) — optional BULK data plane next to the
+//  always-on BLE link. OFF by default; the app enables it with 'F'
+//  on CONTROL and the glasses answer with 'N' + these credentials.
+//  See wifi_link.h and docs/WIFI_LINK.md.
+// ────────────────────────────────────────────────────────────────
+#define WIFI_AP_SSID_PREFIX  "AIGlasses-"   // + last two MAC bytes, e.g. AIGlasses-3F2A
+#define WIFI_AP_PASS         "glasses-link" // WPA2 (8+ chars)
+#define WIFI_AP_CHANNEL      1   // RF scan 2026-07-20: ch6 had 5 competing APs
+                                 // in the lab, ch1 was empty. Rescan with
+                                 // `system_profiler SPAirPortDataType` if the
+                                 // link gets bursty again — congestion moves.
+#define WIFI_TCP_PORT        5005
+#define WIFI_PROTO_VERSION   1              // sent in the 'R' hello on connect
+// Max inner packet per frame (header + payload). TCP segments it; no
+// radio-side pacing needed.
+#define WIFI_FRAME_MAX       4096
+#define WIFI_MAX_PAYLOAD     (WIFI_FRAME_MAX - 2)   // minus TAG+SEQ inner header
+#define WIFI_WRITE_TIMEOUT_MS  2000   // stalled socket → drop client
+#define WIFI_READ_TIMEOUT_MS   3000   // mid-frame silence → protocol desync
+// Liveness watchdog: the app pings ('P' on CONTROL) every 2 s per transport.
+// No ping on the WiFi socket for this long → the socket is dead, close it.
+// (BLE relies on the 5 s supervision timeout instead.)
+#define WIFI_PING_TIMEOUT_MS   10000
+#define WIFI_AP_AT_BOOT      0        // 1 = SoftAP from boot (dev convenience,
+                                      // ~100 mA extra draw — keep 0 for demos)
+
+// ────────────────────────────────────────────────────────────────
+//  Transport routing + link statistics (link.cpp)
+//  BLE is ALWAYS the control + realtime-voice plane. Photos route
+//  per image: WiFi only when the socket is healthy AND measured
+//  faster than BLE — when in doubt, BLE.
+// ────────────────────────────────────────────────────────────────
+#define LINK_STATS_PERIOD_MS   5000  // [LINK-STATS] serial line + 'T' packet cadence
+#define LINK_PING_STALE_MS     6000  // no app ping on WiFi for this long → route BLE
+                                     // (3 missed 2 s pings, matches the app's rule)
+#define LINK_BLE_SEED_KBS      30.0f // assumed BLE image throughput until measured
+                                     // (bench: ~34 KB/s ceiling on IMAGE_TX)
+#define LINK_WIFI_REMEASURE_MS 60000 // a WiFi measurement older than this is stale —
+                                     // probe the route again with one photo
+#define LINK_WIFI_PROBE_MIN_RSSI (-80) // don't probe an unmeasured WiFi route when the
+                                       // client's RSSI says edge-of-range — pings can
+                                       // survive at -85 dBm while throughput is far
+                                       // below BLE ("when in doubt, BLE")
 
 // ────────────────────────────────────────────────────────────────
 //  I2S pins — XIAO ESP32-S3 Sense
@@ -125,7 +171,18 @@
 #define CAM_WARMUP_FRAMES_BOOT     5   // discarded at init (AEC/AWB convergence)
 #define CAM_WARMUP_FRAMES_CAPTURE  4   // discarded before each snapshot
 #define CAM_CAPTURE_RETRIES        5
-#define CAM_VIDEO_FRAME_RETRIES    3
+
+// Route-matched photo profiles (link.cpp switches them when the preferred
+// image route changes). BLE budget is ~34 KB/s, so BLE photos are deliberately
+// small; the WiFi socket moves 10x+ that, so capture accordingly. jpeg
+// quality: LOWER number = better image, bigger file.
+#define CAM_PHOTO_FRAMESIZE_BLE    FRAMESIZE_QVGA    // 320x240, ~8 KB
+#define CAM_PHOTO_QUALITY_BLE      12
+#define CAM_PHOTO_FRAMESIZE_WIFI   FRAMESIZE_SVGA    // 800x600, ~40-70 KB
+#define CAM_PHOTO_QUALITY_WIFI     10
+// Frame buffers are allocated for this size at init — must be ≥ the largest
+// profile above or the sensor can't be switched up to it later.
+#define CAM_INIT_FRAMESIZE         FRAMESIZE_SVGA
 
 // ────────────────────────────────────────────────────────────────
 //  Logging — set LOG_VERBOSE to 0 to silence per-chunk chatter

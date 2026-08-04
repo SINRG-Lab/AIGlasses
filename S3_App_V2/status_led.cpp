@@ -30,10 +30,5 @@ void ledTick() {
     case LED_SOLID:      writeLed(true);  break;
     case LED_SLOW_BLINK: writeLed((t % 1000) < 100); break;     // short flash each second
     case LED_FAST_BLINK: writeLed((t % 200) < 100); break;
-    case LED_DOUBLE_BLINK: {
-      unsigned long phase = t % 1000;                            // blink-blink-pause
-      writeLed(phase < 80 || (phase >= 160 && phase < 240));
-      break;
-    }
   }
 }

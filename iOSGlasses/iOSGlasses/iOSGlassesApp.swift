@@ -17,8 +17,6 @@ struct ContentView: View {
         TabView {
             HomeView()
                 .tabItem { Label("Home", systemImage: "house.fill") }
-            LiveView()
-                .tabItem { Label("Live", systemImage: "video.fill") }
             GalleryView()
                 .tabItem { Label("Gallery", systemImage: "photo.on.rectangle") }
             SettingsView()

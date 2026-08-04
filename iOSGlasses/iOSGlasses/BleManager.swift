@@ -5,10 +5,13 @@ import Observation
 /// BLE Central for the SINRG Lab AI glasses (ESP32-S3, NimBLE peripheral).
 ///
 /// GATT layout (service aa00):
-///   aa01 AUDIO_TX  NOTIFY      mic -> phone   ['A'][seq u8][µ-law @16 kHz]
+///   aa01 AUDIO_TX  NOTIFY      mic -> phone   ['A'][seq u8][audio @16 kHz —
+///                              µ-law while 'M' voice mode is on, else PCM16]
 ///   aa02 AUDIO_RX  WRITE_NR    phone -> spkr  ['A'][seq u8][µ-law @24 kHz]
 ///   aa03 CONTROL   WRITE+NOTIFY markers: 'M'/'m' voice mode, 'S'/'E' stream
-///                              start/end, 'X' barge-in, legacy image headers
+///                              start/end, 'X' barge-in, 'P' ping echo,
+///                              'F'/'f'→'N' WiFi bootstrap, 'T' fw stats,
+///                              legacy image headers
 ///   aa04 IMAGE_TX  NOTIFY      ['H'][flags][len u32 LE], ['I'][seq][jpeg], ['J'][idx]
 ///
 /// Hard-won CoreBluetooth rules baked in (from bench debugging on macOS —
@@ -54,6 +57,17 @@ final class BleManager: NSObject {
         var dupPerSec = 0.0
         var lostPerSec = 0.0
         var txBytesPerSec = 0.0     // response audio to the glasses
+        var rxBytesPerSec = 0.0     // everything off the radio (audio+image+control)
+        var rxBytesTotal = 0
+        var txBytesTotal = 0
+        // Ping / RTT ('P' echo on CONTROL)
+        var rttMs = 0.0             // last sample; 0 = none yet
+        var rttAvgMs = 0.0
+        var rttMinMs = 0.0
+        var rttMaxMs = 0.0
+        var pingsSent = 0
+        var pingsLost = 0
+        var imageSeqGapsTotal = 0
         var reconnects = 0
     }
 
@@ -69,12 +83,15 @@ final class BleManager: NSObject {
     @ObservationIgnored var onMicAudio: ((Data) -> Void)?   // PCM16 @16 kHz, seq-filtered
     @ObservationIgnored var onPhoto: ((Data) -> Void)?      // complete JPEG
     @ObservationIgnored var onVisionPhoto: ((Data) -> Void)? // vision-gesture photo → realtime
-    @ObservationIgnored var onVideoFrame: ((Data) -> Void)? // one live MJPEG frame
-    @ObservationIgnored var onVideoStart: (() -> Void)?
-    @ObservationIgnored var onVideoEnd: (() -> Void)?
+    /// Fires once per completed photo: (bytes, seconds) — for transfer records.
+    @ObservationIgnored var onPhotoStats: ((Int, TimeInterval) -> Void)?
+    /// Raw firmware 'T' stats packet from CONTROL (includes the tag byte).
+    @ObservationIgnored var onStatsPacket: ((Data) -> Void)?
     @ObservationIgnored var onBargeIn: (() -> Void)?        // 'X' from the glasses
     @ObservationIgnored var onLog: ((String) -> Void)?
     @ObservationIgnored var onConnected: (() -> Void)?
+    /// 'N' answer to our 'F': the glasses' SoftAP is up. (ssid, pass, host, port)
+    @ObservationIgnored var onWifiInfo: ((String, String, String, UInt16) -> Void)?
 
     // MARK: Private BLE state
 
@@ -88,6 +105,11 @@ final class BleManager: NSObject {
     @ObservationIgnored private var shouldStayConnected = false
     @ObservationIgnored private var everConnected = false
     @ObservationIgnored private var voiceModeWanted = false
+    // 10 s first-connect watchdog: central.connect() never times out on iOS,
+    // and a wedged GATT setup (stale cache, notify-enable stall) looks
+    // "connecting" forever. The watchdog cancels + rescans instead.
+    @ObservationIgnored private var connectAttempt = 0
+    @ObservationIgnored private var connectTimeoutTask: Task<Void, Never>?
 
     // Uplink (mic) sequence tracking
     @ObservationIgnored private var micSeq: Int? = nil
@@ -104,14 +126,14 @@ final class BleManager: NSObject {
 
     // Image reassembly
     @ObservationIgnored private var receivingImage = false
-    @ObservationIgnored private var receivingVideoFrame = false
+    @ObservationIgnored private var discardingVideoFrame = false   // legacy fw live video
     @ObservationIgnored private var pendingImageIsVision = false   // header flags 0x02
-    @ObservationIgnored private var videoSessionActive = false
-    @ObservationIgnored private var videoFrameCount = 0
     @ObservationIgnored private var expectedImageSize = 0
     @ObservationIgnored private var imageBuffer = Data()
     @ObservationIgnored private var imageSeqExpected = 0
     @ObservationIgnored private var imageSeqGaps = 0
+    @ObservationIgnored private var imageStarted = Date()
+    @ObservationIgnored private var loggedLegacyVideo = false
 
     // Rolling stats counters (reset every 2 s by the stats loop)
     @ObservationIgnored private var statRecv = 0
@@ -119,7 +141,15 @@ final class BleManager: NSObject {
     @ObservationIgnored private var statDup = 0
     @ObservationIgnored private var statLost = 0
     @ObservationIgnored private var statTxBytes = 0
+    @ObservationIgnored private var statRxBytes = 0
     @ObservationIgnored private var statsTask: Task<Void, Never>?
+
+    // Live RTT ping ('P' on CONTROL, echoed verbatim by the firmware)
+    @ObservationIgnored private var pingSeq: UInt32 = 0
+    @ObservationIgnored private var pingSent: [UInt32: Date] = [:]
+    @ObservationIgnored private var rttSum = 0.0
+    @ObservationIgnored private var rttCount = 0
+    @ObservationIgnored private var missedPings = 0
 
     override init() {
         super.init()
@@ -128,8 +158,67 @@ final class BleManager: NSObject {
                 try? await Task.sleep(nanoseconds: 2_000_000_000)
                 guard let self else { return }
                 self.rollStats()
+                self.sendPing()
             }
         }
+    }
+
+    // MARK: Ping / liveness
+
+    private func sendPing() {
+        guard isConnected else {
+            stats.rttMs = 0
+            pingSent.removeAll()
+            missedPings = 0
+            return
+        }
+        // Liveness: a working link echoes in ms, so a ping still outstanding
+        // when the next one goes out counts as missed. Three in a row means
+        // the link is wedged (CoreBluetooth still says connected, nothing
+        // moves) — force a disconnect so the normal rescan path recovers it.
+        if !pingSent.isEmpty {
+            missedPings += pingSent.count
+            stats.pingsLost += pingSent.count
+            pingSent.removeAll()
+            if missedPings >= 3 {
+                log("3 pings unanswered — BLE link is wedged, forcing reconnect")
+                missedPings = 0
+                if let p = peripheral {
+                    central?.cancelPeripheralConnection(p)
+                } else {
+                    handleDisconnect(nil)
+                }
+                return
+            }
+        } else {
+            missedPings = 0
+        }
+        pingSeq &+= 1
+        let id = pingSeq
+        pingSent[id] = Date()
+        stats.pingsSent += 1
+        var bytes: [UInt8] = [UInt8(ascii: "P")]
+        withUnsafeBytes(of: id.littleEndian) { bytes.append(contentsOf: $0) }
+        // Wait for buffer space like every other control write — a bare WWR
+        // is silently dropped when CoreBluetooth's buffer is full (e.g. mid
+        // TTS burst), which would fake a missed ping. The clock restarts at
+        // the actual write so RTT measures the link, not our queue.
+        Task {
+            await self.awaitCanSendWWR()
+            guard self.isConnected, self.pingSent[id] != nil else { return }
+            self.pingSent[id] = Date()
+            self.writeControlNow(bytes)
+        }
+    }
+
+    private func recordRtt(_ ms: Double) {
+        stats.rttMs = ms
+        rttSum += ms
+        rttCount += 1
+        stats.rttAvgMs = rttSum / Double(rttCount)
+        stats.rttMinMs = stats.rttMinMs == 0 ? ms : min(stats.rttMinMs, ms)
+        stats.rttMaxMs = max(stats.rttMaxMs, ms)
+        missedPings = 0
     }
 
     // MARK: Public API
@@ -183,6 +272,16 @@ final class BleManager: NSObject {
         ensureSender()
     }
 
+    /// Raw control write ('F'/'f' WiFi link on/off, …) with the same
+    /// buffer-drain wait as every other control marker.
+    func writeControlBytes(_ bytes: [UInt8]) {
+        guard isConnected else { return }
+        Task {
+            await self.awaitCanSendWWR()
+            self.writeControlNow(bytes)
+        }
+    }
+
     /// Barge-in / voice-off: drop everything immediately. Deliberately no 'E' —
     /// a late 'E' could land after the 'S' of the next response and kill it.
     func cancelResponse() {
@@ -209,6 +308,9 @@ final class BleManager: NSObject {
 
     private func handleDisconnect(_ error: Error?) {
         let wasConnected = connectionState == .connected
+        connectAttempt += 1                  // invalidates the connect watchdog
+        connectTimeoutTask?.cancel()
+        connectTimeoutTask = nil
         audioTxChar = nil
         audioRxChar = nil
         controlChar = nil
@@ -218,9 +320,10 @@ final class BleManager: NSObject {
         micSeq = nil
         cancelResponse()
         receivingImage = false
-        receivingVideoFrame = false
-        if videoSessionActive { videoSessionActive = false; onVideoEnd?() }
+        discardingVideoFrame = false
         imageBuffer.removeAll()
+        pingSent.removeAll()
+        missedPings = 0
         connectionState = .disconnected
         if wasConnected {
             log("BLE dropped\(error.map { ": \($0.localizedDescription)" } ?? "") — reconnecting (voice session continues)")
@@ -269,10 +372,40 @@ final class BleManager: NSObject {
         if let img { p.setNotifyValue(true, for: img) }
     }
 
+    /// Section-7 robustness: an attempt that stalls anywhere between connect()
+    /// and full subscription is abandoned after 10 s. Canceling the peripheral
+    /// forces a fresh discovery on the next attempt, which clears the stale
+    /// GATT cache that causes most first-connect hangs.
+    private func startConnectWatchdog() {
+        connectAttempt += 1
+        let attempt = connectAttempt
+        connectTimeoutTask?.cancel()
+        connectTimeoutTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 10_000_000_000)
+            guard let self, !Task.isCancelled,
+                  self.connectAttempt == attempt, self.connectionState != .connected else { return }
+            self.log("connect attempt timed out after 10 s — canceling and rescanning")
+            self.failConnectAttempt()
+        }
+    }
+
+    /// Abandon the in-flight connect attempt and go back to scanning.
+    private func failConnectAttempt() {
+        if let p = peripheral {
+            central?.cancelPeripheralConnection(p)
+            // A canceled *pending* connect does not always call the
+            // didDisconnect delegate — clean up directly. handleDisconnect is
+            // idempotent if the delegate fires anyway.
+        }
+        handleDisconnect(nil)
+    }
+
     private func finishSubscription() {
         // Need AUDIO_TX + CONTROL (+ IMAGE_TX when present) notifying.
         let wanted = imageTxChar == nil ? 2 : 3
         guard notifyReadyCount >= wanted, connectionState != .connected else { return }
+        connectTimeoutTask?.cancel()
+        connectTimeoutTask = nil
         connectionState = .connected
         let mtu = writePayloadMax + 3
         attMTU = mtu
@@ -304,6 +437,11 @@ final class BleManager: NSObject {
         statRecv += 1
         let seq = Int(data[data.startIndex + 1])
         let payload = data.subdata(in: (data.startIndex + 2)..<data.endIndex)
+        // Firmware µ-law-encodes mic audio only while realtime voice mode
+        // ('M') is active; otherwise it streams raw PCM16 (V2 behavior).
+        // Decode per OUR commanded mode — unconditional µ-law decoding turned
+        // PCM16 frames into full-scale garbage.
+        let pcm = voiceModeWanted ? ULaw.decode(payload) : payload
         if let last = micSeq {
             // Stale double-subscription on CoreBluetooth can deliver the stream
             // twice, interleaved with a lag. Anything at-or-behind the last
@@ -316,16 +454,16 @@ final class BleManager: NSObject {
             let gap = delta - 1
             if gap > 0 && gap <= 8 {
                 // Small real loss: zero-fill to keep server VAD timing sane
-                // (x2: the lost payloads were µ-law, we forward PCM16).
+                // (sized in forwarded PCM16 bytes, whatever the wire codec).
                 statLost += gap
-                onMicAudio?(Data(count: 2 * gap * payload.count))
+                onMicAudio?(Data(count: gap * pcm.count))
             } else if gap > 8 {
                 statLost += 1   // resync after a big jump, don't fill
             }
         }
         micSeq = seq
         statAccepted += 1
-        onMicAudio?(ULaw.decode(payload))
+        onMicAudio?(pcm)
     }
 
     // MARK: Downlink — paced response audio
@@ -435,17 +573,31 @@ final class BleManager: NSObject {
             log("glasses: barge-in ('X') — aborting response audio")
             cancelResponse()
             onBargeIn?()
-        case "V":
-            videoSessionActive = true
-            videoFrameCount = 0
-            receivingVideoFrame = false
-            log("glasses: video session start — live view")
-            onVideoStart?()
-        case "W":
-            videoSessionActive = false
-            receivingVideoFrame = false
-            log("glasses: video session end (\(videoFrameCount) frames)")
-            onVideoEnd?()
+        case "V", "W":
+            // Live video was removed; a stray marker from older firmware is
+            // harmless — one log line and move on.
+            log("legacy video marker '\(Character(UnicodeScalar(first)))' — ignored (feature removed)")
+        case "P":
+            // Our ping, echoed back: ['P'][id u32 LE]
+            guard data.count >= 5 else { return }
+            let id = data.subdata(in: (data.startIndex + 1)..<(data.startIndex + 5))
+                .withUnsafeBytes { $0.loadUnaligned(as: UInt32.self) }.littleEndian
+            if let sent = pingSent.removeValue(forKey: id) {
+                recordRtt(Date().timeIntervalSince(sent) * 1000.0)
+            }
+        case "T":
+            // Firmware link-stats packet, every 5 s. Parsed upstairs.
+            onStatsPacket?(data)
+        case "N":
+            // WiFi bootstrap answer: 'N' + "ssid\npass\nip\nport"
+            guard let text = String(data: data.dropFirst(), encoding: .utf8) else { return }
+            let parts = text.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+            guard parts.count >= 4, let port = UInt16(parts[3]) else {
+                log("malformed 'N' WiFi info: \(text)")
+                return
+            }
+            log("glasses WiFi AP: \(parts[0]) @ \(parts[2]):\(parts[3])")
+            onWifiInfo?(parts[0], parts[1], parts[2], port)
         case "I":
             // LEGACY (pre-in-band firmware): image header on CONTROL.
             // ['I'][flags][len u32 LE]
@@ -479,25 +631,26 @@ final class BleManager: NSObject {
                 .withUnsafeBytes { $0.loadUnaligned(as: UInt32.self) })
             startImageReceive(isVideoFrame: isVideoFrame, expectedSize: expected, legacy: false)
         case "J":
-            if receivingVideoFrame {
-                finishVideoFrame()
+            if discardingVideoFrame {
+                discardingVideoFrame = false
+                imageBuffer.removeAll()
             } else if receivingImage {
                 finishStillImage()
             }
         case "I":
             guard data.count > 2 else { return }
+            if discardingVideoFrame { return }   // legacy video payload — drop
             let payload = data.subdata(in: (data.startIndex + 2)..<data.endIndex)
             let seq = Int(data[data.startIndex + 1])
-            if !receivingImage && !receivingVideoFrame {
+            if !receivingImage {
                 // Recover a dropped 'H' header: fragments always start at seq 0,
                 // so a seq-0 fragment with no open transfer means the header was
-                // lost in its connection event — open an implicit transfer. During
-                // a video session it's a video frame; otherwise a still photo.
+                // lost in its connection event — open an implicit transfer.
                 // Integrity is still guarded at frame completion. A non-zero seq
                 // is a genuine mid-stream orphan and stays dropped.
                 if seq == 0 {
-                    startImageReceive(isVideoFrame: videoSessionActive, expectedSize: 0, legacy: false)
-                    if !videoSessionActive { log("image header missed — recovering from seq-0 fragment") }
+                    startImageReceive(isVideoFrame: false, expectedSize: 0, legacy: false)
+                    log("image header missed — recovering from seq-0 fragment")
                 } else {
                     log("stray image fragment (\(payload.count) B, seq \(seq)) — dropped")
                     return
@@ -506,9 +659,8 @@ final class BleManager: NSObject {
             if seq != imageSeqExpected {
                 let gap = (seq - imageSeqExpected) & 0xFF
                 imageSeqGaps += gap
-                if !receivingVideoFrame {   // gaps are normal/expected in live video
-                    log("image SEQ gap: expected \(imageSeqExpected) got \(seq) (~\(gap) lost)")
-                }
+                stats.imageSeqGapsTotal += gap
+                log("image SEQ gap: expected \(imageSeqExpected) got \(seq) (~\(gap) lost)")
             }
             imageSeqExpected = (seq + 1) & 0xFF
             imageBuffer.append(payload)
@@ -518,31 +670,23 @@ final class BleManager: NSObject {
     }
 
     private func startImageReceive(isVideoFrame: Bool, expectedSize: Int, legacy: Bool) {
+        // Live video was removed; a video-flagged transfer from older firmware
+        // is swallowed whole (header + fragments + end) with one log line.
+        discardingVideoFrame = isVideoFrame
         receivingImage = !isVideoFrame
-        receivingVideoFrame = isVideoFrame
         expectedImageSize = expectedSize
         imageSeqExpected = 0
         imageSeqGaps = 0
         imageBuffer.removeAll()
-        if !isVideoFrame {
+        imageStarted = Date()
+        if isVideoFrame {
+            if !loggedLegacyVideo {
+                loggedLegacyVideo = true
+                log("legacy video frame from firmware — discarding (feature removed)")
+            }
+        } else {
             log("photo incoming\(legacy ? " (legacy header)" : ""): \(expectedSize) B expected")
         }
-    }
-
-    /// One live MJPEG frame complete. Unlike stills, a bad frame is dropped
-    /// silently — the next is ~80 ms away, nothing to recover. A frame that
-    /// lost any fragment (seqGaps > 0) is *partially* corrupt: it still has a
-    /// valid SOI but decodes with wrong colors/blocks, so drop those too rather
-    /// than flash garbage.
-    private func finishVideoFrame() {
-        receivingVideoFrame = false
-        let jpeg = imageBuffer
-        imageBuffer = Data()
-        guard imageSeqGaps == 0,
-              jpeg.count >= 2,
-              jpeg[jpeg.startIndex] == 0xFF, jpeg[jpeg.startIndex + 1] == 0xD8 else { return }
-        videoFrameCount += 1
-        onVideoFrame?(jpeg)
     }
 
     private func finishStillImage() {
@@ -558,7 +702,10 @@ final class BleManager: NSObject {
             ? " (SIZE MISMATCH, expected \(expectedImageSize))" : ""
         let isVision = pendingImageIsVision
         pendingImageIsVision = false
-        log("\(isVision ? "vision" : "photo") complete: \(jpeg.count) B, seqGaps=\(imageSeqGaps)\(sizeNote)")
+        let elapsed = Date().timeIntervalSince(imageStarted)
+        log(String(format: "%@ complete: %d B in %.0f ms, seqGaps=%d%@",
+                   isVision ? "vision" : "photo", jpeg.count, elapsed * 1000.0, imageSeqGaps, sizeNote))
+        onPhotoStats?(jpeg.count, elapsed)
         if isVision { onVisionPhoto?(jpeg) } else { onPhoto?(jpeg) }
     }
 
@@ -570,11 +717,15 @@ final class BleManager: NSObject {
         stats.dupPerSec = Double(statDup) / 2.0
         stats.lostPerSec = Double(statLost) / 2.0
         stats.txBytesPerSec = Double(statTxBytes) / 2.0
+        stats.rxBytesPerSec = Double(statRxBytes) / 2.0
+        stats.txBytesTotal += statTxBytes
+        stats.rxBytesTotal += statRxBytes
         statRecv = 0
         statAccepted = 0
         statDup = 0
         statLost = 0
         statTxBytes = 0
+        statRxBytes = 0
     }
 
     private func log(_ line: String) {
@@ -614,6 +765,7 @@ extension BleManager: @preconcurrency CBCentralManagerDelegate {
         deviceName = peripheral.name ?? "AIGlasses"
         connectionState = .connecting
         log("found \(deviceName) (RSSI \(RSSI)) — connecting…")
+        startConnectWatchdog()
         central.connect(peripheral, options: nil)
     }
 
@@ -624,12 +776,14 @@ extension BleManager: @preconcurrency CBCentralManagerDelegate {
 
     func centralManager(_ central: CBCentralManager,
                         didFailToConnect peripheral: CBPeripheral, error: Error?) {
+        guard peripheral === self.peripheral else { return }   // stale attempt
         log("connect failed: \(error?.localizedDescription ?? "unknown")")
         handleDisconnect(error)
     }
 
     func centralManager(_ central: CBCentralManager,
                         didDisconnectPeripheral peripheral: CBPeripheral, error: Error?) {
+        guard peripheral === self.peripheral else { return }   // stale attempt
         handleDisconnect(error)
     }
 }
@@ -641,13 +795,13 @@ extension BleManager: @preconcurrency CBPeripheralDelegate {
     func peripheral(_ peripheral: CBPeripheral, didDiscoverServices error: Error?) {
         guard error == nil, let services = peripheral.services else {
             log("service discovery failed: \(error?.localizedDescription ?? "no services")")
-            central?.cancelPeripheralConnection(peripheral)
+            failConnectAttempt()
             return
         }
         let matches = services.filter { $0.uuid == Self.serviceUUID }
         guard !matches.isEmpty else {
             log("voice service not found on peripheral")
-            central?.cancelPeripheralConnection(peripheral)
+            failConnectAttempt()
             return
         }
         // Discover chars on EVERY matching instance; the last complete one wins.
@@ -669,7 +823,11 @@ extension BleManager: @preconcurrency CBPeripheralDelegate {
                     didUpdateNotificationStateFor characteristic: CBCharacteristic,
                     error: Error?) {
         if let error {
-            log("notify enable failed for \(characteristic.uuid): \(error.localizedDescription)")
+            // A notify-enable failure means the GATT session is unusable
+            // (usually a stale cache) — abandon the attempt; the rescan's
+            // fresh discovery clears it.
+            log("notify enable failed for \(characteristic.uuid): \(error.localizedDescription) — rescanning")
+            failConnectAttempt()
             return
         }
         guard characteristic.isNotifying else { return }
@@ -680,6 +838,7 @@ extension BleManager: @preconcurrency CBPeripheralDelegate {
     func peripheral(_ peripheral: CBPeripheral,
                     didUpdateValueFor characteristic: CBCharacteristic, error: Error?) {
         guard error == nil, let data = characteristic.value, !data.isEmpty else { return }
+        statRxBytes += data.count
         switch characteristic.uuid {
         case Self.audioTxUUID: handleMicFrame(data)
         case Self.imageTxUUID: handleImageTx(data)
