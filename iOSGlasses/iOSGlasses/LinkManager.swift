@@ -288,6 +288,35 @@ final class LinkManager {
 
     func connect() { ble.connect() }
 
+    // MARK: App lifecycle
+
+    @ObservationIgnored private var inBackground = false
+
+    /// Backgrounded: iOS suspends us between BLE events (bluetooth-central
+    /// background mode). The TCP bulk lane cannot survive suspension — close
+    /// it deliberately so it doesn't die mid-photo, and skip redial churn
+    /// that would just burn the background execution window. BLE stays up;
+    /// photos ride Bluetooth while backgrounded.
+    func enterBackground() {
+        inBackground = true
+        redialTask?.cancel()
+        ble.clearPingLiveness()
+        if wifi.isConnected || wifiPhase == .connecting {
+            onLog?("[link] backgrounded — closing Wi-Fi bulk lane (BLE carries everything)")
+            wifiPhase = .off
+            wifi.disconnect()
+        }
+    }
+
+    func enterForeground() {
+        inBackground = false
+        ble.clearPingLiveness()
+        if wifiWanted && !wifi.isConnected {
+            redialsLeft = 8
+            startWifiBootstrap()
+        }
+    }
+
     func disconnectAll() {
         disableWifiLink()
         ble.disconnect()
@@ -338,6 +367,7 @@ final class LinkManager {
     /// another network.
     private func scheduleRedial(reason: String) {
         guard wifiWanted else { wifiPhase = .off; return }
+        guard !inBackground else { wifiPhase = .off; return }   // resumes on foreground
         if redialsLeft <= 0 {
             let ssid = wifiSsid.isEmpty ? "the glasses' Wi-Fi" : wifiSsid
             let pass = wifiPass.isEmpty ? "glasses-link" : wifiPass
