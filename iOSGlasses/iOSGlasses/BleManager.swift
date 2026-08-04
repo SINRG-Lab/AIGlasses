@@ -223,14 +223,27 @@ final class BleManager: NSObject {
 
     // MARK: Public API
 
+    /// Restore identifier: with the bluetooth-central background mode, iOS
+    /// relaunches the app for BLE events on this central after termination
+    /// and hands the live connection back via willRestoreState.
+    private static let restoreId = "com.sinrglab.iOSGlasses.central"
+
     func connect() {
         shouldStayConnected = true
         if central == nil {
-            central = CBCentralManager(delegate: self, queue: nil)
+            central = CBCentralManager(delegate: self, queue: nil,
+                                       options: [CBCentralManagerOptionRestoreIdentifierKey: Self.restoreId])
             // scan starts from centralManagerDidUpdateState once powered on
         } else {
             startScanIfPossible()
         }
+    }
+
+    /// Background transition: any in-flight ping was frozen with us — clear
+    /// the liveness state so resuming can't misread it as a wedged link.
+    func clearPingLiveness() {
+        pingSent.removeAll()
+        missedPings = 0
     }
 
     func disconnect() {
@@ -740,10 +753,39 @@ final class BleManager: NSObject {
 // which satisfies the MainActor isolation at runtime.
 extension BleManager: @preconcurrency CBCentralManagerDelegate {
 
+    /// iOS relaunched us in the background for a BLE event: re-adopt the
+    /// peripheral it kept alive on our behalf. Service discovery restarts
+    /// from centralManagerDidUpdateState once the stack reports poweredOn.
+    func centralManager(_ central: CBCentralManager, willRestoreState dict: [String: Any]) {
+        guard peripheral == nil,
+              let restored = (dict[CBCentralManagerRestoredStatePeripheralsKey] as? [CBPeripheral])?.first
+        else { return }
+        peripheral = restored
+        restored.delegate = self
+        deviceName = restored.name ?? "AIGlasses"
+        shouldStayConnected = true
+        connectionState = .connecting
+        log("relaunched by iOS — restoring \(deviceName)")
+    }
+
     func centralManagerDidUpdateState(_ central: CBCentralManager) {
         switch central.state {
         case .poweredOn:
-            startScanIfPossible()
+            if let p = peripheral {
+                // Restored by state restoration (normal runs never reach
+                // poweredOn with a peripheral already retained).
+                switch p.state {
+                case .connected:
+                    p.discoverServices([Self.serviceUUID])
+                case .connecting:
+                    break   // iOS's pending connect survives the relaunch
+                default:
+                    connectionState = .connecting
+                    central.connect(p, options: nil)
+                }
+            } else {
+                startScanIfPossible()
+            }
         case .unauthorized:
             log("Bluetooth permission denied — enable it in iOS Settings")
             connectionState = .disconnected

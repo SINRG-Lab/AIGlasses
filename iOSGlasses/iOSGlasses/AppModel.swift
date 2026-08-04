@@ -1,5 +1,6 @@
 import Foundation
 import Observation
+import SwiftUI
 import UIKit
 
 /// Top-level coordinator: owns the glasses link (BLE + WiFi), the OpenAI
@@ -131,6 +132,25 @@ final class AppModel {
     func disconnectGlasses() {
         stopVoice()
         link.disconnectAll()
+    }
+
+    // MARK: App lifecycle (background operation)
+
+    /// The app runs in the background on BLE events (bluetooth-central mode):
+    /// glasses traffic wakes us, voice keeps flowing, photos ride Bluetooth.
+    /// Foregrounding re-checks everything the suspension may have broken.
+    func scenePhaseChanged(to phase: ScenePhase) {
+        switch phase {
+        case .background:
+            link.enterBackground()
+        case .active:
+            link.enterForeground()
+            // The websocket may have died while suspended and its backoff
+            // timer was frozen with us — if voice should be on, nudge it now.
+            if voiceWanted && !voiceEnabled { maybeStartVoice() }
+        default:
+            break
+        }
     }
 
     // MARK: Voice session (auto-started, self-healing)
