@@ -81,8 +81,9 @@ Stale `expectedSeq` — fixed in V2 (`playbackOnStart` resets sequence tracking)
 
 ## Gestures
 
-**Triple-tap starts a photo instead of video (V1 only).**
-Design flaw fixed in V2: the photo is held until the 600 ms tap window closes.
+**Triple-tap does nothing.**
+By design since Transport V2: the live-video feature was removed, so a quick
+triple-tap only logs `[APP] Quick triple-tap — video feature removed`.
 
 **Taps register twice / not at all.**
 Tune `DEBOUNCE_MS` (15 ms default). If the button reads HIGH at boot, the

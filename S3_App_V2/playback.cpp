@@ -156,7 +156,11 @@ void playbackTick() {
       resetState();
       return;
     }
-    if (avail >= STREAM_START_THRESHOLD || ((sEndMarker || stalled) && avail > 0)) {
+    // Clamp to the actual ring: a degraded (internal-RAM fallback) ring can
+    // be smaller than STREAM_START_THRESHOLD and would otherwise never start.
+    size_t startThresh = STREAM_START_THRESHOLD;
+    if (ringCapacity() > 0 && ringCapacity() / 2 < startThresh) startThresh = ringCapacity() / 2;
+    if (avail >= startThresh || ((sEndMarker || stalled) && avail > 0)) {
       LOGI("[STREAM] Starting playback (%u bytes buffered)", (unsigned)avail);
       if (!speakerInit()) {
         LOGI("[STREAM] Speaker init failed — aborting playback");

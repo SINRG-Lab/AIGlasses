@@ -10,7 +10,6 @@ enum LedPattern {
   LED_SLOW_BLINK,     // waiting for BLE connection (1 s period)
   LED_SOLID,          // recording (mic streaming)
   LED_FAST_BLINK,     // TTS playback in progress (200 ms period)
-  LED_DOUBLE_BLINK,   // video recording (blink-blink-pause)
 };
 
 void ledInit();

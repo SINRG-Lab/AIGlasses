@@ -13,7 +13,7 @@ import Foundation
 ///          silence ONCE so server VAD actually hears the turn end.
 /// Downlink: response.output_audio.delta carries base64 24 kHz PCM16.
 @MainActor
-final class RealtimeSession {
+final class RealtimeSession: NSObject {
 
     enum State: String {
         case idle, connecting, open, closed
@@ -42,6 +42,8 @@ final class RealtimeSession {
         "agree with or confirm a statement you only partially heard."
 
     private var ws: URLSessionWebSocketTask?
+    private var session: URLSession?
+    private var model = ""
     private var receiveTask: Task<Void, Never>?
     private var silenceTask: Task<Void, Never>?
     private var talking = false
@@ -55,9 +57,16 @@ final class RealtimeSession {
             onError?("bad model string")
             return
         }
+        self.model = model
         var req = URLRequest(url: url)
         req.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
-        let task = URLSession.shared.webSocketTask(with: req)
+        // Own session with self as delegate: the ONLY way to see why a
+        // handshake failed (HTTP status) or why the server closed us (close
+        // reason). URLSession.shared reports both as a bare ENOTCONN
+        // "Socket is not connected", which is undebuggable in the field.
+        let session = URLSession(configuration: .default, delegate: self, delegateQueue: nil)
+        self.session = session
+        let task = session.webSocketTask(with: req)
         task.maximumMessageSize = 1 << 24
         ws = task
         state = .connecting
@@ -103,6 +112,9 @@ final class RealtimeSession {
         silenceTask = nil
         ws?.cancel(with: .normalClosure, reason: nil)
         ws = nil
+        // Invalidate — the session retains its delegate (us) until told not to.
+        session?.invalidateAndCancel()
+        session = nil
         state = .closed
     }
 
@@ -198,10 +210,35 @@ final class RealtimeSession {
     }
 
     private func handleTransportError(_ error: Error) {
+        // The handshake HTTP status names the real cause; the socket error
+        // ("Socket is not connected") is just the aftermath.
+        let status = (ws?.response as? HTTPURLResponse)?.statusCode
+        finish(reason: Self.describe(error: error, httpStatus: status, model: model))
+    }
+
+    private func finish(reason: String) {
         guard state != .closed else { return }
         state = .closed
         ws = nil
-        onClosed?(error.localizedDescription)
+        session?.invalidateAndCancel()
+        session = nil
+        onClosed?(reason)
+    }
+
+    private static func describe(error: Error, httpStatus: Int?, model: String) -> String {
+        if let code = httpStatus, code != 101 {
+            switch code {
+            case 401: return "OpenAI rejected the API key (HTTP 401) — re-paste it in Settings."
+            case 403: return "OpenAI refused access (HTTP 403) — this key/org can't use \(model)."
+            case 429: return "OpenAI rate/quota limit (HTTP 429) — check billing/credits."
+            default:  return "OpenAI handshake failed (HTTP \(code), model \(model))."
+            }
+        }
+        let ns = error as NSError
+        if ns.domain == NSURLErrorDomain, ns.code == NSURLErrorNotConnectedToInternet {
+            return "No internet connection on the phone."
+        }
+        return error.localizedDescription
     }
 
     // MARK: Event handling
@@ -254,6 +291,31 @@ final class RealtimeSession {
 
         default:
             break
+        }
+    }
+}
+
+// MARK: - URLSessionWebSocketDelegate
+
+// Delegate callbacks arrive on URLSession's queue; hop to the main actor.
+extension RealtimeSession: URLSessionWebSocketDelegate {
+
+    nonisolated func urlSession(_ session: URLSession,
+                                webSocketTask: URLSessionWebSocketTask,
+                                didOpenWithProtocol proto: String?) {
+        Task { @MainActor in
+            self.onLog?("realtime: websocket open (handshake OK)")
+        }
+    }
+
+    nonisolated func urlSession(_ session: URLSession,
+                                webSocketTask: URLSessionWebSocketTask,
+                                didCloseWith closeCode: URLSessionWebSocketTask.CloseCode,
+                                reason: Data?) {
+        let why = reason.flatMap { String(data: $0, encoding: .utf8) } ?? ""
+        Task { @MainActor in
+            self.finish(reason: "server closed the session (code \(closeCode.rawValue))"
+                        + (why.isEmpty ? "" : ": \(why)"))
         }
     }
 }

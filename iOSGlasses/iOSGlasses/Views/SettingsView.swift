@@ -16,6 +16,7 @@ struct SettingsView: View {
                     Button(keySaved ? "Saved ✓" : "Save Key") {
                         app.settings.setAPIKey(apiKeyDraft)
                         keySaved = true
+                        app.retryVoiceNow()   // one-step: a fresh key starts voice
                         Task {
                             try? await Task.sleep(nanoseconds: 1_500_000_000)
                             keySaved = false
@@ -43,9 +44,14 @@ struct SettingsView: View {
                 }
 
                 Section {
-                    LabeledContent("Changes apply", value: "next voice session")
+                    LabeledContent("Voice session", value: app.voiceStatus.rawValue)
+                    if app.voiceEnabled || app.voiceAutoEnabled {
+                        Button("Stop voice", role: .destructive) { app.stopVoice() }
+                    } else {
+                        Button("Start voice") { app.retryVoiceNow() }
+                    }
                 } footer: {
-                    Text("Turn voice off and on again after changing the model, effort, or voice.")
+                    Text("Voice starts automatically when the glasses connect. Model/effort/voice changes apply on the next session — stop and start voice to pick them up.")
                 }
             }
             .navigationTitle("Settings")
