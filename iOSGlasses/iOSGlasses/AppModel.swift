@@ -46,7 +46,9 @@ final class AppModel {
 
     // UI state
     private(set) var voiceEnabled = false
-    private(set) var voiceStatus: VoiceStatus = .off
+    private(set) var voiceStatus: VoiceStatus = .off {
+        didSet { syncLiveActivity() }
+    }
     private(set) var userTranscript = ""
     private(set) var assistantTranscript = ""
     private(set) var micGain = 4.0
@@ -79,7 +81,19 @@ final class AppModel {
         link.onLog = { [weak self] line in self?.log(line) }
 
         link.onMicAudio = { [weak self] pcm16k in
-            guard let self, let rt = self.realtime else { return }
+            guard let self else { return }
+            // Background wake: iOS kills the websocket while we're suspended
+            // and the reconnect backoff timer froze with us. Mic audio arriving
+            // IS the wake signal — revive the session right now. Sends queue
+            // inside URLSession until the handshake completes, so the first
+            // words of the question survive the reconnect.
+            if self.realtime == nil, self.voiceWanted {
+                self.reconnectTask?.cancel()
+                self.maybeStartVoice()
+            }
+            guard let rt = self.realtime else { return }
+            self.extendBackgroundRuntime()
+            self.noteRecordingActivity()
             let conditioned = self.mic.process(pcm16k)
             self.micGain = self.mic.gain
             self.micLevel = min(1.0, Double(self.mic.lastPeak) / 32767.0)
@@ -145,12 +159,75 @@ final class AppModel {
             link.enterBackground()
         case .active:
             link.enterForeground()
+            releaseBackgroundRuntime()
             // The websocket may have died while suspended and its backoff
             // timer was frozen with us — if voice should be on, nudge it now.
             if voiceWanted && !voiceEnabled { maybeStartVoice() }
+            syncLiveActivity()   // activities can only be STARTED in foreground
         default:
             break
         }
+    }
+
+    // MARK: Background runtime (voice exchanges while backgrounded)
+
+    @ObservationIgnored private var bgTask: UIBackgroundTaskIdentifier = .invalid
+    @ObservationIgnored private var bgReleaseTask: Task<Void, Never>?
+
+    /// Hold a background-task assertion while a voice exchange is in flight:
+    /// BLE events alone give only short wake slices, but an assertion buys
+    /// ~30 s of continuous runtime so the websocket and TTS relay survive a
+    /// whole question→answer round trip. Released 15 s after the last audio.
+    private func extendBackgroundRuntime() {
+        if bgTask == .invalid {
+            bgTask = UIApplication.shared.beginBackgroundTask(withName: "voice-exchange") { [weak self] in
+                self?.releaseBackgroundRuntime()
+            }
+        }
+        bgReleaseTask?.cancel()
+        bgReleaseTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 15_000_000_000)
+            guard let self, !Task.isCancelled else { return }
+            self.releaseBackgroundRuntime()
+        }
+    }
+
+    private func releaseBackgroundRuntime() {
+        bgReleaseTask?.cancel()
+        bgReleaseTask = nil
+        if bgTask != .invalid {
+            UIApplication.shared.endBackgroundTask(bgTask)
+            bgTask = .invalid
+        }
+    }
+
+    // MARK: Live Activity (Dynamic Island / Lock Screen)
+
+    @ObservationIgnored private let liveActivity = GlassesLiveActivityController()
+    @ObservationIgnored private var recordingDecayTask: Task<Void, Never>?
+    @ObservationIgnored private var micStreaming = false
+
+    /// Mic frames are the only "recording" signal we have — pulse a flag that
+    /// decays 700 ms after the stream stops (button released).
+    private func noteRecordingActivity() {
+        recordingDecayTask?.cancel()
+        if !micStreaming {
+            micStreaming = true
+            syncLiveActivity()
+        }
+        recordingDecayTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 700_000_000)
+            guard let self, !Task.isCancelled else { return }
+            self.micStreaming = false
+            self.syncLiveActivity()
+        }
+    }
+
+    func syncLiveActivity() {
+        liveActivity.sync(
+            active: voiceEnabled || voiceWanted && voiceStatus != .off,
+            state: .init(status: micStreaming ? "Recording" : voiceStatus.rawValue,
+                         recording: micStreaming))
     }
 
     // MARK: Voice session (auto-started, self-healing)
@@ -187,6 +264,8 @@ final class AppModel {
         link.cancelResponse()
         realtime?.close()
         realtime = nil
+        releaseBackgroundRuntime()
+        liveActivity.end()
         log("voice OFF (manual)")
     }
 
@@ -237,6 +316,7 @@ final class AppModel {
         rt.onAudioDelta = { [weak self] pcm24k in
             guard let self else { return }
             if self.voiceEnabled { self.voiceStatus = .speaking }
+            self.extendBackgroundRuntime()
             self.link.enqueueResponseAudio(ulaw: ULaw.encode(pcm16: pcm24k))
         }
 
