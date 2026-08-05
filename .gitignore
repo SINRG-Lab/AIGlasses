@@ -22,3 +22,6 @@ local.properties
 
 # Claude Code worktrees
 .claude/
+
+# Xcode per-user state
+**/xcuserdata/
