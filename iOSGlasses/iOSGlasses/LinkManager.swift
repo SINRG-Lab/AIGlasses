@@ -217,6 +217,7 @@ final class LinkManager {
     @ObservationIgnored private var wifiPort = LinkManager.defaultPort
     @ObservationIgnored private var redialsLeft = 0
     @ObservationIgnored private var redialTask: Task<Void, Never>?
+    @ObservationIgnored private var slowRetryTask: Task<Void, Never>?
 
     var wifiEnabled: Bool { wifiWanted }
 
@@ -264,6 +265,7 @@ final class LinkManager {
             self.wifiPhase = .active
             self.redialsLeft = 8          // future drops get a full retry budget
             self.redialTask?.cancel()
+            self.slowRetryTask?.cancel()
             // BLE-primary policy: Bluetooth keeps carrying voice + control —
             // the socket is purely a bulk lane, nothing to hand over.
             self.onConnected?()
@@ -300,6 +302,7 @@ final class LinkManager {
     func enterBackground() {
         inBackground = true
         redialTask?.cancel()
+        slowRetryTask?.cancel()
         ble.clearPingLiveness()
         if wifi.isConnected || wifiPhase == .connecting {
             onLog?("[link] backgrounded — closing Wi-Fi bulk lane (BLE carries everything)")
@@ -371,7 +374,8 @@ final class LinkManager {
         if redialsLeft <= 0 {
             let ssid = wifiSsid.isEmpty ? "the glasses' Wi-Fi" : wifiSsid
             let pass = wifiPass.isEmpty ? "glasses-link" : wifiPass
-            wifiPhase = .failed("Photos are on Bluetooth (\(reason)). Join \(ssid) (password \(pass)) in iOS Settings → Wi-Fi — iOS likes to hop back to networks with internet.")
+            wifiPhase = .failed("Photos are on Bluetooth (\(reason)). Auto-retrying — join \(ssid) (password \(pass)) once in iOS Settings → Wi-Fi and it connects by itself.")
+            scheduleSlowRetry()
             return
         }
         redialsLeft -= 1
@@ -387,9 +391,27 @@ final class LinkManager {
     }
 
     /// Tear the WiFi link down and put the glasses' radio away.
+    /// The toggle is a standing auto-connect preference, not a one-shot
+    /// action: after the fast redial budget burns out, keep probing gently
+    /// in the background. The moment the AP is reachable (user joined it in
+    /// Settings, glasses rebooted, walked back in range) the lane comes up
+    /// on its own — no further taps.
+    private func scheduleSlowRetry() {
+        slowRetryTask?.cancel()
+        slowRetryTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 30_000_000_000)
+            guard let self, !Task.isCancelled,
+                  self.wifiWanted, !self.inBackground, !self.wifi.isConnected else { return }
+            self.onLog?("[link] auto Wi-Fi: retrying quietly…")
+            self.redialsLeft = 1
+            self.startWifiBootstrap()
+        }
+    }
+
     func disableWifiLink() {
         wifiWanted = false
         redialTask?.cancel()
+        slowRetryTask?.cancel()
         if wifi.isConnected {
             // Ask the firmware to shut the SoftAP down (saves ~100 mA).
             wifi.sendControl([UInt8(ascii: "f")])

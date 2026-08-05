@@ -84,7 +84,7 @@ struct HomeView: View {
                     if on { app.link.enableWifiLink() } else { app.link.disableWifiLink() }
                 }
             )) {
-                Label("Wi-Fi photo boost", systemImage: "wifi")
+                Label("Auto Wi-Fi photo boost", systemImage: "wifi")
                     .font(.subheadline.weight(.medium))
             }
             if let detail = wifiPhaseDetail {
