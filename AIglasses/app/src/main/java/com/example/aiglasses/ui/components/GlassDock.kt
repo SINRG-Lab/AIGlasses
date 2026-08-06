@@ -7,7 +7,7 @@ import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.GridView
+import androidx.compose.material.icons.filled.Code
 import androidx.compose.material.icons.filled.Home
 import androidx.compose.material.icons.filled.PhotoLibrary
 import androidx.compose.material.icons.filled.Settings
@@ -29,9 +29,9 @@ data class DockItem(
 
 val dockItems = listOf(
     DockItem(Screen.Home, Icons.Filled.Home, "Home"),
-    DockItem(Screen.Features, Icons.Filled.GridView, "Features"),
     DockItem(Screen.Gallery, Icons.Filled.PhotoLibrary, "Gallery"),
-    DockItem(Screen.Settings, Icons.Filled.Settings, "Settings")
+    DockItem(Screen.Settings, Icons.Filled.Settings, "Settings"),
+    DockItem(Screen.Developer, Icons.Filled.Code, "Developer")
 )
 
 @Composable

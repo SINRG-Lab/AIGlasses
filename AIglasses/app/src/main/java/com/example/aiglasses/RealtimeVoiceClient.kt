@@ -12,31 +12,44 @@ import okhttp3.WebSocketListener
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.ByteArrayOutputStream
+import java.net.UnknownHostException
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 
 /**
- * GPT Realtime speech-to-speech client over an OkHttp WebSocket.
+ * One OpenAI GPT Realtime session over an OkHttp WebSocket (GA endpoint, no
+ * beta header). Mirror of iOS RealtimeSession.swift.
  *
- * Mirrors the hardware-validated Python reference (HardwareTest/realtime_ble.py):
- * one long-lived session owns the conversation; it survives any number of BLE
- * drops, and reconnects itself with backoff if the socket fails.
+ * SINGLE-SHOT: each instance opens exactly one socket and reports exactly one
+ * [RealtimeEvent.Disconnected] when it dies. The reconnection policy
+ * (exponential backoff + mic-audio revival) is owned by [GlassesController],
+ * which builds a fresh client per attempt — exactly how iOS AppModel owns
+ * RealtimeSession.
  *
- * Threading: all callbacks in [onEvent] arrive on OkHttp's WebSocket reader
- * thread — consumers must marshal to the main thread for UI state, but should
- * forward audio deltas to the BLE downlink directly (never via the main
- * dispatcher). [appendAudio]/[sendImage] are thread-safe: WebSocket.send()
- * only enqueues onto OkHttp's writer queue.
+ * Uplink:  conditioned mic audio arrives via [appendAudio] as PCM16 @24 kHz.
+ *          The glasses stream mic audio only while the button is held
+ *          (push-to-talk), so server VAD never hears the turn end by itself —
+ *          when frames stop for >250 ms after speech, a watchdog appends
+ *          600 ms of zeros ONCE (mirrors RealtimeSession.startSilenceWatchdog).
+ * Downlink: response.output_audio.delta carries base64 PCM16 @24 kHz.
+ *
+ * Threading: all [onEvent] callbacks arrive on OkHttp's WebSocket reader
+ * thread (or the silence-watchdog/writer threads for Disconnected edge
+ * cases) — consumers marshal UI state to the main thread themselves but
+ * should forward audio deltas to the BLE downlink directly. [appendAudio] /
+ * [sendImage] are thread-safe: WebSocket.send() only enqueues onto OkHttp's
+ * writer queue, and OkHttp buffers messages sent before the handshake
+ * completes, so the first words of a question survive a reconnect.
  */
 class RealtimeVoiceClient(
     private val apiKey: String,
+    private val model: String,
+    private val voice: String,
+    private val effort: String,
     private val onEvent: (RealtimeEvent) -> Unit
 ) {
     companion object {
         private const val TAG = "RealtimeVoiceClient"
-        private const val MODEL = "gpt-realtime-2.1"
-        private const val WS_URL = "wss://api.openai.com/v1/realtime?model=$MODEL"
-        private const val VOICE = "marin"
-        private const val EFFORT = "low"
         private const val INSTRUCTIONS =
             "You are a voice assistant built into a pair of smart glasses. " +
             "Keep answers to one or two spoken sentences — never lists or formatting. " +
@@ -44,15 +57,31 @@ class RealtimeVoiceClient(
             "The microphone is imperfect: if you did not clearly understand the user, " +
             "say so and ask them to repeat — NEVER guess at what they said, and never " +
             "agree with or confirm a statement you only partially heard."
-        private const val RECONNECT_BASE_MS = 1000L
-        private const val RECONNECT_MAX_MS = 30000L
+
+        /** 600 ms of PCM16 silence @24 kHz — the push-to-talk → server-VAD bridge. */
+        private const val SILENCE_TAIL_BYTES = 2 * 24000 * 600 / 1000
+        private const val SILENCE_AFTER_MS = 250L
+
+        // One shared client across sessions: reconnect cycles must not leak
+        // dispatcher/connection-pool threads.
+        private val httpClient: OkHttpClient by lazy {
+            OkHttpClient.Builder()
+                .connectTimeout(15, TimeUnit.SECONDS)
+                .readTimeout(0, TimeUnit.MILLISECONDS)    // WS stays open indefinitely
+                .pingInterval(20, TimeUnit.SECONDS)       // detect dead links promptly
+                .build()
+        }
     }
 
     sealed class RealtimeEvent {
+        /** The session is open (server acked with session.created/updated). */
         data object Connected : RealtimeEvent()
+        /** Terminal — fired at most once per client; never after [close]. */
         data class Disconnected(val reason: String) : RealtimeEvent()
         /** 24 kHz PCM16 LE response audio. [first] marks the first delta of a response. */
-        data class AudioDelta(val pcm: ByteArray, val first: Boolean) : RealtimeEvent()
+        // Plain class: a data class with a ByteArray field generates broken
+        // (reference-equality) equals/hashCode; consumers only pattern-match.
+        class AudioDelta(val pcm: ByteArray, val first: Boolean) : RealtimeEvent()
         data object ResponseDone : RealtimeEvent()
         data class AssistantTranscriptDelta(val text: String) : RealtimeEvent()
         data class UserTranscript(val text: String) : RealtimeEvent()
@@ -61,47 +90,62 @@ class RealtimeVoiceClient(
         data class Error(val message: String) : RealtimeEvent()
     }
 
-    private val client = OkHttpClient.Builder()
-        .connectTimeout(15, TimeUnit.SECONDS)
-        .readTimeout(0, TimeUnit.MILLISECONDS)    // WS stays open indefinitely
-        .pingInterval(20, TimeUnit.SECONDS)       // detect dead links promptly
-        .build()
-
     @Volatile private var webSocket: WebSocket? = null
-    @Volatile private var connected = false
-    @Volatile private var closed = false          // user-requested teardown
+    @Volatile private var sessionOpen = false
+    /** True once the client is dead (user close or socket death). */
+    private val finished = AtomicBoolean(false)
+    private val started = AtomicBoolean(false)
     /** True while an audio response is streaming — used to flag the first delta. */
     @Volatile private var respOpen = false
-    private val reconnectLock = Any()
-    private var reconnecting = false               // guarded by reconnectLock
-    private var reconnectDelayMs = RECONNECT_BASE_MS  // guarded by reconnectLock
+
+    // Silence-tail watchdog state
+    @Volatile private var talking = false
+    @Volatile private var lastMicAtMs = 0L
+    @Volatile private var watchdog: Thread? = null
 
     // ── Public API ──
 
     fun connect() {
-        closed = false
-        synchronized(reconnectLock) { reconnectDelayMs = RECONNECT_BASE_MS }
-        openSocket()
+        if (!started.compareAndSet(false, true)) return
+        val request = Request.Builder()
+            .url("wss://api.openai.com/v1/realtime?model=$model")
+            .header("Authorization", "Bearer $apiKey")
+            .build()
+        val ws = httpClient.newWebSocket(request, socketListener)
+        webSocket = ws
+        // OkHttp queues messages written before the handshake completes, so
+        // the session config goes out first and any early mic audio lines up
+        // behind it — same ordering trick as iOS RealtimeSession.connect.
+        ws.send(buildSessionUpdate())
+        startSilenceWatchdog()
+        Log.i(TAG, "Realtime WS connecting (model $model, effort $effort, voice $voice)")
     }
 
+    /** Deliberate teardown: no Disconnected event will follow. */
     fun close() {
-        closed = true
-        connected = false
+        finished.set(true)
+        sessionOpen = false
         respOpen = false
+        watchdog?.interrupt()
+        watchdog = null
         try { webSocket?.close(1000, "session ended") } catch (_: Exception) {}
         webSocket = null
     }
 
-    fun isConnected(): Boolean = connected
+    fun isConnected(): Boolean = sessionOpen && !finished.get()
 
-    /** Stream mic audio (PCM16 LE @ 24 kHz) into the server's input buffer. */
+    /** Stream mic audio (PCM16 LE @24 kHz) into the server's input buffer. */
     fun appendAudio(pcm24k: ByteArray) {
-        if (!connected || pcm24k.isEmpty()) return
+        if (pcm24k.isEmpty() || finished.get()) return
         val ws = webSocket ?: return
-        val msg = JSONObject()
-            .put("type", "input_audio_buffer.append")
-            .put("audio", Base64.encodeToString(pcm24k, Base64.NO_WRAP))
-        ws.send(msg.toString())
+        talking = true
+        lastMicAtMs = System.currentTimeMillis()
+        ws.send(
+            JSONObject()
+                .put("type", "input_audio_buffer.append")
+                .put("audio", Base64.encodeToString(pcm24k, Base64.NO_WRAP))
+                .toString()
+        )
     }
 
     /**
@@ -110,11 +154,11 @@ class RealtimeVoiceClient(
      * triggers the response — no explicit response.create needed.
      *
      * Re-encodes through Bitmap: ESP32 camera JPEGs have non-standard headers
-     * that OpenAI rejects (same workaround as OpenAIService.visionChat).
-     * Call from a background thread — encoding a photo is not free.
+     * that OpenAI rejects. Call from a background thread — encoding a photo
+     * is not free.
      */
     fun sendImage(jpegBytes: ByteArray): Boolean {
-        if (!connected || jpegBytes.isEmpty()) return false
+        if (jpegBytes.isEmpty() || finished.get()) return false
         val ws = webSocket ?: return false
         val base64: String = try {
             val bitmap = BitmapFactory.decodeByteArray(jpegBytes, 0, jpegBytes.size)
@@ -142,45 +186,66 @@ class RealtimeVoiceClient(
         return ws.send(item.toString())
     }
 
-    // ── Socket lifecycle ──
+    // ── Silence tail (push-to-talk → server VAD bridge) ──
 
-    private fun openSocket() {
-        val request = Request.Builder()
-            .url(WS_URL)
-            .header("Authorization", "Bearer $apiKey")
-            .build()
-        webSocket = client.newWebSocket(request, socketListener)
-    }
-
-    private fun scheduleReconnect(reason: String) {
-        if (closed) return
-        val delay: Long
-        synchronized(reconnectLock) {
-            if (reconnecting) return
-            reconnecting = true
-            delay = reconnectDelayMs
-            reconnectDelayMs = minOf(reconnectDelayMs * 2, RECONNECT_MAX_MS)
-        }
-        Log.w(TAG, "WS down ($reason) — reconnecting in ${delay}ms")
-        Thread {
-            try { Thread.sleep(delay) } catch (_: InterruptedException) {}
-            synchronized(reconnectLock) { reconnecting = false }
-            if (!closed) openSocket()
+    private fun startSilenceWatchdog() {
+        watchdog = Thread {
+            while (!finished.get() && !Thread.currentThread().isInterrupted) {
+                try {
+                    Thread.sleep(100)
+                } catch (_: InterruptedException) {
+                    return@Thread
+                }
+                if (talking && System.currentTimeMillis() - lastMicAtMs > SILENCE_AFTER_MS) {
+                    talking = false
+                    webSocket?.send(
+                        JSONObject()
+                            .put("type", "input_audio_buffer.append")
+                            .put("audio", Base64.encodeToString(
+                                ByteArray(SILENCE_TAIL_BYTES), Base64.NO_WRAP))
+                            .toString()
+                    )
+                }
+            }
         }.apply {
-            name = "RealtimeReconnect"
+            name = "RealtimeSilence"
             isDaemon = true
             start()
         }
     }
 
+    // ── Socket lifecycle ──
+
+    /** Terminal transition — emits Disconnected exactly once. */
+    private fun finish(reason: String) {
+        if (!finished.compareAndSet(false, true)) return
+        sessionOpen = false
+        respOpen = false
+        watchdog?.interrupt()
+        watchdog = null
+        webSocket = null
+        onEvent(RealtimeEvent.Disconnected(reason))
+    }
+
+    private fun describeFailure(t: Throwable, response: Response?): String {
+        // The handshake HTTP status names the real cause; the socket error
+        // is just the aftermath (mirrors iOS RealtimeSession.describe).
+        val code = response?.code
+        if (code != null && code != 101) {
+            return when (code) {
+                401 -> "OpenAI rejected the API key (HTTP 401) — re-paste it in Settings."
+                403 -> "OpenAI refused access (HTTP 403) — this key/org can't use $model."
+                429 -> "OpenAI rate/quota limit (HTTP 429) — check billing/credits."
+                else -> "OpenAI handshake failed (HTTP $code, model $model)."
+            }
+        }
+        if (t is UnknownHostException) return "No internet connection on the phone."
+        return t.message ?: t.javaClass.simpleName
+    }
+
     private val socketListener = object : WebSocketListener() {
         override fun onOpen(ws: WebSocket, response: Response) {
-            Log.i(TAG, "Realtime WS open — model $MODEL, effort $EFFORT")
-            connected = true
-            respOpen = false
-            synchronized(reconnectLock) { reconnectDelayMs = RECONNECT_BASE_MS }
-            ws.send(buildSessionUpdate())
-            onEvent(RealtimeEvent.Connected)
+            Log.i(TAG, "Realtime WS open (handshake OK)")
         }
 
         override fun onMessage(ws: WebSocket, text: String) {
@@ -193,18 +258,12 @@ class RealtimeVoiceClient(
         }
 
         override fun onClosed(ws: WebSocket, code: Int, reason: String) {
-            connected = false
-            respOpen = false
-            onEvent(RealtimeEvent.Disconnected("closed: $code $reason"))
-            scheduleReconnect("closed $code")
+            finish("server closed the session (code $code)" +
+                    if (reason.isEmpty()) "" else ": $reason")
         }
 
         override fun onFailure(ws: WebSocket, t: Throwable, response: Response?) {
-            connected = false
-            respOpen = false
-            val detail = response?.let { "HTTP ${it.code}" } ?: (t.message ?: "failure")
-            onEvent(RealtimeEvent.Disconnected(detail))
-            scheduleReconnect(detail)
+            finish(describeFailure(t, response))
         }
     }
 
@@ -214,6 +273,13 @@ class RealtimeVoiceClient(
         try {
             val ev = JSONObject(raw)
             when (ev.optString("type")) {
+                "session.created", "session.updated" -> {
+                    if (!sessionOpen) {
+                        sessionOpen = true
+                        Log.i(TAG, "Realtime session open — model $model, effort $effort")
+                        onEvent(RealtimeEvent.Connected)
+                    }
+                }
                 "response.output_audio.delta" -> {
                     val b64 = ev.optString("delta")
                     if (b64.isEmpty()) return
@@ -247,7 +313,7 @@ class RealtimeVoiceClient(
         }
     }
 
-    /** Exact GA session schema validated by HardwareTest/realtime_ble.py. */
+    /** Exact GA session.update schema — byte-for-byte the iOS RealtimeSession one. */
     private fun buildSessionUpdate(): String {
         val turnDetection = JSONObject()
             .put("type", "server_vad")
@@ -262,11 +328,11 @@ class RealtimeVoiceClient(
             .put("turn_detection", turnDetection)
         val output = JSONObject()
             .put("format", JSONObject().put("type", "audio/pcm").put("rate", 24000))
-            .put("voice", VOICE)
+            .put("voice", voice)
         val session = JSONObject()
             .put("type", "realtime")
             .put("instructions", INSTRUCTIONS)
-            .put("reasoning", JSONObject().put("effort", EFFORT))
+            .put("reasoning", JSONObject().put("effort", effort))
             .put("output_modalities", JSONArray().put("audio"))
             .put("audio", JSONObject().put("input", input).put("output", output))
         return JSONObject()
