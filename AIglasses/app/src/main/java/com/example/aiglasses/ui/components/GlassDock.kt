@@ -1,39 +1,47 @@
 package com.example.aiglasses.ui.components
 
-import androidx.compose.animation.AnimatedVisibility
-import androidx.compose.animation.fadeIn
-import androidx.compose.animation.fadeOut
 import androidx.compose.foundation.BorderStroke
-import androidx.compose.foundation.layout.*
-import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.Code
-import androidx.compose.material.icons.filled.Home
-import androidx.compose.material.icons.filled.PhotoLibrary
-import androidx.compose.material.icons.filled.Settings
+import androidx.compose.material.icons.outlined.Code
+import androidx.compose.material.icons.outlined.Home
+import androidx.compose.material.icons.outlined.PhotoLibrary
+import androidx.compose.material.icons.outlined.Settings
 import androidx.compose.material3.Icon
 import androidx.compose.material3.Surface
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.unit.dp
 import com.example.aiglasses.ui.navigation.Screen
-import com.example.aiglasses.ui.theme.*
+import com.example.aiglasses.ui.theme.Hairline
+import com.example.aiglasses.ui.theme.Panel
+import com.example.aiglasses.ui.theme.SignalOrange
+import com.example.aiglasses.ui.theme.SignalOrangeDim
+import com.example.aiglasses.ui.theme.TextTertiary
 
-data class DockItem(
+private data class DockItem(
     val screen: Screen,
-    val icon: androidx.compose.ui.graphics.vector.ImageVector,
+    val icon: ImageVector,
     val label: String
 )
 
-val dockItems = listOf(
-    DockItem(Screen.Home, Icons.Filled.Home, "Home"),
-    DockItem(Screen.Gallery, Icons.Filled.PhotoLibrary, "Gallery"),
-    DockItem(Screen.Settings, Icons.Filled.Settings, "Settings"),
-    DockItem(Screen.Developer, Icons.Filled.Code, "Developer")
+private val dockItems = listOf(
+    DockItem(Screen.Home, Icons.Outlined.Home, "Home"),
+    DockItem(Screen.Gallery, Icons.Outlined.PhotoLibrary, "Gallery"),
+    DockItem(Screen.Settings, Icons.Outlined.Settings, "Settings"),
+    DockItem(Screen.Developer, Icons.Outlined.Code, "Developer")
 )
 
+/** Bottom navigation pill — Panel fill, hairline border, orange selection. */
 @Composable
 fun GlassDock(
     currentRoute: String?,
@@ -45,61 +53,36 @@ fun GlassDock(
         contentAlignment = Alignment.Center
     ) {
         Surface(
-            shape = RoundedCornerShape(980.dp),
-            color = GlassSurfaceMed,
-            border = BorderStroke(1.dp, GlassBorder)
+            shape = CircleShape,
+            color = Panel,
+            tonalElevation = 0.dp,
+            shadowElevation = 0.dp,
+            border = BorderStroke(1.dp, Hairline)
         ) {
             Row(
-                modifier = Modifier.padding(horizontal = 8.dp, vertical = 10.dp),
+                modifier = Modifier.padding(horizontal = 8.dp, vertical = 6.dp),
                 horizontalArrangement = Arrangement.spacedBy(4.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 dockItems.forEach { item ->
-                    val isSelected = currentRoute == item.screen.route
-                    DockIconButton(
-                        item = item,
-                        isSelected = isSelected,
-                        onClick = { if (!isSelected) onNavigate(item.screen.route) }
-                    )
+                    val selected = currentRoute == item.screen.route
+                    Surface(
+                        onClick = { if (!selected) onNavigate(item.screen.route) },
+                        shape = CircleShape,
+                        color = if (selected) SignalOrangeDim else Color.Transparent,
+                        tonalElevation = 0.dp,
+                        shadowElevation = 0.dp
+                    ) {
+                        Icon(
+                            imageVector = item.icon,
+                            contentDescription = item.label,
+                            tint = if (selected) SignalOrange else TextTertiary,
+                            modifier = Modifier
+                                .padding(horizontal = 16.dp, vertical = 10.dp)
+                                .size(22.dp)
+                        )
+                    }
                 }
-            }
-        }
-    }
-}
-
-@Composable
-private fun DockIconButton(
-    item: DockItem,
-    isSelected: Boolean,
-    onClick: () -> Unit
-) {
-    Surface(
-        onClick = onClick,
-        shape = RoundedCornerShape(14.dp),
-        color = if (isSelected) Blue.copy(alpha = 0.2f) else androidx.compose.ui.graphics.Color.Transparent,
-        modifier = Modifier.clip(RoundedCornerShape(14.dp))
-    ) {
-        Column(
-            modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
-            horizontalAlignment = Alignment.CenterHorizontally,
-            verticalArrangement = Arrangement.spacedBy(4.dp)
-        ) {
-            Icon(
-                imageVector = item.icon,
-                contentDescription = item.label,
-                tint = if (isSelected) Blue else TextTertiary,
-                modifier = Modifier.size(22.dp)
-            )
-            AnimatedVisibility(
-                visible = isSelected,
-                enter = fadeIn(),
-                exit = fadeOut()
-            ) {
-                Surface(
-                    modifier = Modifier.size(4.dp),
-                    shape = RoundedCornerShape(50),
-                    color = Blue
-                ) {}
             }
         }
     }
