@@ -25,12 +25,11 @@ fun StatusBadge(
 ) {
     val (label, color) = when (state) {
         ConnectionState.Disconnected -> "Offline" to Red
-        ConnectionState.Scanning -> "Scanning" to Orange
-        ConnectionState.Connected -> "Idle" to Blue
-        ConnectionState.Active -> "Live" to Green
+        ConnectionState.Scanning -> "Searching" to Orange
+        ConnectionState.Connected -> "Connected" to Green
     }
 
-    val isActive = state == ConnectionState.Active
+    val isActive = state == ConnectionState.Connected
     val infiniteTransition = rememberInfiniteTransition(label = "badge_pulse")
     val dotScale by if (isActive) {
         infiniteTransition.animateFloat(

@@ -28,11 +28,10 @@ private fun tagColor(tag: String): Color = when (tag) {
     "USER" -> Blue
     "AI" -> Purple
     "ERROR" -> Red
-    "BLE" -> Green
-    "AUDIO" -> Orange
-    "PIPELINE" -> Pink
+    "LINK" -> Green
+    "VOICE" -> Orange
+    "VISION" -> Pink
     "CAMERA" -> Blue
-    "TTS" -> Pink
     else -> Color(0x66FFFFFF)
 }
 

@@ -16,7 +16,7 @@ fun AmbientBackground(
     modifier: Modifier = Modifier
 ) {
     val bgColors = when (connectionState) {
-        ConnectionState.Active -> listOf(BgActiveStart, BgActiveMid, BgActiveEnd)
+        ConnectionState.Connected -> listOf(BgActiveStart, BgActiveMid, BgActiveEnd)
         else -> listOf(BgStart, BgMid, BgEnd)
     }
 

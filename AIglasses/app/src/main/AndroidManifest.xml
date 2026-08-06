@@ -2,28 +2,39 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:tools="http://schemas.android.com/tools">
 
-    <!-- Internet for OpenAI API calls -->
+    <!-- Internet for the OpenAI Realtime websocket + WiFi bulk lane TCP -->
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <!-- ConnectivityManager.requestNetwork with WifiNetworkSpecifier -->
+    <uses-permission android:name="android.permission.CHANGE_NETWORK_STATE" />
+    <!-- WifiNetworkSpecifier on Android 13+ -->
+    <uses-permission android:name="android.permission.NEARBY_WIFI_DEVICES"
+        android:usesPermissionFlags="neverForLocation" />
 
     <!-- BLE permissions (API 31+ / Android 12+) -->
     <uses-permission android:name="android.permission.BLUETOOTH_SCAN"
         android:usesPermissionFlags="neverForLocation" />
     <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
 
-    <!-- BLE permissions (API 30 and below) -->
+    <!-- BLE permissions (API 30 and below); fine location also serves as the
+         WifiNetworkSpecifier fallback on 12/12L (API 31-32) -->
     <uses-permission android:name="android.permission.BLUETOOTH"
         android:maxSdkVersion="30" />
     <uses-permission android:name="android.permission.BLUETOOTH_ADMIN"
         android:maxSdkVersion="30" />
     <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION"
-        android:maxSdkVersion="30" />
+        android:maxSdkVersion="32" />
+
+    <!-- Background operation: connectedDevice foreground service + live notification -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
     <!-- Require BLE hardware -->
     <uses-feature android:name="android.hardware.bluetooth_le" android:required="true" />
 
     <application
-        android:allowBackup="true"
+        android:allowBackup="false"
         android:dataExtractionRules="@xml/data_extraction_rules"
         android:fullBackupContent="@xml/backup_rules"
         android:icon="@mipmap/ic_launcher"
@@ -41,9 +52,15 @@
                 android:resource="@xml/file_paths" />
         </provider>
 
+        <service
+            android:name=".GlassesService"
+            android:exported="false"
+            android:foregroundServiceType="connectedDevice" />
+
         <activity
             android:name=".MainActivity"
             android:exported="true"
+            android:launchMode="singleTask"
             android:label="@string/app_name"
             android:theme="@style/Theme.AIglasses">
             <intent-filter>
