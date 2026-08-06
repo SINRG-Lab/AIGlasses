@@ -1,15 +1,20 @@
 # BLE Protocol Specification
 
-Identical to V1 (`S3_App_imp`) with **two backward-compatible additions**:
+BLE is the **primary, always-on transport**: control markers, realtime voice
+audio, and photo fallback all ride it. Same GATT layout as V1 (`S3_App_imp`)
+with backward-compatible additions:
 
-1. The `'X'` playback-cancelled notification (barge-in). An un-updated Android app
+1. The `'X'` playback-cancelled notification (barge-in). An un-updated app
    still works — it ignores the unknown tag and simply keeps streaming TTS the
    glasses discard, which is the pre-V2 behavior.
-2. **In-band image framing**: the image header (now `'H'`) and every image/frame
-   end marker (`'J'`) ride the IMAGE_TX characteristic together with the data
+2. **In-band image framing**: the image header (now `'H'`) and the image end
+   marker (`'J'`) ride the IMAGE_TX characteristic together with the data
    fragments, instead of CONTROL. The app still accepts the legacy CONTROL-channel
    `'I'` header / `'J'` end marker, so it works with old firmware; old apps need
    the update to receive images from this firmware.
+3. **Transport V2** (2026-08): `'P'` ping echo, the `'F'`/`'f'`/`'N'` WiFi-link
+   bootstrap, and the `'T'` binary stats packet — all on CONTROL, all ignored
+   by older apps. The video feature (`'V'`/`'W'`) was removed.
 
 ## GATT layout
 
@@ -24,11 +29,18 @@ Device name: **`AIGlasses-ESP32S3`** · MTU: 512 requested (payload = MTU − 3 
 
 Service UUID: `0000aa00-1234-5678-abcd-0e5032c6b1e0`
 
-On connect the glasses request fast connection parameters: interval 7.5–15 ms,
-latency 0, supervision timeout 5 s. Both sides also request the **2M PHY**
-(BLE 5, double the 1M symbol rate); the link falls back to 1M automatically on
-phones without 2M support. The negotiated PHY is logged on the firmware serial
-(`[BLE] PHY updated`) and in Android logcat (`[PERF-M35]`).
+After connect the glasses tune the link, **staggered** from the main loop
+(`bleTick()`) so the three LL procedures never collide with the central's own
+MTU exchange + service discovery (a known early-drop trigger on iOS):
+
+| When | Procedure |
+|---|---|
+| +300 ms | Connection parameters: interval 7.5–15 ms, latency 0, supervision timeout 5 s |
+| +600 ms | **2M PHY** request (1M+2M mask; falls back to 1M on phones without 2M) |
+| +900 ms | Data Length Extension: 251 bytes / 2120 µs |
+
+The negotiated PHY is logged on the firmware serial (`[BLE] PHY updated`) and
+reported to the app in the `'T'` stats packet.
 
 ## Packet framing
 
@@ -117,24 +129,81 @@ only papered over the cross-characteristic race — under load the header could
 still land after fragments (the phone reset its reassembly buffer mid-image) and
 the end marker could still overtake the tail fragments (truncated JPEG).
 
-## Video
+## Video — removed (Transport V2)
 
-```
-CONTROL  notify  'V' 0x00                 video session start
-  per frame:
-    IMAGE_TX notify  'H' 0x01 <len u32 LE>   header, flags=0x01 marks video frame
-    IMAGE_TX notify  'I' seq <jpeg frag>...
-    IMAGE_TX notify  'J' frameIdx            frame end
-CONTROL  notify  'W' <totalFrames>        video session end
-```
+The live-video feature (triple-tap gesture, `'V'`/`'W'` session markers,
+`flags=0x01` video frames) was **removed**. This firmware never sends video
+packets; a triple-tap logs and does nothing. Apps should tolerate (ignore with
+one log line) `'V'`/`'W'`/video-flagged frames from older firmware.
 
-Everything per-frame rides IMAGE_TX for the ordering guarantee above — the V1
-fix that moved the per-frame `'J'` there eliminated a structural race that
-corrupted ~25 % of frames; V2 moved the header in-band as well. Only the
-session-level markers (`'V'`/`'W'`) stay on CONTROL. Because `'W'` crosses
-characteristics with the last frame's `'J'`, the firmware waits 50 ms before
-sending it, and the app additionally salvages a fully-received in-flight frame
-if `'W'` arrives early.
+## Pings & liveness (`'P'`)
+
+The app writes **`'P'` + seq + t0** (its own timestamp encoding, opaque to the
+firmware) on CONTROL every 2 s per active transport; the firmware **echoes the
+packet verbatim** as a CONTROL notification (bounded retry — up to 3 tries,
+because the app declares the link wedged after 3 consecutive lost echoes and a
+sustained notification burst can hit `BLE_HS_ENOMEM` repeatedly on a healthy
+link). The app computes per-transport RTT from the echo
+and declares a transport dead after 3 consecutive misses. Firmware-side, BLE
+liveness rides the 5 s supervision timeout; the WiFi socket has its own
+watchdog (no `'P'` for 10 s → socket closed, see `docs/WIFI_LINK.md`).
+
+## WiFi link bootstrap (`'F'` / `'f'` / `'N'`)
+
+BLE is the control plane for the optional WiFi bulk transport
+(`docs/WIFI_LINK.md`). The phone writes **`'F'`** on CONTROL; the firmware's
+main loop brings up its SoftAP + TCP server and answers with an **`'N'`**
+notification carrying `ssid\npass\nip\nport` (newline-separated ASCII). BLE
+**stays connected and advertising-capable the whole time** — it keeps carrying
+control markers and realtime voice audio; only photos may route over the
+socket, and only when it is measurably faster (the route is visible to the app
+as which transport the `'H'` header arrives on). **`'f'`** (either transport)
+tears the AP down. Un-updated apps never send `'F'`, so nothing changes for
+them.
+
+## Link stats packet (`'T'`, glasses → phone)
+
+Every 5 s (`LINK_STATS_PERIOD_MS`) the firmware notifies a compact binary
+stats packet on CONTROL alongside its serial `[LINK-STATS]` line, so the app
+can display firmware-side truth. When a WiFi client is attached the same
+packet is also framed onto the WiFi CONTROL channel, so a WiFi-only session
+(BLE down, socket dialed directly) still gets live stats. All multi-byte
+fields **little-endian**;
+layout version 1 (byte 1 bumps on any change). Total size: **74 bytes**.
+
+| Offset | Size | Type | Field |
+|---|---|---|---|
+| 0 | 1 | u8 | `'T'` (0x54) |
+| 1 | 1 | u8 | layout version = 1 |
+| 2 | 4 | u32 | uptime, ms since boot |
+| 6 | 4 | u32 | free heap, bytes |
+| 10 | 4 | u32 | free PSRAM, bytes |
+| 14 | 2 | u16 | negotiated ATT MTU (23 until the exchange) |
+| 16 | 1 | u8 | BLE TX PHY: 0 unknown, 1 = 1M, 2 = 2M, 3 = coded |
+| 17 | 1 | u8 | BLE RX PHY (same encoding) |
+| 18 | 1 | u8 | flags: bit0 BLE connected, bit1 WiFi AP up, bit2 WiFi client attached, bit3 next image routes WiFi |
+| 19 | 1 | i8 | WiFi client RSSI, dBm (0 = unavailable) |
+| 20 | 2 | u16 | BLE connects since boot |
+| 22 | 2 | u16 | WiFi client sockets accepted since boot |
+| 24 | 2 | u16 | app pings heard on BLE |
+| 26 | 2 | u16 | app pings heard on WiFi |
+| 28 | 4 | u32 | BLE TX bytes/s (rolling 5 s window) |
+| 32 | 4 | u32 | BLE RX bytes/s |
+| 36 | 4 | u32 | WiFi TX bytes/s |
+| 40 | 4 | u32 | WiFi RX bytes/s |
+| 44 | 4 | u32 | BLE TX bytes, cumulative |
+| 48 | 4 | u32 | BLE RX bytes, cumulative |
+| 52 | 4 | u32 | WiFi TX bytes, cumulative |
+| 56 | 4 | u32 | WiFi RX bytes, cumulative |
+| 60 | 1 | u8 | last photo route: 0 none yet, 1 = BLE, 2 = WiFi |
+| 61 | 1 | u8 | reserved (0) |
+| 62 | 4 | u32 | last photo size, bytes |
+| 66 | 4 | u32 | last photo transfer duration, ms |
+| 70 | 4 | u32 | WiFi socket uptime, ms (0 = no client attached) |
+
+Byte counts are whole-frame air bytes (BLE: ATT payloads; WiFi: 3-byte frame
+header + inner packet). The packet is built in `link.cpp`
+(`sendStatsPacket`) — keep this table in lockstep with it.
 
 ## Flow control
 
@@ -155,13 +224,16 @@ notification per connection event, which is what the Android stack reliably acce
 |---|---|---|
 | `'S'` | CONTROL (both directions) | Stream start (recording / TTS) |
 | `'E'` | CONTROL (both directions) | Stream end |
-| `'A'` | AUDIO_TX / AUDIO_RX | PCM audio fragment |
-| `'H'` | IMAGE_TX | Image header (`flags`: 0x00 photo, 0x01 video frame) + u32 LE size |
+| `'A'` | AUDIO_TX / AUDIO_RX | Audio fragment (PCM16, or µ-law in realtime mode) |
+| `'H'` | IMAGE_TX | Image header (`flags`: 0x00 photo, 0x02 vision photo) + u32 LE size |
 | `'I'` | IMAGE_TX | JPEG fragment |
-| `'J'` | IMAGE_TX | Image / video-frame end |
-| `'V'` | CONTROL | Video session start |
-| `'W'` | CONTROL | Video session end (+ frame count) |
+| `'J'` | IMAGE_TX | Image end |
 | `'X'` | CONTROL (glasses → phone) | Playback cancelled (barge-in) — stop streaming TTS |
 | `'M'` / `'m'` | CONTROL (phone → glasses) | Realtime voice mode on/off (µ-law audio both ways) |
+| `'P'` | CONTROL (phone → glasses, echoed back) | Ping — app measures per-transport RTT |
+| `'F'` / `'f'` | CONTROL (phone → glasses) | WiFi link on/off — start/stop the SoftAP + TCP server |
+| `'N'` | CONTROL (glasses → phone) | Answer to `'F'`: `"ssid\npass\nip\nport"` — join and connect |
+| `'T'` | CONTROL (glasses → phone) | Link stats packet, every 5 s (layout above) |
+| `'V'` / `'W'` | CONTROL *(removed)* | Old video session markers — apps tolerate, this firmware never sends |
 | `'I'` | CONTROL *(legacy, app-accepted)* | Old image header from pre-in-band firmware |
 | `'J'` | CONTROL *(legacy, app-accepted)* | Old still-image end from pre-in-band firmware |

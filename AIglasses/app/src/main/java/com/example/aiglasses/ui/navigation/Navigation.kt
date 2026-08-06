@@ -1,9 +1,18 @@
 package com.example.aiglasses.ui.navigation
 
-import androidx.compose.animation.*
+import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.tween
-import androidx.compose.foundation.layout.*
-import androidx.compose.runtime.*
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.slideInVertically
+import androidx.compose.animation.slideOutVertically
+import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.padding
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
@@ -13,9 +22,15 @@ import androidx.navigation.compose.currentBackStackEntryAsState
 import androidx.navigation.compose.rememberNavController
 import com.example.aiglasses.MainViewModel
 import com.example.aiglasses.ui.components.GlassDock
-import com.example.aiglasses.ui.screens.*
+import com.example.aiglasses.ui.screens.DeveloperScreen
+import com.example.aiglasses.ui.screens.GalleryScreen
+import com.example.aiglasses.ui.screens.HomeScreen
+import com.example.aiglasses.ui.screens.SettingsScreen
+import com.example.aiglasses.ui.theme.Motion
 
-private val mainRoutes = setOf(Screen.Home.route, Screen.Features.route, Screen.Gallery.route, Screen.Settings.route)
+private val mainRoutes = setOf(
+    Screen.Home.route, Screen.Gallery.route, Screen.Settings.route, Screen.Developer.route
+)
 
 @Composable
 fun AppNavigation(viewModel: MainViewModel) {
@@ -24,21 +39,44 @@ fun AppNavigation(viewModel: MainViewModel) {
     val currentRoute = currentBackStack?.destination?.route
     val showDock = currentRoute in mainRoutes
 
-    Box(modifier = Modifier.fillMaxSize()) {
+    // Dock tabs and the hero long-press share one navigation pattern.
+    val navigateTo: (String) -> Unit = { route ->
+        navController.navigate(route) {
+            popUpTo(Screen.Home.route) { saveState = true }
+            launchSingleTop = true
+            restoreState = true
+        }
+    }
+
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(MaterialTheme.colorScheme.background)
+    ) {
         NavHost(
             navController = navController,
             startDestination = Screen.Home.route,
-            modifier = Modifier.fillMaxSize()
+            modifier = Modifier.fillMaxSize(),
+            // §8: fade + short slide, EmphasizedDecel in / EmphasizedAccel out.
+            enterTransition = {
+                fadeIn(tween(350, easing = Motion.EmphasizedDecel)) +
+                    slideInVertically(tween(350, easing = Motion.EmphasizedDecel)) { it / 24 }
+            },
+            exitTransition = {
+                fadeOut(tween(200, easing = Motion.EmphasizedAccel))
+            },
+            popEnterTransition = {
+                fadeIn(tween(350, easing = Motion.EmphasizedDecel))
+            },
+            popExitTransition = {
+                fadeOut(tween(200, easing = Motion.EmphasizedAccel))
+            }
         ) {
             composable(Screen.Home.route) {
                 HomeScreen(
                     viewModel = viewModel,
-                    onLiveViewOpen = { navController.navigate(Screen.LiveView.route) },
-                    onDevModeReveal = { navController.navigate(Screen.Developer.route) }
+                    onDevModeReveal = { navigateTo(Screen.Developer.route) }
                 )
-            }
-            composable(Screen.Features.route) {
-                FeaturesScreen(viewModel = viewModel)
             }
             composable(Screen.Gallery.route) {
                 GalleryScreen(viewModel = viewModel)
@@ -46,43 +84,11 @@ fun AppNavigation(viewModel: MainViewModel) {
             composable(Screen.Settings.route) {
                 SettingsScreen(viewModel = viewModel)
             }
-            composable(
-                route = Screen.LiveView.route,
-                enterTransition = {
-                    slideInVertically(
-                        initialOffsetY = { it },
-                        animationSpec = tween(380)
-                    ) + fadeIn(tween(380))
-                },
-                exitTransition = {
-                    slideOutVertically(
-                        targetOffsetY = { it },
-                        animationSpec = tween(300)
-                    ) + fadeOut(tween(300))
-                }
-            ) {
-                LiveViewScreen(
-                    viewModel = viewModel,
-                    onDismiss = { navController.popBackStack() }
-                )
-            }
-            composable(
-                route = Screen.Developer.route,
-                enterTransition = {
-                    fadeIn(tween(280)) + scaleIn(initialScale = 0.95f, animationSpec = tween(280))
-                },
-                exitTransition = {
-                    fadeOut(tween(220)) + scaleOut(targetScale = 0.95f, animationSpec = tween(220))
-                }
-            ) {
-                DeveloperScreen(
-                    viewModel = viewModel,
-                    onDismiss = { navController.popBackStack() }
-                )
+            composable(Screen.Developer.route) {
+                DeveloperScreen(viewModel = viewModel)
             }
         }
 
-        // Glass dock — shown only on main 3 routes
         AnimatedVisibility(
             visible = showDock,
             enter = fadeIn(tween(200)) + slideInVertically(initialOffsetY = { it / 2 }, animationSpec = tween(200)),
@@ -93,13 +99,7 @@ fun AppNavigation(viewModel: MainViewModel) {
         ) {
             GlassDock(
                 currentRoute = currentRoute,
-                onNavigate = { route ->
-                    navController.navigate(route) {
-                        popUpTo(Screen.Home.route) { saveState = true }
-                        launchSingleTop = true
-                        restoreState = true
-                    }
-                }
+                onNavigate = navigateTo
             )
         }
     }

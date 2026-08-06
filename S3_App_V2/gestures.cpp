@@ -15,7 +15,7 @@ static bool sHoldFired = false;         // true once PRESS_VOICE/VISION has been
 bool gesturePressed()  { return sStable && sHoldFired; }
 int  gestureTapCount() { return sTapCount; }
 
-GestureEvent gestureTick(bool rawPressed, bool videoActive) {
+GestureEvent gestureTick(bool rawPressed) {
   unsigned long now = millis();
 
   // Debounce: the raw level must hold steady for DEBOUNCE_MS before we
@@ -34,8 +34,7 @@ GestureEvent gestureTick(bool rawPressed, bool videoActive) {
   // (which clears its buffer and discards the first ~200 ms of the real
   // utterance each time it fires).
   if (rawPressed == sStable) {
-    if (sStable && !videoActive && !sHoldFired &&
-        (now - sPressStart) >= QUICK_TAP_MAX_MS) {
+    if (sStable && !sHoldFired && (now - sPressStart) >= QUICK_TAP_MAX_MS) {
       sHoldFired = true;
       return (sTapCount == 2) ? GESTURE_PRESS_VISION : GESTURE_PRESS_VOICE;
     }
@@ -47,7 +46,6 @@ GestureEvent gestureTick(bool rawPressed, bool videoActive) {
   if (sStable) {
     sPressStart = now;
     sHoldFired = false;
-    if (videoActive) return GESTURE_NONE;   // release will stop the video
 
     bool withinWindow = (sTapCount > 0) && (now - sLastQuickTap < TAP_WINDOW_MS);
     sTapCount = withinWindow ? sTapCount + 1 : 1;
@@ -60,12 +58,6 @@ GestureEvent gestureTick(bool rawPressed, bool videoActive) {
   }
 
   // ── Release edge ──
-  if (videoActive) {
-    sTapCount = 0;
-    sHoldFired = false;
-    return GESTURE_VIDEO_STOP;
-  }
-
   if (sHoldFired) {
     // Hold was committed before this release — normal voice/vision end.
     sTapCount = 0;
@@ -76,6 +68,6 @@ GestureEvent gestureTick(bool rawPressed, bool videoActive) {
   // Quick release: hold never committed, classify by tap count.
   sLastQuickTap = now;
   if (sTapCount == 2) return GESTURE_QUICK_PHOTO;
-  if (sTapCount == 3) { sTapCount = 0; return GESTURE_QUICK_VIDEO; }
+  if (sTapCount == 3) { sTapCount = 0; return GESTURE_QUICK_TRIPLE; }
   return GESTURE_QUICK_DISCARD;
 }

@@ -1,26 +1,29 @@
 # S3_App_V2 — AI Smart Glasses Firmware
 
-Modular rewrite of `S3_App_imp` for the **Seeed XIAO ESP32-S3 Sense**. Voice + vision
-assistant glasses: push-to-talk mic streaming, camera snapshots/video, and streaming
-TTS playback — all over BLE to the companion Android app (`AIglasses`).
+Modular firmware for the **Seeed XIAO ESP32-S3 Sense**. Voice + vision
+assistant glasses: push-to-talk mic streaming, camera snapshots, and streaming
+TTS playback to the companion iOS app (`iOSGlasses`).
 
-**The BLE protocol is unchanged from V1** — same service/characteristic UUIDs, same
-packet framing — plus one backward-compatible addition: a `'X'` control notification
-that tells the app to stop streaming TTS after a barge-in. The existing Android app
-works without modification; the updated `BleVoiceService.kt`/`MainViewModel.kt` in
-`AIglasses` additionally honor `'X'` so a cancelled response stops wasting BLE airtime.
+**Transport policy (V2):** BLE is the primary, always-on link — control
+markers and realtime voice audio ride it at all times. An app-enabled **WiFi
+SoftAP + TCP socket** ([docs/WIFI_LINK.md](docs/WIFI_LINK.md)) is an optional
+bulk plane: photos route over it per image, and only when it is measurably
+faster than BLE. Photos work over BLE alone whenever WiFi is off. The BLE
+protocol stays backward-compatible ([docs/BLE_PROTOCOL.md](docs/BLE_PROTOCOL.md)).
 
-## What's new vs V1
+## Highlights
 
-- **Modular code** — the 1,174-line monolithic sketch is split into 7 single-purpose
-  modules (see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)).
+- **Modular code** — single-purpose modules (see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)).
 - **Barge-in** — pressing the button while the glasses are speaking cancels TTS playback.
-- **Triple-tap fixed** — the standalone photo no longer fires instantly on the 2nd tap,
-  which made the video gesture (3 taps) nearly unreachable in V1.
+- **Realtime voice mode** — G.711 µ-law both directions for GPT Realtime speech-to-speech.
+- **Per-image transport routing** — measured-speed decision, BLE by default;
+  `[IMG]` / `[LINK-STATS]` serial logs plus a binary `'T'` stats packet to the app every 5 s.
+- **Liveness** — `'P'` ping echo on both transports; a WiFi socket with no ping
+  for 10 s is closed by the firmware watchdog.
 - **Status LED** — glanceable state on the XIAO's user LED (no serial monitor needed).
-- **Bug fixes** — stale sequence tracking, VLA stack buffers, inconsistent flow control
-  on video markers. Full list in [docs/CHANGES_FROM_V1.md](docs/CHANGES_FROM_V1.md).
 - **Non-blocking input** — millis()-based debounce replaces blocking double-reads.
+
+The live-video feature was removed in Transport V2 (triple-tap is a no-op).
 
 ## Gestures
 
@@ -29,7 +32,7 @@ works without modification; the updated `BleVoiceService.kt`/`MainViewModel.kt` 
 | 1 press + **hold** | Voice question (a photo taken in the last 5 s auto-attaches) |
 | Quick **double-tap** | Standalone photo (stored on phone; ask within 5 s to query it) |
 | 2 presses, **hold** the 2nd | Photo + voice question bundled (vision AI) |
-| Quick **triple-tap** | Start video recording — any tap stops it |
+| Quick **triple-tap** | No-op (video feature removed) |
 | Press **during playback** | Cancel TTS playback (barge-in) |
 
 ## Status LED (GPIO21, user LED)
@@ -40,7 +43,6 @@ works without modification; the updated `BleVoiceService.kt`/`MainViewModel.kt` 
 | Off | Connected, idle |
 | Solid | Recording (mic streaming) |
 | Fast blink | Speaking (TTS playback) |
-| Double-blink | Video recording |
 
 ## Hardware
 
@@ -87,7 +89,8 @@ Everything tunable lives in [config.h](config.h):
 | File | Contents |
 |---|---|
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Module map, data flow, task/concurrency model |
-| [docs/BLE_PROTOCOL.md](docs/BLE_PROTOCOL.md) | Complete GATT protocol spec (UUIDs, framing, sequences) |
+| [docs/BLE_PROTOCOL.md](docs/BLE_PROTOCOL.md) | Complete GATT protocol spec (UUIDs, framing, `'T'` stats layout) |
+| [docs/WIFI_LINK.md](docs/WIFI_LINK.md) | WiFi bulk transport (SoftAP + TCP, `'F'`/`'N'` bootstrap, routing policy) |
 | [docs/HARDWARE.md](docs/HARDWARE.md) | Pinout, wiring, audio-path notes |
 | [docs/CHANGES_FROM_V1.md](docs/CHANGES_FROM_V1.md) | Every change vs `S3_App_imp`, with rationale |
 | [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) | Known failure modes and their fixes |
