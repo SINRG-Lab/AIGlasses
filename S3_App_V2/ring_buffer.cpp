@@ -8,14 +8,23 @@ static volatile size_t sHead = 0;   // write position (BLE task)
 static volatile size_t sTail = 0;   // read position  (main loop)
 
 bool ringInit(size_t size) {
-  sSize = size;
-  sBuf = (uint8_t*)ps_malloc(size);
-  if (!sBuf) {
-    // PSRAM unavailable — fall back to internal RAM (will be tight)
-    sBuf = (uint8_t*)malloc(size);
+  // PSRAM first at full size. Without PSRAM the full 256 KB can never come
+  // from internal RAM (~240 KB heap total), so step down until something
+  // fits — a small ring degrades TTS buffering instead of disabling it.
+  for (size_t trySize = size; trySize >= 32 * 1024; trySize /= 2) {
+    sBuf = (uint8_t*)ps_malloc(trySize);
+    if (!sBuf) sBuf = (uint8_t*)malloc(trySize);
+    if (sBuf) {
+      sSize = trySize;
+      sHead = sTail = 0;
+      return true;
+    }
   }
+  // Total failure: sSize MUST be 0 — a non-zero size with a null buffer
+  // makes ringWrite memcpy into NULL on the first TTS byte (hard crash).
+  sSize = 0;
   sHead = sTail = 0;
-  return sBuf != nullptr;
+  return false;
 }
 
 size_t ringCapacity() { return sSize; }
@@ -26,10 +35,12 @@ size_t ringAvailable() {
 }
 
 size_t ringFree() {
+  if (!sBuf) return 0;   // no ring — also avoids sSize-1 underflow when sSize==0
   return sSize - 1 - ringAvailable();
 }
 
 size_t ringWrite(const uint8_t* data, size_t len) {
+  if (!sBuf) return 0;
   size_t space = ringFree();
   if (len > space) len = space;
   if (len == 0) return 0;
@@ -46,6 +57,7 @@ size_t ringWrite(const uint8_t* data, size_t len) {
 }
 
 size_t ringRead(uint8_t* dst, size_t maxLen) {
+  if (!sBuf) return 0;
   size_t avail = ringAvailable();
   size_t len = (maxLen < avail) ? maxLen : avail;
   if (len == 0) return 0;

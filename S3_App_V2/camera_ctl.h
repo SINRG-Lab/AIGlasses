@@ -6,8 +6,7 @@
 // ════════════════════════════════════════════════════════════════
 //  Camera control (OV2640/OV3660 on XIAO ESP32-S3 Sense).
 //  Snapshots are copied into a module-owned PSRAM buffer so the
-//  camera frame buffer can be returned immediately; video frames
-//  are grabbed/returned directly for streaming.
+//  camera frame buffer can be returned immediately.
 // ════════════════════════════════════════════════════════════════
 
 bool cameraInit();                 // init driver + sensor defaults + warm-up
@@ -19,11 +18,7 @@ const uint8_t* cameraJpeg();       // nullptr if no snapshot held
 size_t cameraJpegLen();
 void   cameraDiscardSnapshot();    // free the held snapshot (safe if none)
 
-// Video streaming — caller must return every grabbed frame
-camera_fb_t* cameraGrabFrame(int retries);
-void         cameraReturnFrame(camera_fb_t* fb);
-
-// Live-video mode: drop the sensor to a low resolution + high JPEG compression
-// so each frame is only a handful of BLE fragments (~12 fps instead of ~5).
-// Photos/vision use the full-quality mode. Restore before the next snapshot.
-void cameraSetVideoMode(bool on);
+// Route-matched quality profile: high-bandwidth (WiFi route) captures SVGA
+// photos; low (BLE) keeps the QVGA size the ~34 KB/s budget can move in
+// about a second. Called from linkTick() when the preferred route changes.
+void cameraSetHighBandwidth(bool on);

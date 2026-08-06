@@ -29,9 +29,9 @@ struct HomeView: View {
         VStack(spacing: 12) {
             HStack {
                 VStack(alignment: .leading, spacing: 4) {
-                    Text(app.ble.deviceName.isEmpty ? "AI Glasses" : app.ble.deviceName)
+                    Text(app.link.deviceName.isEmpty ? "AI Glasses" : app.link.deviceName)
                         .font(.headline)
-                    Text(app.ble.connectionState.rawValue)
+                    Text(connectionStatusText)
                         .font(.subheadline)
                         .foregroundStyle(stateColor)
                 }
@@ -40,33 +40,85 @@ struct HomeView: View {
                     .fill(stateColor)
                     .frame(width: 12, height: 12)
             }
-            if app.ble.attMTU > 0 {
+            if app.link.isConnected {
                 HStack(spacing: 16) {
-                    statChip("MTU", "\(app.ble.attMTU)")
-                    statChip("LINK", app.ble.attMTU >= 200 ? "High" : "Std")
+                    if app.ble.stats.rttMs > 0 {
+                        statChip("PING", String(format: "%.0f ms", app.ble.stats.rttMs))
+                    }
+                    if app.ble.attMTU > 0 {
+                        statChip("MTU", "\(app.ble.attMTU)")
+                    }
+                    if app.link.wifi.isConnected {
+                        statChip("BULK", "Wi-Fi")
+                    }
                     Spacer()
                 }
             }
+            wifiLinkRow
             Button {
-                if app.ble.connectionState == .disconnected {
-                    app.connectGlasses()
-                } else {
+                if app.link.isConnected || app.ble.connectionState != .disconnected {
                     app.disconnectGlasses()
+                } else {
+                    app.connectGlasses()
                 }
             } label: {
-                Text(app.ble.connectionState == .disconnected ? "Connect Glasses" : "Disconnect")
+                Text(app.link.isConnected || app.ble.connectionState != .disconnected
+                     ? "Disconnect" : "Connect Glasses")
                     .frame(maxWidth: .infinity)
             }
             .buttonStyle(.borderedProminent)
-            .tint(app.ble.connectionState == .disconnected ? .blue : .red)
+            .tint(app.link.isConnected || app.ble.connectionState != .disconnected ? .red : .blue)
         }
         .padding()
         .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 16))
     }
 
+    /// Wi-Fi as the bulk lane: toggling on runs the whole bootstrap (BLE 'F'
+    /// → SoftAP up → TCP), or dials the glasses' known address directly when
+    /// Bluetooth is unavailable. Bluetooth stays connected regardless.
+    private var wifiLinkRow: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Toggle(isOn: Binding(
+                get: { app.link.wifiEnabled || app.link.wifiPhase != .off },
+                set: { on in
+                    if on { app.link.enableWifiLink() } else { app.link.disableWifiLink() }
+                }
+            )) {
+                Label("Auto Wi-Fi photo boost", systemImage: "wifi")
+                    .font(.subheadline.weight(.medium))
+            }
+            if let detail = wifiPhaseDetail {
+                Text(detail)
+                    .font(.caption)
+                    .foregroundStyle(wifiPhaseIsError ? .orange : .secondary)
+            }
+        }
+    }
+
+    private var wifiPhaseDetail: String? {
+        switch app.link.wifiPhase {
+        case .off: nil
+        case .requesting: "Asking the glasses to start Wi-Fi…"
+        case .joining(let ssid): "Waiting for the phone to be on \(ssid)…"
+        case .connecting: "Opening the data link…"
+        case .active: "Fast photo lane active (voice stays on Bluetooth)"
+        case .failed(let why): why
+        }
+    }
+
+    private var wifiPhaseIsError: Bool {
+        if case .failed = app.link.wifiPhase { return true }
+        return false
+    }
+
+    private var connectionStatusText: String {
+        if app.ble.isConnected, app.link.wifi.isConnected { return "Connected · +Wi-Fi" }
+        return app.ble.connectionState.rawValue
+    }
+
     private var stateColor: Color {
         switch app.ble.connectionState {
-        case .disconnected: .secondary
+        case .disconnected: app.link.wifi.isConnected ? .green : .secondary
         case .scanning, .connecting: .orange
         case .connected: .green
         }
@@ -85,41 +137,62 @@ struct HomeView: View {
         .background(.quaternary, in: RoundedRectangle(cornerRadius: 8))
     }
 
-    // MARK: Voice
+    // MARK: Voice (one-step: starts itself — this is a status surface)
 
     private var voiceCard: some View {
-        VStack(spacing: 16) {
-            Button {
-                app.toggleVoice()
-            } label: {
+        VStack(spacing: 12) {
+            HStack(spacing: 12) {
                 ZStack {
                     Circle()
-                        .fill(app.voiceEnabled ? voiceColor.opacity(0.2) : Color.gray.opacity(0.15))
-                        .frame(width: 130, height: 130)
-                    Circle()
-                        .stroke(app.voiceEnabled ? voiceColor : .gray, lineWidth: 3)
-                        .frame(width: 130, height: 130)
+                        .fill(voiceColor.opacity(app.voiceEnabled ? 0.2 : 0.08))
+                        .frame(width: 54, height: 54)
                     Image(systemName: app.voiceEnabled ? "mic.fill" : "mic.slash.fill")
-                        .font(.system(size: 44))
+                        .font(.system(size: 22))
                         .foregroundStyle(app.voiceEnabled ? voiceColor : .gray)
                 }
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(app.voiceStatus.rawValue)
+                        .font(.headline)
+                        .foregroundStyle(app.voiceEnabled ? voiceColor : .secondary)
+                    Text(voiceDetail)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                if showRetry {
+                    Button("Retry") { app.retryVoiceNow() }
+                        .buttonStyle(.bordered)
+                        .font(.subheadline.weight(.semibold))
+                }
             }
-            .buttonStyle(.plain)
-
-            Text(app.voiceStatus.rawValue)
-                .font(.title3.weight(.semibold))
-                .foregroundStyle(app.voiceEnabled ? voiceColor : .secondary)
-
             if app.voiceEnabled {
-                Text("Hold the button on the glasses to talk")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
                 micMeter
             }
         }
         .frame(maxWidth: .infinity)
         .padding()
         .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 16))
+    }
+
+    private var voiceDetail: String {
+        if app.settings.apiKey.isEmpty {
+            return "Add your OpenAI API key in Settings to enable voice."
+        }
+        if app.voiceEnabled {
+            return "Hold the button on the glasses to talk."
+        }
+        if !app.voiceAutoEnabled {
+            return "Voice is stopped — tap Retry to start it again."
+        }
+        if !app.ble.isConnected {
+            return "Voice starts automatically once the glasses connect."
+        }
+        return "Starting voice…"
+    }
+
+    private var showRetry: Bool {
+        guard !app.settings.apiKey.isEmpty else { return false }
+        return !app.voiceEnabled || app.lastError != nil
     }
 
     private var voiceColor: Color {
