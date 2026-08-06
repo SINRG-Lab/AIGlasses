@@ -4,8 +4,12 @@ import android.content.Intent
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.media.MediaMetadataRetriever
+import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.spring
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectVerticalDragGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -14,26 +18,27 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.lazy.grid.GridCells
+import androidx.compose.foundation.lazy.grid.GridItemSpan
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
-import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.foundation.pager.HorizontalPager
 import androidx.compose.foundation.pager.rememberPagerState
-import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Close
-import androidx.compose.material.icons.filled.Delete
-import androidx.compose.material.icons.filled.Share
+import androidx.compose.material.icons.outlined.Delete
+import androidx.compose.material.icons.outlined.PlayArrow
+import androidx.compose.material.icons.outlined.Share
 import androidx.compose.material3.AlertDialog
-import androidx.compose.material3.Button
-import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -43,11 +48,10 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.withContext
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.alpha
+import androidx.compose.ui.draw.scale
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.FilterQuality
 import androidx.compose.ui.graphics.asImageBitmap
@@ -55,113 +59,113 @@ import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import androidx.core.content.FileProvider
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.example.aiglasses.MainViewModel
 import com.example.aiglasses.model.SavedImage
-import com.example.aiglasses.ui.components.AmbientBackground
-import com.example.aiglasses.ui.components.GlassCard
-import com.example.aiglasses.ui.theme.BgMid
-import com.example.aiglasses.ui.theme.GlassSurface
-import com.example.aiglasses.ui.theme.Red
+import com.example.aiglasses.ui.components.Eyebrow
+import com.example.aiglasses.ui.components.GlassesGlyph
+import com.example.aiglasses.ui.theme.ErrorRed
+import com.example.aiglasses.ui.theme.MonoData
+import com.example.aiglasses.ui.theme.OutlineGray
+import com.example.aiglasses.ui.theme.PanelHigh
 import com.example.aiglasses.ui.theme.TextPrimary
 import com.example.aiglasses.ui.theme.TextSecondary
 import com.example.aiglasses.ui.theme.TextTertiary
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.text.SimpleDateFormat
+import java.util.Calendar
 import java.util.Date
 import java.util.Locale
+
+/** One capture-day section of the grid. */
+private data class DayGroup(val label: String, val items: List<SavedImage>)
 
 @Composable
 fun GalleryScreen(viewModel: MainViewModel) {
     val savedImages by viewModel.savedImages.collectAsStateWithLifecycle()
-    val glassesStatus by viewModel.glassesStatus.collectAsStateWithLifecycle()
     var viewerIndex by remember { mutableStateOf<Int?>(null) }
 
-    Box(modifier = Modifier.fillMaxSize()) {
-        AmbientBackground(connectionState = glassesStatus.connectionState)
+    val groups = remember(savedImages) { groupByDay(savedImages) }
 
-        Column(
-            modifier = Modifier
-                .fillMaxSize()
-                .padding(horizontal = 20.dp)
-                .padding(top = 56.dp, bottom = 100.dp)
-        ) {
-            Text(
-                text = "Gallery",
-                style = MaterialTheme.typography.displayMedium,
-                color = TextPrimary,
-                modifier = Modifier.padding(bottom = 4.dp)
-            )
-            Text(
-                text = "Photos captured by your glasses",
-                fontSize = 15.sp,
-                color = TextTertiary,
-                modifier = Modifier.padding(bottom = 20.dp)
-            )
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(MaterialTheme.colorScheme.background)
+            .statusBarsPadding()
+    ) {
+        Text(
+            text = "Gallery",
+            style = MaterialTheme.typography.headlineSmall,
+            color = TextPrimary,
+            modifier = Modifier.padding(start = 20.dp, top = 20.dp, bottom = 4.dp)
+        )
 
-            if (savedImages.isEmpty()) {
-                GlassCard(depth = 1, cornerRadius = 14.dp) {
-                    Box(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(40.dp),
-                        contentAlignment = Alignment.Center
-                    ) {
-                        Text(
-                            text = "No photos yet — press the button on your glasses to capture one",
-                            fontSize = 14.sp,
-                            color = TextTertiary
+        if (savedImages.isEmpty()) {
+            EmptyGallery()
+        } else {
+            // Edge-to-edge 3-column grid, 2dp gutters, no thumb chrome (§6).
+            LazyVerticalGrid(
+                columns = GridCells.Fixed(3),
+                verticalArrangement = Arrangement.spacedBy(2.dp),
+                horizontalArrangement = Arrangement.spacedBy(2.dp),
+                modifier = Modifier.fillMaxSize(),
+                contentPadding = androidx.compose.foundation.layout.PaddingValues(bottom = 112.dp)
+            ) {
+                groups.forEach { group ->
+                    item(key = "header_${group.label}", span = { GridItemSpan(maxLineSpan) }) {
+                        Eyebrow(
+                            text = group.label,
+                            modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp)
                         )
                     }
-                }
-            } else {
-                val videoCount = savedImages.count { it.isVideo }
-                val imageCount = savedImages.size - videoCount
-                val label = buildString {
-                    if (imageCount > 0) append("$imageCount PHOTO${if (imageCount != 1) "S" else ""}")
-                    if (imageCount > 0 && videoCount > 0) append("  ·  ")
-                    if (videoCount > 0) append("$videoCount VIDEO${if (videoCount != 1) "S" else ""}")
-                }
-                Text(
-                    text = label,
-                    fontSize = 11.sp,
-                    fontWeight = FontWeight.SemiBold,
-                    letterSpacing = 1.2.sp,
-                    color = TextTertiary,
-                    modifier = Modifier.padding(bottom = 10.dp)
-                )
-
-                LazyVerticalGrid(
-                    columns = GridCells.Fixed(2),
-                    verticalArrangement = Arrangement.spacedBy(8.dp),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp),
-                    modifier = Modifier.fillMaxSize()
-                ) {
-                    items(savedImages, key = { it.filename }) { image ->
-                        GalleryThumbnail(
-                            image = image,
-                            viewModel = viewModel,
-                            onClick = {
-                                val idx = savedImages.indexOfFirst { it.filename == image.filename }
-                                if (idx >= 0) viewerIndex = idx
-                            }
-                        )
+                    group.items.forEachIndexed { indexInGroup, image ->
+                        item(key = image.filename) {
+                            GalleryThumbnail(
+                                image = image,
+                                viewModel = viewModel,
+                                appearIndex = indexInGroup,
+                                onClick = {
+                                    val idx = savedImages.indexOfFirst { it.filename == image.filename }
+                                    if (idx >= 0) viewerIndex = idx
+                                }
+                            )
+                        }
                     }
                 }
             }
         }
+    }
 
-        viewerIndex?.let { startIndex ->
-            GalleryViewer(
-                images = savedImages,
-                startIndex = startIndex,
-                viewModel = viewModel,
-                onDismiss = { viewerIndex = null }
+    viewerIndex?.let { startIndex ->
+        GalleryViewer(
+            images = savedImages,
+            startIndex = startIndex,
+            viewModel = viewModel,
+            onDismiss = { viewerIndex = null }
+        )
+    }
+}
+
+@Composable
+private fun EmptyGallery() {
+    Box(
+        modifier = Modifier.fillMaxSize(),
+        contentAlignment = Alignment.Center
+    ) {
+        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+            GlassesGlyph(color = OutlineGray, width = 96.dp, height = 36.dp)
+            Text(
+                text = "No photos yet",
+                style = MaterialTheme.typography.bodyMedium,
+                color = TextTertiary,
+                modifier = Modifier.padding(top = 16.dp)
             )
         }
     }
@@ -171,85 +175,59 @@ fun GalleryScreen(viewModel: MainViewModel) {
 private fun GalleryThumbnail(
     image: SavedImage,
     viewModel: MainViewModel,
+    appearIndex: Int,
     onClick: () -> Unit
 ) {
     // Decode off the main thread — full-size decodes in composition jank the grid.
     val bitmap = produceState<Bitmap?>(initialValue = null, image.filename) {
         value = withContext(Dispatchers.IO) { loadBitmap(viewModel, image) }
     }.value
-    val timeFormat = remember { SimpleDateFormat("MMM d, h:mm a", Locale.getDefault()) }
 
-    GlassCard(depth = 1, cornerRadius = 12.dp, onClick = onClick) {
-        Column {
-            Box(
+    // Thumb appear: fade 220ms + scale 0.94→1 spring, staggered ≤6 items (§6).
+    val appearAlpha = remember { Animatable(0f) }
+    val appearScale = remember { Animatable(0.94f) }
+    LaunchedEffect(image.filename) {
+        delay((appearIndex.coerceAtMost(6)) * 30L)
+        launch { appearAlpha.animateTo(1f, tween(220)) }
+        appearScale.animateTo(1f, spring(dampingRatio = 0.8f, stiffness = 380f))
+    }
+
+    Box(
+        modifier = Modifier
+            .aspectRatio(1f)
+            .alpha(appearAlpha.value)
+            .scale(appearScale.value)
+            .background(PanelHigh)
+            .clickable(onClick = onClick)
+    ) {
+        if (bitmap != null) {
+            Image(
+                bitmap = bitmap.asImageBitmap(),
+                contentDescription = image.filename,
+                contentScale = ContentScale.Crop,
+                filterQuality = FilterQuality.High,
+                modifier = Modifier.fillMaxSize()
+            )
+        }
+        if (image.isVideo) {
+            Icon(
+                Icons.Outlined.PlayArrow,
+                contentDescription = "Video",
+                tint = TextPrimary,
                 modifier = Modifier
-                    .fillMaxWidth()
-                    .aspectRatio(1f)
-            ) {
-                if (bitmap != null) {
-                    Image(
-                        bitmap = bitmap.asImageBitmap(),
-                        contentDescription = image.filename,
-                        contentScale = ContentScale.Crop,
-                        filterQuality = FilterQuality.High,
-                        modifier = Modifier
-                            .fillMaxSize()
-                            .clip(RoundedCornerShape(topStart = 12.dp, topEnd = 12.dp))
-                    )
-                } else {
-                    Box(
-                        modifier = Modifier
-                            .fillMaxSize()
-                            .background(GlassSurface),
-                        contentAlignment = Alignment.Center
-                    ) {
-                        Text(
-                            text = if (image.isVideo) "▶" else "?",
-                            fontSize = 24.sp,
-                            color = TextTertiary
-                        )
-                    }
-                }
-                if (image.isVideo) {
-                    Box(
-                        modifier = Modifier
-                            .align(Alignment.Center)
-                            .background(Color.Black.copy(alpha = 0.45f), RoundedCornerShape(50))
-                            .padding(horizontal = 10.dp, vertical = 4.dp)
-                    ) {
-                        Text(
-                            "▶  VIDEO", fontSize = 10.sp, color = Color.White,
-                            fontWeight = FontWeight.SemiBold
-                        )
-                    }
-                }
-            }
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(horizontal = 8.dp, vertical = 6.dp),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Text(
-                    text = timeFormat.format(Date(image.timestamp)),
-                    fontSize = 10.sp,
-                    color = TextTertiary
-                )
-                Text(
-                    text = formatSize(image.sizeBytes),
-                    fontSize = 10.sp,
-                    color = TextTertiary
-                )
-            }
+                    .align(Alignment.Center)
+                    .size(28.dp)
+                    .background(Color.Black.copy(alpha = 0.45f), CircleShape)
+                    .padding(4.dp)
+            )
         }
     }
 }
 
 /**
- * Full-screen pager viewer: swipe left/right between items, swipe down (or
- * back / the close button) to dismiss. Renders in its own window (Dialog) so
- * it covers the bottom dock.
+ * Full-screen viewer: pure black, immersive, metadata in mono (§6). Swipe
+ * left/right between items, swipe down (or the close button) to dismiss.
+ * Renders in its own window (Dialog) so it covers the bottom dock.
  */
 @Composable
 private fun GalleryViewer(
@@ -279,7 +257,7 @@ private fun GalleryViewer(
         Box(
             modifier = Modifier
                 .fillMaxSize()
-                .background(Color.Black.copy(alpha = 0.96f))
+                .background(Color.Black)
                 .pointerInput(Unit) {
                     detectVerticalDragGestures(
                         onDragEnd = { if (dragOffset > 220f) onDismiss() else dragOffset = 0f },
@@ -301,7 +279,7 @@ private fun GalleryViewer(
                 }
             }
 
-            // Top bar: position + actions
+            // Top bar: position (mono) + actions
             Row(
                 modifier = Modifier
                     .align(Alignment.TopCenter)
@@ -312,18 +290,17 @@ private fun GalleryViewer(
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 Text(
-                    text = "${pagerState.currentPage + 1} of ${images.size}",
-                    fontSize = 13.sp,
-                    fontWeight = FontWeight.SemiBold,
+                    text = "${pagerState.currentPage + 1}/${images.size}",
+                    style = MonoData,
                     color = TextSecondary,
                     modifier = Modifier.padding(start = 8.dp)
                 )
                 Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
                     IconButton(onClick = { current?.let { shareItem(context, viewModel, it) } }) {
-                        Icon(Icons.Filled.Share, contentDescription = "Share", tint = TextSecondary)
+                        Icon(Icons.Outlined.Share, contentDescription = "Share", tint = TextSecondary)
                     }
                     IconButton(onClick = { showDeleteConfirm = true }) {
-                        Icon(Icons.Filled.Delete, contentDescription = "Delete", tint = TextSecondary)
+                        Icon(Icons.Outlined.Delete, contentDescription = "Delete", tint = TextSecondary)
                     }
                     IconButton(onClick = onDismiss) {
                         Icon(Icons.Filled.Close, contentDescription = "Close", tint = TextPrimary)
@@ -331,12 +308,12 @@ private fun GalleryViewer(
                 }
             }
 
-            // Bottom labels: date, size, dimensions
+            // Bottom metadata — mono telemetry
             current?.let { item ->
                 val dims = remember(item.filename) {
                     if (item.isVideo) null else imageDimensions(viewModel, item)
                 }
-                val dateFormat = remember { SimpleDateFormat("MMM d, yyyy · h:mm a", Locale.getDefault()) }
+                val dateFormat = remember { SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.US) }
                 Column(
                     modifier = Modifier
                         .align(Alignment.BottomCenter)
@@ -346,16 +323,16 @@ private fun GalleryViewer(
                 ) {
                     Text(
                         text = dateFormat.format(Date(item.timestamp)),
-                        fontSize = 13.sp,
-                        color = TextPrimary
+                        style = MonoData,
+                        color = TextSecondary
                     )
                     Text(
                         text = buildString {
                             append(formatSize(item.sizeBytes))
-                            if (dims != null) append("  ·  ${dims.first} × ${dims.second}")
-                            if (item.isVideo) append("  ·  video")
+                            if (dims != null) append(" · ${dims.first}x${dims.second}")
+                            if (item.isVideo) append(" · video")
                         },
-                        fontSize = 12.sp,
+                        style = MonoData,
                         color = TextTertiary
                     )
                 }
@@ -365,25 +342,35 @@ private fun GalleryViewer(
                 AlertDialog(
                     onDismissRequest = { showDeleteConfirm = false },
                     title = {
-                        Text(if (current.isVideo) "Delete Video?" else "Delete Photo?", color = TextPrimary)
+                        Text(
+                            text = if (current.isVideo) "Delete video?" else "Delete photo?",
+                            style = MaterialTheme.typography.titleMedium,
+                            color = TextPrimary
+                        )
                     },
-                    text = { Text("This cannot be undone.", color = TextSecondary) },
+                    text = {
+                        Text(
+                            "This cannot be undone.",
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = TextSecondary
+                        )
+                    },
                     confirmButton = {
                         TextButton(onClick = {
                             viewModel.deleteImage(current.filename)
                             showDeleteConfirm = false
                             onDismiss()
                         }) {
-                            Text("Delete", color = Red)
+                            Text("Delete", color = ErrorRed)
                         }
                     },
                     dismissButton = {
                         TextButton(onClick = { showDeleteConfirm = false }) {
-                            Text("Cancel", color = TextTertiary)
+                            Text("Cancel", color = TextSecondary)
                         }
                     },
-                    containerColor = BgMid,
-                    shape = RoundedCornerShape(16.dp)
+                    containerColor = PanelHigh,
+                    shape = MaterialTheme.shapes.large
                 )
             }
         }
@@ -413,7 +400,7 @@ private fun ViewerPage(
             )
         }
         if (item.isVideo) {
-            Button(
+            OutlinedButton(
                 onClick = {
                     val file = viewModel.getImageFile(item.filename)
                     try {
@@ -428,16 +415,36 @@ private fun ViewerPage(
                     } catch (_: Exception) {
                     }
                 },
-                modifier = Modifier.align(Alignment.Center),
-                colors = ButtonDefaults.buttonColors(containerColor = Color.White.copy(alpha = 0.15f))
+                modifier = Modifier.align(Alignment.Center)
             ) {
-                Text("▶  Play Video", color = Color.White, fontWeight = FontWeight.SemiBold)
+                Text("Play video", color = TextPrimary)
             }
         }
     }
 }
 
 // ── Helpers ──
+
+private fun groupByDay(images: List<SavedImage>): List<DayGroup> {
+    if (images.isEmpty()) return emptyList()
+    val dayFormat = SimpleDateFormat("yyyy-MM-dd", Locale.US)
+    val today = dayFormat.format(Date())
+    val yesterday = dayFormat.format(
+        Calendar.getInstance().apply { add(Calendar.DAY_OF_YEAR, -1) }.time
+    )
+    return images
+        .groupBy { dayFormat.format(Date(it.timestamp)) }
+        .entries
+        .sortedByDescending { it.key }
+        .map { (day, items) ->
+            val label = when (day) {
+                today -> "Today · $day"
+                yesterday -> "Yesterday · $day"
+                else -> day
+            }
+            DayGroup(label, items)
+        }
+}
 
 private fun loadBitmap(viewModel: MainViewModel, image: SavedImage): Bitmap? {
     val file = viewModel.getImageFile(image.filename)

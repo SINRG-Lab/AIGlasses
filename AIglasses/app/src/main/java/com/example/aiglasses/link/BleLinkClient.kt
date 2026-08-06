@@ -430,11 +430,20 @@ class BleLinkClient(private val context: Context) {
             return
         }
         scanner = s
-        val filter = ScanFilter.Builder().setServiceUuid(ParcelUuid(SERVICE_UUID)).build()
+        // Filter list = OR semantics. The service-UUID filter finds the real
+        // glasses; the name filters find the macOS bench simulator, whose
+        // CoreBluetooth peripheral stack tends to advertise 128-bit service
+        // UUIDs in an Apple-proprietary "overflow area" invisible to Android
+        // scanners (iOS sees it, we would not).
+        val filters = listOf(
+            ScanFilter.Builder().setServiceUuid(ParcelUuid(SERVICE_UUID)).build(),
+            ScanFilter.Builder().setDeviceName("AIGlasses-ESP32S3").build(),
+            ScanFilter.Builder().setDeviceName("AIGlasses-SIM").build(),
+        )
         val settings = ScanSettings.Builder().setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY).build()
         isScanning = true
         try {
-            s.startScan(listOf(filter), settings, scanCallback)
+            s.startScan(filters, settings, scanCallback)
         } catch (e: Exception) {
             Log.e(TAG, "startScan failed", e)
             isScanning = false
