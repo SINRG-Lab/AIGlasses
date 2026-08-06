@@ -273,10 +273,13 @@ class GlassesSim:
                    | GATTCharacteristicProperties.write_without_response)
         props_c = props_w | GATTCharacteristicProperties.notify
         perm = GATTAttributePermissions.readable | GATTAttributePermissions.writeable
-        await self.server.add_new_characteristic(SERVICE, AUDIO_TX, props_n, bytearray(b"\x00"), perm)
-        await self.server.add_new_characteristic(SERVICE, AUDIO_RX, props_w, bytearray(b"\x00"), perm)
-        await self.server.add_new_characteristic(SERVICE, CONTROL, props_c, bytearray(b"\x00"), perm)
-        await self.server.add_new_characteristic(SERVICE, IMAGE_TX, props_n, bytearray(b"\x00"), perm)
+        # value=None is mandatory: CoreBluetooth only allows a cached initial
+        # value on READ-ONLY characteristics — anything writable/notify must
+        # be created value-less or addService throws NSInternalInconsistency.
+        await self.server.add_new_characteristic(SERVICE, AUDIO_TX, props_n, None, perm)
+        await self.server.add_new_characteristic(SERVICE, AUDIO_RX, props_w, None, perm)
+        await self.server.add_new_characteristic(SERVICE, CONTROL, props_c, None, perm)
+        await self.server.add_new_characteristic(SERVICE, IMAGE_TX, props_n, None, perm)
         await self.server.start()
         print("[SIM] advertising as 'AIGlasses-SIM' (service aa00) — connect from the app")
         print("[SIM] commands: t=talk  p=photo  v=vision  q=quit")
