@@ -1,5 +1,28 @@
 import Foundation
 
+struct RealtimeCloseReason: Sendable {
+    enum Kind: Equatable, Sendable {
+        case rateLimited
+        case serviceUnavailable
+        case networkUnavailable
+        case authenticationRejected
+        case accessDenied
+        case credentialExpired
+        case other
+    }
+
+    let kind: Kind
+    let message: String
+}
+
+/// A fully serialized Realtime image event. JPEG Base64 conversion and JSON
+/// encoding happen away from CoreBluetooth's main callback path; the main
+/// actor only queues this ready-to-send WebSocket string.
+struct PreparedRealtimeImage: Sendable {
+    let message: String
+    let byteCount: Int
+}
+
 /// One OpenAI GPT Realtime session over a raw WebSocket
 /// (URLSessionWebSocketTask). GA endpoint — no beta header.
 ///
@@ -30,7 +53,7 @@ final class RealtimeSession: NSObject {
     var onSpeechStarted: (() -> Void)?
     var onSpeechStopped: (() -> Void)?
     var onError: ((String) -> Void)?
-    var onClosed: ((String) -> Void)?
+    var onClosed: ((RealtimeCloseReason) -> Void)?
     var onLog: ((String) -> Void)?
 
     static let instructions =
@@ -51,15 +74,28 @@ final class RealtimeSession: NSObject {
 
     // MARK: Lifecycle
 
-    func connect(apiKey: String, model: String, effort: String, voice: String) {
+    func connect(credential: RealtimeClientCredential, effort: String, voice: String) {
         guard state == .idle || state == .closed else { return }
-        guard let url = URL(string: "wss://api.openai.com/v1/realtime?model=\(model)") else {
+        guard credential.isUsable() else {
+            onError?(RealtimeCredentialServiceError.expiredCredential.localizedDescription)
+            finish(reason: .init(
+                kind: .credentialExpired,
+                message: "Secure voice credential expired before connection."
+            ))
+            return
+        }
+        var components = URLComponents()
+        components.scheme = "wss"
+        components.host = "api.openai.com"
+        components.path = "/v1/realtime"
+        components.queryItems = [URLQueryItem(name: "model", value: credential.model)]
+        guard let url = components.url else {
             onError?("bad model string")
             return
         }
-        self.model = model
+        self.model = credential.model
         var req = URLRequest(url: url)
-        req.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+        req.setValue("Bearer \(credential.secret)", forHTTPHeaderField: "Authorization")
         // Own session with self as delegate: the ONLY way to see why a
         // handshake failed (HTTP status) or why the server closed us (close
         // reason). URLSession.shared reports both as a bare ENOTCONN
@@ -100,7 +136,7 @@ final class RealtimeSession: NSObject {
                 ],
             ],
         ])
-        onLog?("realtime: connecting (model \(model), effort \(effort), voice \(voice))")
+        onLog?("realtime: connecting (model \(credential.model), effort \(effort), voice \(voice))")
         startReceiveLoop()
         startSilenceWatchdog()
     }
@@ -131,11 +167,9 @@ final class RealtimeSession: NSObject {
         ])
     }
 
-    /// Attach a photo from the glasses to the conversation; the user's next
-    /// voice turn can reference it. If the API rejects input_image the error
-    /// event surfaces through onError (photo is already safe in the gallery).
-    func attachImage(jpeg: Data) {
-        sendJSON([
+    /// CPU-heavy image preparation is safe to call from a detached task.
+    nonisolated static func prepareImage(jpeg: Data) -> PreparedRealtimeImage? {
+        let event: [String: Any] = [
             "type": "conversation.item.create",
             "item": [
                 "type": "message",
@@ -147,8 +181,18 @@ final class RealtimeSession: NSObject {
                     ],
                 ],
             ],
-        ])
-        onLog?("realtime: photo attached (\(jpeg.count) B)")
+        ]
+        guard let data = try? JSONSerialization.data(withJSONObject: event) else { return nil }
+        return PreparedRealtimeImage(
+            message: String(decoding: data, as: UTF8.self),
+            byteCount: jpeg.count
+        )
+    }
+
+    /// Queue an already prepared photo before any buffered mic messages.
+    func attachImage(_ image: PreparedRealtimeImage) {
+        sendText(image.message)
+        onLog?("realtime: photo attached (\(image.byteCount) B)")
     }
 
     // MARK: Silence tail (push-to-talk -> server VAD bridge)
@@ -177,12 +221,16 @@ final class RealtimeSession: NSObject {
     // MARK: WebSocket plumbing
 
     private func sendJSON(_ obj: [String: Any]) {
-        guard let ws else { return }
         guard let data = try? JSONSerialization.data(withJSONObject: obj) else {
             onError?("JSON encode failed")
             return
         }
-        ws.send(.string(String(decoding: data, as: UTF8.self))) { [weak self] error in
+        sendText(String(decoding: data, as: UTF8.self))
+    }
+
+    private func sendText(_ text: String) {
+        guard let ws else { return }
+        ws.send(.string(text)) { [weak self] error in
             if let error {
                 Task { @MainActor [weak self] in
                     self?.handleTransportError(error)
@@ -216,7 +264,7 @@ final class RealtimeSession: NSObject {
         finish(reason: Self.describe(error: error, httpStatus: status, model: model))
     }
 
-    private func finish(reason: String) {
+    private func finish(reason: RealtimeCloseReason) {
         guard state != .closed else { return }
         state = .closed
         ws = nil
@@ -225,20 +273,58 @@ final class RealtimeSession: NSObject {
         onClosed?(reason)
     }
 
-    private static func describe(error: Error, httpStatus: Int?, model: String) -> String {
+    nonisolated static func describe(
+        error: Error,
+        httpStatus: Int?,
+        model: String
+    ) -> RealtimeCloseReason {
         if let code = httpStatus, code != 101 {
             switch code {
-            case 401: return "OpenAI rejected the API key (HTTP 401) — re-paste it in Settings."
-            case 403: return "OpenAI refused access (HTTP 403) — this key/org can't use \(model)."
-            case 429: return "OpenAI rate/quota limit (HTTP 429) — check billing/credits."
-            default:  return "OpenAI handshake failed (HTTP \(code), model \(model))."
+            case 401:
+                return .init(
+                    kind: .authenticationRejected,
+                    message: "The short-lived voice credential was rejected (HTTP 401)."
+                )
+            case 403:
+                return .init(
+                    kind: .accessDenied,
+                    message: "The voice service refused access to \(model) (HTTP 403)."
+                )
+            case 429:
+                return .init(
+                    kind: .rateLimited,
+                    message: "The voice service is temporarily rate limited (HTTP 429)."
+                )
+            case 500...599:
+                return .init(
+                    kind: .serviceUnavailable,
+                    message: "OpenAI handshake failed (HTTP \(code), model \(model))."
+                )
+            default:
+                return .init(
+                    kind: .other,
+                    message: "OpenAI handshake failed (HTTP \(code), model \(model))."
+                )
             }
         }
         let ns = error as NSError
-        if ns.domain == NSURLErrorDomain, ns.code == NSURLErrorNotConnectedToInternet {
-            return "No internet connection on the phone."
+        if ns.domain == NSURLErrorDomain {
+            let networkCodes = [
+                NSURLErrorNotConnectedToInternet,
+                NSURLErrorNetworkConnectionLost,
+                NSURLErrorTimedOut,
+                NSURLErrorCannotConnectToHost,
+                NSURLErrorCannotFindHost,
+                NSURLErrorDNSLookupFailed,
+            ]
+            if networkCodes.contains(ns.code) {
+                let message = ns.code == NSURLErrorNotConnectedToInternet
+                    ? "No internet connection on the phone."
+                    : error.localizedDescription
+                return .init(kind: .networkUnavailable, message: message)
+            }
         }
-        return error.localizedDescription
+        return .init(kind: .other, message: error.localizedDescription)
     }
 
     // MARK: Event handling
@@ -286,7 +372,8 @@ final class RealtimeSession: NSObject {
             onSpeechStopped?()
 
         case "error":
-            let message = ((obj["error"] as? [String: Any])?["message"] as? String) ?? text
+            let message = ((obj["error"] as? [String: Any])?["message"] as? String)
+                ?? "The realtime service reported an error."
             onError?(message)
 
         default:
@@ -314,8 +401,11 @@ extension RealtimeSession: URLSessionWebSocketDelegate {
                                 reason: Data?) {
         let why = reason.flatMap { String(data: $0, encoding: .utf8) } ?? ""
         Task { @MainActor in
-            self.finish(reason: "server closed the session (code \(closeCode.rawValue))"
-                        + (why.isEmpty ? "" : ": \(why)"))
+            self.finish(reason: .init(
+                kind: .other,
+                message: "server closed the session (code \(closeCode.rawValue))"
+                    + (why.isEmpty ? "" : ": \(why)")
+            ))
         }
     }
 }

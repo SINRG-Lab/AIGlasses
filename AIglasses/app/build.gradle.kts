@@ -1,15 +1,7 @@
-import java.util.Properties
 plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.android)
     alias(libs.plugins.kotlin.compose)
-}
-
-// Load API key from secrets.properties
-val secretsFile = rootProject.file("secrets.properties")
-val secrets = Properties()
-if (secretsFile.exists()) {
-    secrets.load(secretsFile.inputStream())
 }
 
 android {
@@ -25,8 +17,6 @@ android {
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
-        // Inject API key into BuildConfig
-        buildConfigField("String", "OPENAI_API_KEY", "\"${secrets.getProperty("OPENAI_API_KEY", "")}\"")
     }
 
     buildTypes {
@@ -67,9 +57,12 @@ dependencies {
     implementation(libs.androidx.lifecycle.viewmodel.compose)
     implementation(libs.androidx.lifecycle.runtime.compose)
 
-    // HTTP client for OpenAI API
+    // HTTP client for Supabase Auth / Edge Functions and OpenAI Realtime.
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
     testImplementation(libs.junit)
+    testImplementation("com.squareup.okhttp3:mockwebserver:4.12.0")
+    testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.9.0")
+    testImplementation("org.json:json:20250517")
     androidTestImplementation(libs.androidx.junit)
     androidTestImplementation(libs.androidx.espresso.core)
     androidTestImplementation(platform(libs.androidx.compose.bom))

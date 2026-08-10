@@ -144,16 +144,16 @@ struct HomeView: View {
             HStack(spacing: 12) {
                 ZStack {
                     Circle()
-                        .fill(voiceColor.opacity(app.voiceEnabled ? 0.2 : 0.08))
+                        .fill(voiceColor.opacity(voiceArmed ? 0.2 : 0.08))
                         .frame(width: 54, height: 54)
-                    Image(systemName: app.voiceEnabled ? "mic.fill" : "mic.slash.fill")
+                    Image(systemName: voiceArmed ? "mic.fill" : "mic.slash.fill")
                         .font(.system(size: 22))
-                        .foregroundStyle(app.voiceEnabled ? voiceColor : .gray)
+                        .foregroundStyle(voiceArmed ? voiceColor : .gray)
                 }
                 VStack(alignment: .leading, spacing: 3) {
                     Text(app.voiceStatus.rawValue)
                         .font(.headline)
-                        .foregroundStyle(app.voiceEnabled ? voiceColor : .secondary)
+                        .foregroundStyle(voiceArmed ? voiceColor : .secondary)
                     Text(voiceDetail)
                         .font(.caption)
                         .foregroundStyle(.secondary)
@@ -175,29 +175,30 @@ struct HomeView: View {
     }
 
     private var voiceDetail: String {
-        if app.settings.apiKey.isEmpty {
-            return "Add your OpenAI API key in Settings to enable voice."
-        }
         if app.voiceEnabled {
             return "Hold the button on the glasses to talk."
         }
         if !app.voiceAutoEnabled {
-            return "Voice is stopped — tap Retry to start it again."
+            return "Glasses voice is disabled in Settings."
         }
         if !app.ble.isConnected {
-            return "Voice starts automatically once the glasses connect."
+            return "Voice arms automatically once the glasses connect."
         }
-        return "Starting voice…"
+        return "Hold the physical side button on the glasses to talk."
     }
 
     private var showRetry: Bool {
-        guard !app.settings.apiKey.isEmpty else { return false }
-        return !app.voiceEnabled || app.lastError != nil
+        app.lastError != nil
+    }
+
+    private var voiceArmed: Bool {
+        app.voiceEnabled || app.voiceAutoEnabled && app.ble.isConnected
     }
 
     private var voiceColor: Color {
         switch app.voiceStatus {
         case .off: .gray
+        case .ready: .green
         case .connecting: .orange
         case .listening: .green
         case .hearing: .blue

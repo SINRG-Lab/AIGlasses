@@ -74,8 +74,8 @@ class MainActivity : ComponentActivity() {
         }
 
         // One-step activation (iOS AppModel.init parity): bring the foreground
-        // service + radio up immediately; the voice session follows by itself
-        // once the glasses connect and an API key is saved.
+        // service + radio up immediately. A voice session starts only when the
+        // user presses the physical button on the glasses.
         viewModel.startScan()
     }
 
@@ -87,6 +87,8 @@ class MainActivity : ComponentActivity() {
                     PackageManager.PERMISSION_GRANTED
         } else {
             ContextCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH) ==
+                    PackageManager.PERMISSION_GRANTED &&
+            ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_COARSE_LOCATION) ==
                     PackageManager.PERMISSION_GRANTED &&
             ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) ==
                     PackageManager.PERMISSION_GRANTED
@@ -102,6 +104,7 @@ class MainActivity : ComponentActivity() {
         } else {
             wanted += Manifest.permission.BLUETOOTH
             wanted += Manifest.permission.BLUETOOTH_ADMIN
+            wanted += Manifest.permission.ACCESS_COARSE_LOCATION
             wanted += Manifest.permission.ACCESS_FINE_LOCATION
         }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
@@ -110,6 +113,7 @@ class MainActivity : ComponentActivity() {
             wanted += Manifest.permission.NEARBY_WIFI_DEVICES
         } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             // 12/12L: the local-only WiFi request uses the location fallback.
+            wanted += Manifest.permission.ACCESS_COARSE_LOCATION
             wanted += Manifest.permission.ACCESS_FINE_LOCATION
         }
         return wanted.filter {

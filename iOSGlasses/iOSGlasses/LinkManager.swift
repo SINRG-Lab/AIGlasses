@@ -203,7 +203,9 @@ final class LinkManager {
     @ObservationIgnored var onMicAudio: ((Data) -> Void)?
     @ObservationIgnored var onPhoto: ((Data) -> Void)?
     @ObservationIgnored var onVisionPhoto: ((Data) -> Void)?
+    @ObservationIgnored var onRecordingStarted: (() -> Void)?
     @ObservationIgnored var onBargeIn: (() -> Void)?
+    @ObservationIgnored var onResponsePlaybackFinished: (() -> Void)?
     @ObservationIgnored var onLog: ((String) -> Void)?
     @ObservationIgnored var onConnected: (() -> Void)?
 
@@ -234,7 +236,9 @@ final class LinkManager {
         ble.onPhotoStats = { [weak self] bytes, seconds in
             self?.recordPhotoTransfer(route: .bluetooth, bytes: bytes, seconds: seconds)
         }
+        ble.onRecordingStarted = { [weak self] in self?.onRecordingStarted?() }
         ble.onBargeIn = { [weak self] in self?.onBargeIn?() }
+        ble.onResponsePlaybackFinished = { [weak self] in self?.onResponsePlaybackFinished?() }
         ble.onStatsPacket = { [weak self] in self?.handleStatsPacket($0) }
         ble.onConnected = { [weak self] in
             guard let self else { return }

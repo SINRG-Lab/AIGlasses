@@ -7,7 +7,7 @@ import Observation
 @Observable
 final class GalleryStore {
 
-    struct Photo: Identifiable, Hashable {
+    struct Photo: Identifiable, Hashable, Sendable {
         let id: String       // filename
         let url: URL
         let date: Date
@@ -41,14 +41,20 @@ final class GalleryStore {
     }
 
     @discardableResult
-    func save(jpeg: Data) throws -> Photo {
-        let fmt = DateFormatter()
-        fmt.dateFormat = "yyyyMMdd-HHmmss-SSS"
-        let name = "photo-\(fmt.string(from: Date())).jpg"
-        let url = dir.appendingPathComponent(name)
-        try jpeg.write(to: url, options: .atomic)
-        let photo = Photo(id: name, url: url, date: Date(), bytes: jpeg.count)
-        photos.insert(photo, at: 0)
+    func save(jpeg: Data) async throws -> Photo {
+        let directory = dir
+        let photo = try await Task.detached(priority: .utility) {
+            let fmt = DateFormatter()
+            fmt.dateFormat = "yyyyMMdd-HHmmss-SSS"
+            let now = Date()
+            let suffix = UUID().uuidString.prefix(8)
+            let name = "photo-\(fmt.string(from: now))-\(suffix).jpg"
+            let url = directory.appendingPathComponent(name)
+            try jpeg.write(to: url, options: .atomic)
+            return Photo(id: name, url: url, date: now, bytes: jpeg.count)
+        }.value
+        photos.append(photo)
+        photos.sort { $0.date > $1.date }
         return photo
     }
 
