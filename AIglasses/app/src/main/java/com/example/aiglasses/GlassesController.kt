@@ -4,6 +4,7 @@ import android.content.Context
 import android.graphics.BitmapFactory
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.util.Log
 import com.example.aiglasses.link.BleState
 import com.example.aiglasses.link.LinkManager
@@ -15,12 +16,15 @@ import com.example.aiglasses.model.SavedImage
 import com.example.aiglasses.model.VoiceState
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import java.io.File
 
 /**
@@ -39,10 +43,9 @@ import java.io.File
  *   RealtimeVoiceClient (PCM16@24k deltas) --µ-law encode-->
  *     LinkManager.enqueueResponseAudio (paced 'S'/'A'/'E') --> glasses speaker
  *
- * One-step activation: BLE connects on service start; the voice session
- * auto-starts whenever (voice wanted && API key present && BLE connected),
- * reconnects with exponential backoff 2/4/8…30 s when the socket dies, and is
- * revived immediately by arriving mic audio (iOS AppModel.onMicAudio parity).
+ * BLE connects on service start, but the short-lived credential and Realtime
+ * socket are created only when the physical glasses button starts recording.
+ * Mic audio is bounded-buffered during that startup so the first words survive.
  */
 class GlassesController private constructor(private val appContext: Context) {
 
@@ -50,9 +53,10 @@ class GlassesController private constructor(private val appContext: Context) {
         private const val TAG = "GlassesController"
         private const val MAX_LOG_ENTRIES = 300
         private const val GALLERY_DIR = "gallery"
-        private const val RECONNECT_BASE_MS = 2_000L
-        private const val RECONNECT_MAX_MS = 30_000L
         private const val MIC_PULSE_DECAY_MS = 700L
+        private const val SESSION_IDLE_MS = 120_000L
+        /** Ten seconds of PCM16 mono @24 kHz while auth + the socket open. */
+        private const val MAX_PREBUFFER_BYTES = 2 * 24_000 * 10
 
         @Volatile private var instance: GlassesController? = null
 
@@ -66,19 +70,32 @@ class GlassesController private constructor(private val appContext: Context) {
 
     val settings = RealtimeSettings(appContext)
     val link = LinkManager(appContext)
+    private val credentialProvider = SupabaseRealtimeCredentialProvider(appContext)
 
     private val mainHandler = Handler(Looper.getMainLooper())
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private val mic = MicConditioner()
     @Volatile private var realtime: RealtimeVoiceClient? = null
+    private val realtimeLock = Any()
+    private val audioPrebuffer = BoundedAudioPrebuffer(MAX_PREBUFFER_BYTES)
+    private var pendingVisionImage: RealtimeVoiceClient.PreparedImage? = null
+    private var visionPreparationsInFlight = 0
+    private var visionGeneration = 0L
+    /** Guarded by [realtimeLock]; false while the ordered startup buffer is draining. */
+    private var realtimeAcceptingLiveAudio = false
+    private val photoMutex = Mutex()
 
     // ── One-step activation state (main thread, except where @Volatile) ──
 
-    /** True unless the user explicitly stopped voice (Settings). */
-    @Volatile private var voiceWanted = true
+    /** Durable privacy preference; honored even after a sticky-service process restart. */
+    @Volatile private var voiceWanted = settings.glassesVoiceEnabled
     @Volatile private var voiceEnabled = false
-    private var reconnectDelayMs = RECONNECT_BASE_MS
-    private var reconnectRunnable: Runnable? = null
+    private var credentialJob: Job? = null
+    /** Invalidates late results/finally blocks from cancelled credential coroutines. */
+    private var credentialGeneration = 0L
+    @Volatile private var credentialRetryNotBeforeUptimeMs = 0L
+    @Volatile private var sessionRequiresNewPhysicalPress = false
+    private var sessionIdleRunnable: Runnable? = null
 
     // Assistant transcript accumulates delta-by-delta; main thread only.
     private val assistantTranscript = StringBuilder()
@@ -102,7 +119,7 @@ class GlassesController private constructor(private val appContext: Context) {
     private val _lastError = MutableStateFlow<String?>(null)
     val lastError: StateFlow<String?> = _lastError.asStateFlow()
 
-    private val _voiceAutoEnabled = MutableStateFlow(true)
+    private val _voiceAutoEnabled = MutableStateFlow(voiceWanted)
     /** Standing "voice wanted" preference — false only after a manual stop. */
     val voiceAutoEnabled: StateFlow<Boolean> = _voiceAutoEnabled.asStateFlow()
 
@@ -131,9 +148,20 @@ class GlassesController private constructor(private val appContext: Context) {
         // Called on LinkManager's notify thread — decode/conditioning stays
         // off the main thread; only the session revival hops to main.
         link.onMicAudio = { pcm16k -> handleMicAudio(pcm16k) }
+        link.onRecordingStarted = {
+            // This callback precedes the new turn's audio on the BLE stream. Clear stale frames
+            // here, not later on main, or a busy main thread could erase the first new frames.
+            val clearsTerminalGate = sessionRequiresNewPhysicalPress
+            synchronized(realtimeLock) {
+                // With no live socket, everything buffered predates this physical turn (whether
+                // the prior cooldown is active or already expired). The newest S always wins.
+                if (realtime == null || clearsTerminalGate) audioPrebuffer.clear()
+            }
+            mainHandler.post { handlePhysicalRecordingStarted(clearsTerminalGate) }
+        }
 
-        link.onPhoto = { jpeg -> handlePhoto(jpeg, vision = false) }
-        link.onVisionPhoto = { jpeg -> handlePhoto(jpeg, vision = true) }
+        link.onPhoto = { jpeg -> queuePhotoProcessing(jpeg, vision = false) }
+        link.onVisionPhoto = { jpeg -> queuePhotoProcessing(jpeg, vision = true) }
 
         link.onBargeIn = {
             if (voiceEnabled) setVoiceState(VoiceState.Listening)
@@ -141,7 +169,10 @@ class GlassesController private constructor(private val appContext: Context) {
 
         link.onConnected = {
             mic.reset()
-            mainHandler.post { maybeStartVoice() }
+            mainHandler.post {
+                link.setVoiceMode(voiceWanted)
+                if (voiceWanted && realtime == null) setVoiceState(VoiceState.Listening)
+            }
         }
     }
 
@@ -162,12 +193,35 @@ class GlassesController private constructor(private val appContext: Context) {
                 )
             }
         }
+        if (state !is BleState.Connected) {
+            if (realtime != null || credentialJob?.isActive == true) {
+                cancelCredentialFetch()
+            }
+            cancelSessionIdleTimeout()
+            voiceEnabled = false
+            setVoiceState(VoiceState.Idle)
+            // Audio may have accumulated while a local retry gate was active even though no
+            // socket/job existed. Never carry that recording across a BLE disconnect.
+            synchronized(realtimeLock) {
+                realtimeAcceptingLiveAudio = false
+                realtime?.close()
+                realtime = null
+                audioPrebuffer.clear()
+                pendingVisionImage = null
+                visionGeneration++
+                visionPreparationsInFlight = 0
+            }
+            _photoAttached.value = false
+        }
     }
 
     // ── Connection controls ──
 
     /** Bring the radio up (idempotent). Voice follows once glasses connect. */
     fun connect() {
+        // Set the desired codec mode before GATT subscription completes so the
+        // first physical press cannot land in the legacy PCM format window.
+        link.setVoiceMode(voiceWanted)
         link.connect()
     }
 
@@ -186,20 +240,38 @@ class GlassesController private constructor(private val appContext: Context) {
     // ── Mic uplink ──
 
     private fun handleMicAudio(pcm16k: ByteArray) {
+        if (!voiceWanted) return
         noteMicActivity()
-        // Revival: the websocket may have died (backoff pending, app dozing).
-        // Mic audio arriving IS the wake signal — restart the session now.
-        // OkHttp queues the frames sent while the handshake completes, so the
-        // first words of the question survive (iOS AppModel.onMicAudio parity).
-        if (realtime == null && voiceWanted && settings.apiKey.value.isNotBlank()) {
-            mainHandler.post {
-                cancelScheduledReconnect()
-                maybeStartVoice()
+        val conditioned = mic.process(pcm16k)
+        val pcm24k = AudioCodec.upsample16kTo24k(conditioned)
+        var needsSession = false
+        var liveClient: RealtimeVoiceClient? = null
+        synchronized(realtimeLock) {
+            val rt = realtime
+            if (rt == null || !realtimeAcceptingLiveAudio || visionPreparationsInFlight > 0) {
+                audioPrebuffer.add(pcm24k)
+                needsSession = rt == null
+            } else {
+                liveClient = rt
             }
         }
-        val rt = realtime ?: return
-        val conditioned = mic.process(pcm16k)
-        rt.appendAudio(AudioCodec.upsample16kTo24k(conditioned))
+        // Base64/JSON work stays off the shared ordering lock.
+        liveClient?.appendAudio(pcm24k)
+        // The firmware's 'S' marker normally arrives first. Treat mic traffic as
+        // a fallback trigger so firmware timing or a lost control notify can never
+        // silently discard the beginning of the question.
+        if (needsSession) mainHandler.post { ensureVoiceSession() }
+    }
+
+    /** Physical side-button start marker. Main thread, including while the phone is locked. */
+    private fun handlePhysicalRecordingStarted(clearsTerminalGate: Boolean) {
+        if (!voiceWanted || link.bleState.value !is BleState.Connected) return
+        if (clearsTerminalGate) {
+            sessionRequiresNewPhysicalPress = false
+        }
+        cancelSessionIdleTimeout()
+        if (realtime == null) setVoiceState(VoiceState.Connecting)
+        ensureVoiceSession()
     }
 
     @Volatile private var lastMicMs = 0L
@@ -216,6 +288,7 @@ class GlassesController private constructor(private val appContext: Context) {
         if (!_micStreaming.value) {
             _micStreaming.value = true
             mainHandler.post {
+                cancelSessionIdleTimeout()
                 mainHandler.removeCallbacks(micDecayRunnable)
                 mainHandler.postDelayed(micDecayRunnable, MIC_PULSE_DECAY_MS)
             }
@@ -224,14 +297,31 @@ class GlassesController private constructor(private val appContext: Context) {
 
     // ── Photos ──
 
-    /** Runs on LinkManager's background thread — file IO + decode are fine here. */
-    private fun handlePhoto(jpeg: ByteArray, vision: Boolean) {
+    private enum class VisionAttachment { Attached, Queued, VoiceOff, Stale, Failed }
+
+    /**
+     * The BLE notification callback only copies/enqueues work. In particular, camera file IO,
+     * bitmap decoding and JPEG normalization must not delay the mic notifications that follow.
+     */
+    private fun queuePhotoProcessing(jpeg: ByteArray, vision: Boolean) {
+        val generation = if (vision) synchronized(realtimeLock) {
+            visionPreparationsInFlight++
+            visionGeneration
+        } else -1L
+        scope.launch(Dispatchers.IO) {
+            photoMutex.withLock { handlePhoto(jpeg, vision, generation) }
+        }
+    }
+
+    /** Runs on a serialized IO coroutine, never the BLE callback or main thread. */
+    private fun handlePhoto(jpeg: ByteArray, vision: Boolean, visionGenerationAtStart: Long) {
         val filename = "IMG_${System.currentTimeMillis()}.jpg"
         try {
             File(galleryDir, filename).writeBytes(jpeg)
         } catch (e: Exception) {
             Log.e(TAG, "Photo save failed", e)
             addLog("ERROR", "photo save failed: ${e.message}")
+            if (vision) completeVisionPreparation(visionGenerationAtStart, null)
             return
         }
         loadSavedImages()
@@ -254,29 +344,68 @@ class GlassesController private constructor(private val appContext: Context) {
         if (vision) {
             // Tap-then-hold on the glasses: the photo goes straight into the
             // live conversation; the voice spoken during the hold is the question.
-            val rt = realtime
-            if (voiceEnabled && rt != null) {
-                if (rt.sendImage(jpeg)) {
-                    _photoAttached.value = true
+            val result = completeVisionPreparation(
+                visionGenerationAtStart,
+                RealtimeVoiceClient.prepareImage(jpeg)
+            )
+            when (result) {
+                VisionAttachment.Attached ->
                     addLog("VISION", "photo attached — answering your spoken question")
-                } else {
-                    addLog("VISION", "photo attach failed — saved to gallery")
-                }
-            } else {
-                addLog("VISION", "vision photo received but voice is off — saved to gallery")
+                VisionAttachment.Queued ->
+                    addLog("VISION", "photo queued while the secure session opens")
+                VisionAttachment.VoiceOff ->
+                    addLog("VISION", "vision photo received but voice is off — saved to gallery")
+                else -> Unit
             }
         }
+    }
+
+    /**
+     * Publishes a normalized image before releasing any audio that arrived after its BLE event.
+     * Returns Stale after disconnect/dismiss so late background work cannot resurrect an attach.
+     */
+    private fun completeVisionPreparation(
+        generation: Long,
+        prepared: RealtimeVoiceClient.PreparedImage?
+    ): VisionAttachment {
+        var clientToFlush: RealtimeVoiceClient? = null
+        var needsSession = false
+        val result = synchronized(realtimeLock) {
+            if (generation != visionGeneration) return VisionAttachment.Stale
+            visionPreparationsInFlight = (visionPreparationsInFlight - 1).coerceAtLeast(0)
+            val attachment = when {
+                prepared == null -> VisionAttachment.Failed
+                !voiceWanted -> VisionAttachment.VoiceOff
+                realtime != null && realtime!!.sendPreparedImage(prepared) ->
+                    VisionAttachment.Attached
+                realtime == null -> {
+                    pendingVisionImage = prepared
+                    needsSession = true
+                    VisionAttachment.Queued
+                }
+                else -> VisionAttachment.Failed
+            }
+            if (voiceWanted && visionPreparationsInFlight == 0) clientToFlush = realtime
+            attachment
+        }
+        clientToFlush?.let { client ->
+            scope.launch(Dispatchers.Default) { flushBufferedAudio(client) }
+        }
+        if (prepared != null && result != VisionAttachment.Stale && result != VisionAttachment.VoiceOff) {
+            _photoAttached.value = true
+        }
+        if (needsSession) mainHandler.post { ensureVoiceSession() }
+        return result
     }
 
     /** Attach the most recent glasses photo so the next spoken question can reference it. */
     fun askAboutPendingPhoto() {
         val photo = _pendingPhoto.value ?: return
-        val rt = realtime
-        if (rt == null || !voiceEnabled) {
-            _lastError.value = "Voice isn't connected yet — retry voice first."
-            return
+        val generation = synchronized(realtimeLock) {
+            visionPreparationsInFlight++
+            visionGeneration
         }
-        Thread {
+        scope.launch(Dispatchers.IO) {
             val jpeg = try {
                 File(galleryDir, photo.filename).readBytes()
             } catch (e: Exception) {
@@ -284,23 +413,38 @@ class GlassesController private constructor(private val appContext: Context) {
                 null
             }
             if (jpeg == null || jpeg.isEmpty()) {
+                completeVisionPreparation(generation, null)
                 _lastError.value = "Could not reload the photo from disk."
-                return@Thread
+                return@launch
             }
-            if (rt.sendImage(jpeg)) {
-                _photoAttached.value = true
-                addLog("VISION", "photo attached — ask your question")
-            }
-        }.apply {
-            name = "PhotoAttach"
-            isDaemon = true
-            start()
+            val prepared = RealtimeVoiceClient.prepareImage(jpeg)
+            val result = completeVisionPreparation(generation, prepared)
+            addLog(
+                "VISION",
+                when (result) {
+                    VisionAttachment.Attached -> "photo attached — ask your question"
+                    VisionAttachment.Queued ->
+                        "photo ready — hold the glasses button and ask your question"
+                    VisionAttachment.VoiceOff -> "photo kept in gallery because glasses voice is disabled"
+                    VisionAttachment.Failed -> "photo could not be attached"
+                    VisionAttachment.Stale -> "photo attachment was cancelled"
+                }
+            )
         }
     }
 
     fun dismissPendingPhoto() {
         _pendingPhoto.value = null
         _photoAttached.value = false
+        val clientToFlush = synchronized(realtimeLock) {
+            pendingVisionImage = null
+            visionGeneration++
+            visionPreparationsInFlight = 0
+            realtime
+        }
+        clientToFlush?.let { client ->
+            scope.launch(Dispatchers.Default) { flushBufferedAudio(client) }
+        }
     }
 
     // ── Gallery ──
@@ -328,92 +472,175 @@ class GlassesController private constructor(private val appContext: Context) {
         }
     }
 
-    // ── Voice session (auto-started, self-healing) ──
+    // ── Voice session (physical-button started, foreground-service owned) ──
 
-    fun setApiKey(key: String) {
-        settings.setApiKey(key)
-        mainHandler.post { maybeStartVoice() }
-    }
-
-    /** Start voice if everything it needs is in place. Main thread only. */
-    private fun maybeStartVoice() {
-        if (!voiceWanted || voiceEnabled) return
-        if (settings.apiKey.value.isBlank()) return       // no key — status chip explains
-        if (link.bleState.value !is BleState.Connected) return   // voice rides BLE
-        startVoiceSession()
-    }
-
-    /** User affordance: clear the error/backoff and try again right now. */
+    /** Enable voice and reconnect BLE. The next physical-button press starts a session. */
     fun retryVoiceNow() {
+        settings.setGlassesVoiceEnabled(true)
         voiceWanted = true
         _voiceAutoEnabled.value = true
         mainHandler.post {
-            reconnectDelayMs = RECONNECT_BASE_MS
-            cancelScheduledReconnect()
             _lastError.value = null
+            link.setVoiceMode(true)
             link.connect()
-            maybeStartVoice()
+            if (link.bleState.value is BleState.Connected) setVoiceState(VoiceState.Listening)
         }
     }
 
     /** Manual off switch (Settings) — stays off until retried. */
     fun stopVoice() {
+        settings.setGlassesVoiceEnabled(false)
         voiceWanted = false
         _voiceAutoEnabled.value = false
         mainHandler.post {
-            cancelScheduledReconnect()
-            if (!voiceEnabled && realtime == null) return@post
+            cancelCredentialFetch()
+            cancelSessionIdleTimeout()
             voiceEnabled = false
             setVoiceState(VoiceState.Idle)
             link.setVoiceMode(false)
             link.cancelResponse()
-            realtime?.close()
-            realtime = null
+            synchronized(realtimeLock) {
+                realtimeAcceptingLiveAudio = false
+                realtime?.close()
+                realtime = null
+                audioPrebuffer.clear()
+                pendingVisionImage = null
+                visionGeneration++
+                visionPreparationsInFlight = 0
+            }
             addLog("VOICE", "voice OFF (manual)")
         }
     }
 
-    /** Main thread only. */
-    private fun startVoiceSession() {
+    /** Main thread only. Coalesces button, vision and mic fallback triggers. */
+    private fun ensureVoiceSession() {
+        if (!voiceWanted || link.bleState.value !is BleState.Connected) return
+        if (realtime != null || credentialJob?.isActive == true) return
+        if (sessionRequiresNewPhysicalPress) return
+        if (SystemClock.elapsedRealtime() < credentialRetryNotBeforeUptimeMs) return
         _lastError.value = null
+        setVoiceState(VoiceState.Connecting)
+        val generation = ++credentialGeneration
+        val job = scope.launch {
+            try {
+                val credential = credentialProvider.fetchCredential()
+                if (generation != credentialGeneration || !voiceWanted ||
+                    link.bleState.value !is BleState.Connected
+                ) return@launch
+                credentialRetryNotBeforeUptimeMs = 0L
+                openRealtimeSession(credential, generation)
+            } catch (_: kotlinx.coroutines.CancellationException) {
+                // Normal teardown when voice/BLE is stopped while auth is in flight.
+            } catch (failure: CredentialFailure) {
+                if (generation == credentialGeneration) {
+                    setCredentialRetryGate(failure)
+                    handleCredentialFailure(failure)
+                }
+            } catch (failure: Exception) {
+                Log.e(TAG, "Credential startup failed", failure)
+                if (generation == credentialGeneration) {
+                    val serviceFailure = CredentialFailure.ServiceUnavailable()
+                    setCredentialRetryGate(serviceFailure)
+                    handleCredentialFailure(serviceFailure)
+                }
+            } finally {
+                // A cancelled generation may finish after its replacement. It must never clear
+                // the replacement's coalescing slot.
+                if (generation == credentialGeneration) credentialJob = null
+            }
+        }
+        credentialJob = job
+    }
+
+    private fun cancelCredentialFetch() {
+        credentialGeneration++
+        credentialJob?.cancel()
+        credentialJob = null
+    }
+
+    private fun setCredentialRetryGate(failure: CredentialFailure) {
+        if (failure is CredentialFailure.Authentication) {
+            // A fresh physical marker, rather than time, is the retry boundary for terminal auth.
+            sessionRequiresNewPhysicalPress = true
+            credentialRetryNotBeforeUptimeMs = 0L
+            return
+        }
+        val delaySeconds = when (failure) {
+            is CredentialFailure.RateLimited -> failure.retryAfterSeconds
+            is CredentialFailure.RetryDeferred -> failure.retryAfterSeconds
+            is CredentialFailure.Network, is CredentialFailure.ServiceUnavailable -> 2L
+            is CredentialFailure.Authentication -> error("handled above")
+        }.coerceAtLeast(1L)
+        credentialRetryNotBeforeUptimeMs = SystemClock.elapsedRealtime() + delaySeconds * 1_000L
+    }
+
+    /** Main thread only. Session config, queued image and buffered audio retain their order. */
+    private fun openRealtimeSession(credential: RealtimeCredential, generation: Long) {
         assistantTranscript.setLength(0)
         _pipelineStatus.update {
             it.copy(lastTranscription = "", lastAiResponse = "", voiceState = VoiceState.Connecting)
         }
         var holder: RealtimeVoiceClient? = null
         val rt = RealtimeVoiceClient(
-            apiKey = settings.apiKey.value,
-            model = settings.model.value,
+            clientSecret = credential.clientSecret,
+            model = credential.model,
             voice = settings.voice.value,
             effort = settings.effort.value
         ) { event -> holder?.let { handleRealtimeEvent(it, event) } }
         holder = rt
-        realtime = rt
-        voiceEnabled = true
-        rt.connect()
-        link.setVoiceMode(true)
-        addLog("VOICE", "voice ON (model ${settings.model.value})")
-    }
-
-    /** The websocket died while voice is wanted: 2/4/8…30 s backoff. Main thread. */
-    private fun scheduleVoiceReconnect(reason: String) {
-        if (!voiceWanted) return
-        val delay = reconnectDelayMs
-        reconnectDelayMs = minOf(reconnectDelayMs * 2, RECONNECT_MAX_MS)
-        _lastError.value = "$reason — retrying in ${delay / 1000} s"
-        setVoiceState(VoiceState.Connecting)
-        cancelScheduledReconnect()
-        val runnable = Runnable {
-            reconnectRunnable = null
-            maybeStartVoice()
+        synchronized(realtimeLock) {
+            if (generation != credentialGeneration || !voiceWanted ||
+                link.bleState.value !is BleState.Connected || realtime != null
+            ) {
+                rt.close()
+                return
+            }
+            realtime = rt
+            realtimeAcceptingLiveAudio = false
+            voiceEnabled = true
+            // connect() synchronously queues session.update first. The prepared image follows;
+            // mic callbacks keep buffering until the background ordered drain completes.
+            rt.connect()
+            pendingVisionImage?.let {
+                if (rt.sendPreparedImage(it)) pendingVisionImage = null
+            }
         }
-        reconnectRunnable = runnable
-        mainHandler.postDelayed(runnable, delay)
+        scope.launch(Dispatchers.Default) { flushBufferedAudio(rt) }
+        link.setVoiceMode(true)
+        addLog("VOICE", "secure realtime session opening (model ${credential.model})")
     }
 
-    private fun cancelScheduledReconnect() {
-        reconnectRunnable?.let { mainHandler.removeCallbacks(it) }
-        reconnectRunnable = null
+    /**
+     * Drains without holding [realtimeLock] during Base64/JSON encoding. New BLE frames continue
+     * entering the prebuffer until an empty drain and the live-audio handoff occur atomically.
+     */
+    private fun flushBufferedAudio(client: RealtimeVoiceClient) {
+        while (true) {
+            val batch = synchronized(realtimeLock) {
+                if (client !== realtime) return
+                // A camera event was observed before later mic frames. Its normalized image must
+                // be enqueued first; completion restarts this drain.
+                if (visionPreparationsInFlight > 0) return
+                val drained = audioPrebuffer.drain()
+                if (drained.isEmpty()) {
+                    realtimeAcceptingLiveAudio = true
+                    return
+                }
+                drained
+            }
+            batch.forEach(client::appendAudio)
+        }
+    }
+
+    private fun handleCredentialFailure(failure: CredentialFailure) {
+        synchronized(realtimeLock) {
+            audioPrebuffer.clear()
+            pendingVisionImage = null
+        }
+        _photoAttached.value = false
+        _lastError.value = failure.message
+        setVoiceState(if (voiceWanted) VoiceState.Listening else VoiceState.Idle)
+        addLog("ERROR", failure.message ?: "Assistant unavailable")
     }
 
     /**
@@ -434,15 +661,31 @@ class GlassesController private constructor(private val appContext: Context) {
             is RealtimeVoiceClient.RealtimeEvent.ResponseDone -> {
                 link.finishResponse()
             }
+            is RealtimeVoiceClient.RealtimeEvent.Disconnected -> {
+                // Publish the gate before hopping to main so a nearly-simultaneous next physical
+                // marker can synchronously discard stale audio at the exact turn boundary.
+                sessionRequiresNewPhysicalPress = true
+                event.retryAfterSeconds?.let { retryAfter ->
+                    credentialRetryNotBeforeUptimeMs = maxOf(
+                        credentialRetryNotBeforeUptimeMs,
+                        SystemClock.elapsedRealtime() + retryAfter * 1_000L
+                    )
+                }
+            }
             else -> {}
         }
         mainHandler.post {
             if (client !== realtime) return@post
             when (event) {
                 is RealtimeVoiceClient.RealtimeEvent.Connected -> {
-                    reconnectDelayMs = RECONNECT_BASE_MS   // healthy session → fresh backoff
                     _lastError.value = null
-                    if (voiceEnabled) setVoiceState(VoiceState.Listening)
+                    if (voiceEnabled) {
+                        setVoiceState(
+                            if (_micStreaming.value) VoiceState.Hearing else VoiceState.Listening
+                        )
+                    }
+                    if (_micStreaming.value) cancelSessionIdleTimeout()
+                    else armSessionIdleTimeout()
                     addLog("VOICE", "realtime session open")
                 }
                 is RealtimeVoiceClient.RealtimeEvent.Disconnected -> {
@@ -450,6 +693,7 @@ class GlassesController private constructor(private val appContext: Context) {
                 }
                 is RealtimeVoiceClient.RealtimeEvent.AudioDelta -> {
                     // First delta of a response: the glasses start speaking.
+                    cancelSessionIdleTimeout()
                     if (voiceEnabled) setVoiceState(VoiceState.Speaking)
                 }
                 is RealtimeVoiceClient.RealtimeEvent.ResponseDone -> {
@@ -457,6 +701,7 @@ class GlassesController private constructor(private val appContext: Context) {
                         addLog("AI", assistantTranscript.toString())
                     }
                     if (voiceEnabled) setVoiceState(VoiceState.Listening)
+                    armSessionIdleTimeout()
                 }
                 is RealtimeVoiceClient.RealtimeEvent.AssistantTranscriptDelta -> {
                     assistantTranscript.append(event.text)
@@ -467,9 +712,11 @@ class GlassesController private constructor(private val appContext: Context) {
                     _pipelineStatus.update { it.copy(lastTranscription = event.text) }
                 }
                 is RealtimeVoiceClient.RealtimeEvent.SpeechStarted -> {
+                    cancelSessionIdleTimeout()
                     if (voiceEnabled) setVoiceState(VoiceState.Hearing)
                 }
                 is RealtimeVoiceClient.RealtimeEvent.SpeechStopped -> {
+                    cancelSessionIdleTimeout()
                     if (voiceEnabled) setVoiceState(VoiceState.Thinking)
                     assistantTranscript.setLength(0)   // a fresh answer is coming
                 }
@@ -487,14 +734,56 @@ class GlassesController private constructor(private val appContext: Context) {
     /** Main thread only. */
     private fun handleRealtimeClosed(reason: String) {
         addLog("VOICE", "realtime closed: $reason")
-        if (!voiceEnabled) return
+        if (!voiceEnabled && realtime == null) return
+        // A terminal WebSocket error (including OpenAI 401/429 or phone network loss) must not let
+        // mic frames from the same held button mint session after session. Only the next physical
+        // recording-start marker clears this gate.
+        sessionRequiresNewPhysicalPress = true
         voiceEnabled = false
+        cancelSessionIdleTimeout()
         link.cancelResponse()
-        realtime?.close()
-        realtime = null
-        // Keep the glasses in voice mode ('M' stays set) — the session is
-        // coming back; flapping 'M'/'m' across a 2 s retry buys nothing.
-        scheduleVoiceReconnect("Voice connection closed: $reason")
+        synchronized(realtimeLock) {
+            realtimeAcceptingLiveAudio = false
+            realtime?.close()
+            realtime = null
+        }
+        // Keep the glasses in µ-law/button mode. New mic traffic from the next
+        // physical press obtains a fresh credential; no battery-draining idle loop.
+        _lastError.value = "Voice connection closed: $reason"
+        setVoiceState(if (voiceWanted) VoiceState.Listening else VoiceState.Idle)
+    }
+
+    /** Close an idle socket to avoid indefinite radio pings; the next glasses press is seamless. */
+    private fun armSessionIdleTimeout() {
+        cancelSessionIdleTimeout()
+        val runnable = Runnable {
+            sessionIdleRunnable = null
+            val activeState = _pipelineStatus.value.voiceState
+            if (_micStreaming.value || activeState == VoiceState.Hearing ||
+                activeState == VoiceState.Thinking || activeState == VoiceState.Speaking
+            ) {
+                // Never truncate a held-button recording or an in-flight answer. Check again only
+                // after another full idle window if a terminal server event never arrives.
+                armSessionIdleTimeout()
+                return@Runnable
+            }
+            voiceEnabled = false
+            link.cancelResponse()
+            synchronized(realtimeLock) {
+                realtimeAcceptingLiveAudio = false
+                realtime?.close()
+                realtime = null
+            }
+            if (voiceWanted) setVoiceState(VoiceState.Listening)
+            addLog("VOICE", "realtime session closed after idle timeout")
+        }
+        sessionIdleRunnable = runnable
+        mainHandler.postDelayed(runnable, SESSION_IDLE_MS)
+    }
+
+    private fun cancelSessionIdleTimeout() {
+        sessionIdleRunnable?.let(mainHandler::removeCallbacks)
+        sessionIdleRunnable = null
     }
 
     private fun setVoiceState(state: VoiceState) {

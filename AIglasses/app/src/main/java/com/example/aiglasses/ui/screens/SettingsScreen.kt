@@ -18,11 +18,8 @@ import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
-import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.OutlinedTextField
-import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
 import androidx.compose.material3.SwitchDefaults
@@ -35,9 +32,6 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.text.input.KeyboardType
-import androidx.compose.ui.text.input.PasswordVisualTransformation
-import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.example.aiglasses.BuildConfig
@@ -60,17 +54,13 @@ import com.example.aiglasses.ui.theme.TextTertiary
 
 @Composable
 fun SettingsScreen(viewModel: MainViewModel) {
-    val apiKey by viewModel.apiKey.collectAsStateWithLifecycle()
     val glassesStatus by viewModel.glassesStatus.collectAsStateWithLifecycle()
     val pipelineStatus by viewModel.pipelineStatus.collectAsStateWithLifecycle()
     val voiceWanted by viewModel.voiceAutoEnabled.collectAsStateWithLifecycle()
-    val model by viewModel.realtimeModel.collectAsStateWithLifecycle()
     val voice by viewModel.realtimeVoice.collectAsStateWithLifecycle()
     val effort by viewModel.realtimeEffort.collectAsStateWithLifecycle()
     val wifiAuto by viewModel.wifiAuto.collectAsStateWithLifecycle()
 
-    var localApiKey by remember(apiKey) { mutableStateOf(apiKey) }
-    var showApiKey by remember { mutableStateOf(false) }
     val isConnected = glassesStatus.connectionState != ConnectionState.Disconnected
 
     LazyColumn(
@@ -90,72 +80,8 @@ fun SettingsScreen(viewModel: MainViewModel) {
             )
         }
 
-        // ── Account ──
-        item { Eyebrow("Account") }
-        item {
-            PanelCard {
-                Column(modifier = Modifier.padding(16.dp)) {
-                    Text(
-                        text = "OpenAI API key",
-                        style = MaterialTheme.typography.titleSmall,
-                        color = TextPrimary
-                    )
-                    Spacer(Modifier.heightIn(min = 8.dp))
-                    OutlinedTextField(
-                        value = localApiKey,
-                        onValueChange = { localApiKey = it },
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(top = 8.dp),
-                        singleLine = true,
-                        textStyle = MonoTelemetry,
-                        visualTransformation = if (showApiKey) VisualTransformation.None
-                        else PasswordVisualTransformation(),
-                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
-                        placeholder = { Text("sk-...", style = MonoTelemetry, color = TextTertiary) },
-                        trailingIcon = {
-                            TextButton(onClick = { showApiKey = !showApiKey }) {
-                                Text(
-                                    text = if (showApiKey) "Hide" else "Show",
-                                    style = MaterialTheme.typography.labelSmall,
-                                    color = TextSecondary
-                                )
-                            }
-                        },
-                        colors = OutlinedTextFieldDefaults.colors(
-                            focusedBorderColor = SignalOrange,
-                            unfocusedBorderColor = Hairline,
-                            focusedTextColor = TextPrimary,
-                            unfocusedTextColor = TextSecondary,
-                            cursorColor = SignalOrange,
-                            focusedContainerColor = PanelHighest,
-                            unfocusedContainerColor = PanelHighest
-                        ),
-                        shape = MaterialTheme.shapes.extraSmall
-                    )
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(top = 4.dp),
-                        horizontalArrangement = Arrangement.End
-                    ) {
-                        TextButton(
-                            onClick = { viewModel.setApiKey(localApiKey) },
-                            enabled = localApiKey != apiKey
-                        ) {
-                            Text(
-                                text = "Save",
-                                style = MaterialTheme.typography.labelLarge,
-                                color = if (localApiKey != apiKey) SignalOrange else TextTertiary
-                            )
-                        }
-                    }
-                }
-            }
-        }
-
         // ── Voice ──
-        item { Eyebrow("Voice", modifier = Modifier.padding(top = 12.dp)) }
+        item { Eyebrow("Voice") }
         item {
             PanelCard {
                 Column {
@@ -175,11 +101,10 @@ fun SettingsScreen(viewModel: MainViewModel) {
                         mono = true
                     )
                     SettingsDivider()
-                    OptionPickerRow(
+                    SettingsValueRow(
                         title = "Model",
-                        options = RealtimeSettings.MODELS,
-                        selected = model,
-                        onSelect = { viewModel.setRealtimeModel(it) }
+                        value = "managed by service",
+                        mono = true
                     )
                     SettingsDivider()
                     OptionPickerRow(
@@ -197,10 +122,10 @@ fun SettingsScreen(viewModel: MainViewModel) {
                     )
                     SettingsDivider()
                     SettingsActionRow(
-                        title = if (voiceWanted) "Stop voice" else "Start voice",
+                        title = if (voiceWanted) "Disable glasses voice" else "Enable glasses voice",
                         titleColor = if (voiceWanted) ErrorRed else SignalOrange,
-                        subtitle = "Starts by itself when the glasses connect; " +
-                            "stopping keeps it off until you start it again.",
+                        subtitle = "The physical glasses button starts each conversation. " +
+                            "Disabling keeps voice off until you enable it again.",
                         onClick = {
                             if (voiceWanted) viewModel.stopVoice()
                             else viewModel.retryVoiceNow()
@@ -211,7 +136,7 @@ fun SettingsScreen(viewModel: MainViewModel) {
         }
         item {
             Text(
-                text = "Model, voice and effort apply the next time the session (re)connects.",
+                text = "Voice and effort apply the next time the glasses button starts a session.",
                 style = MaterialTheme.typography.bodySmall,
                 color = TextTertiary,
                 modifier = Modifier.padding(horizontal = 16.dp)

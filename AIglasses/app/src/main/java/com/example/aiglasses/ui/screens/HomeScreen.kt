@@ -113,7 +113,6 @@ fun HomeScreen(
     val pendingPhoto by viewModel.pendingPhoto.collectAsStateWithLifecycle()
     val photoAttached by viewModel.photoAttached.collectAsStateWithLifecycle()
     val voiceWanted by viewModel.voiceAutoEnabled.collectAsStateWithLifecycle()
-    val apiKey by viewModel.apiKey.collectAsStateWithLifecycle()
 
     // Error banner is dismissable per-message (UI-side; controller keeps state).
     var dismissedError by remember { mutableStateOf<String?>(null) }
@@ -163,7 +162,6 @@ fun HomeScreen(
                 VoiceChip(
                     voiceState = pipelineStatus.voiceState,
                     voiceWanted = voiceWanted,
-                    apiKeyMissing = apiKey.isBlank(),
                     hasError = lastError != null,
                     bleConnected = bleState is BleState.Connected,
                     onRetry = { viewModel.retryVoiceNow() }
@@ -502,13 +500,11 @@ private fun ErrorBanner(
 private fun VoiceChip(
     voiceState: VoiceState,
     voiceWanted: Boolean,
-    apiKeyMissing: Boolean,
     hasError: Boolean,
     bleConnected: Boolean,
     onRetry: () -> Unit
 ) {
     val (mode, label) = when {
-        apiKeyMissing -> WaveformMode.Error to "Add your OpenAI API key in Settings"
         !voiceWanted -> WaveformMode.Error to "Voice off"
         hasError -> WaveformMode.Error to "Assistant unavailable"
         else -> when (voiceState) {
@@ -521,7 +517,7 @@ private fun VoiceChip(
             VoiceState.Speaking -> WaveformMode.Speaking to "Responding…"
         }
     }
-    val showRetry = !apiKeyMissing && (!voiceWanted || hasError)
+    val showRetry = !voiceWanted || hasError
 
     PanelCard(shape = CircleShape) {
         Row(

@@ -48,8 +48,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     // ── Settings ──
 
-    val apiKey: StateFlow<String> = controller.settings.apiKey
-    val realtimeModel: StateFlow<String> = controller.settings.model
     val realtimeVoice: StateFlow<String> = controller.settings.voice
     val realtimeEffort: StateFlow<String> = controller.settings.effort
 
@@ -61,8 +59,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     /**
      * One-step activation: ensure the foreground service is up and the radio
-     * is connecting. Voice auto-starts once the glasses connect (if an API
-     * key is saved). Safe to call repeatedly.
+     * is connecting. The physical glasses button starts voice. Safe to call repeatedly.
      */
     fun startScan() {
         val doStart = {
@@ -104,11 +101,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     // ── Settings intents ──
 
-    fun setApiKey(key: String) = controller.setApiKey(key)
-
-    /** Model/voice/effort apply on the next voice (re)connect — iOS parity. */
-    fun setRealtimeModel(model: String) = controller.settings.setModel(model)
-
+    /** Voice and effort apply on the next physical-button session. */
     fun setRealtimeVoice(voice: String) = controller.settings.setVoice(voice)
 
     fun setRealtimeEffort(effort: String) = controller.settings.setEffort(effort)

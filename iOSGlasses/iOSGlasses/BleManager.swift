@@ -87,7 +87,13 @@ final class BleManager: NSObject {
     @ObservationIgnored var onPhotoStats: ((Int, TimeInterval) -> Void)?
     /// Raw firmware 'T' stats packet from CONTROL (includes the tag byte).
     @ObservationIgnored var onStatsPacket: ((Data) -> Void)?
+    /// Physical side-button recording boundary reported by firmware 'S'.
+    @ObservationIgnored var onRecordingStarted: (() -> Void)?
     @ObservationIgnored var onBargeIn: (() -> Void)?        // 'X' from the glasses
+    /// Fires when queued response audio has fully drained to the glasses, or
+    /// an in-progress playback is canceled. This is later than OpenAI's
+    /// response.done event and is the authoritative local playback boundary.
+    @ObservationIgnored var onResponsePlaybackFinished: (() -> Void)?
     @ObservationIgnored var onLog: ((String) -> Void)?
     @ObservationIgnored var onConnected: (() -> Void)?
     /// 'N' answer to our 'F': the glasses' SoftAP is up. (ssid, pass, host, port)
@@ -280,7 +286,10 @@ final class BleManager: NSObject {
 
     /// The response is complete: flush the queue, then write 'E'.
     func finishResponse() {
-        guard dlResponseOpen || !dlQueue.isEmpty else { return }
+        guard dlResponseOpen || !dlQueue.isEmpty else {
+            onResponsePlaybackFinished?()
+            return
+        }
         dlEndRequested = true
         ensureSender()
     }
@@ -298,10 +307,12 @@ final class BleManager: NSObject {
     /// Barge-in / voice-off: drop everything immediately. Deliberately no 'E' —
     /// a late 'E' could land after the 'S' of the next response and kill it.
     func cancelResponse() {
+        let wasActive = dlResponseOpen || !dlQueue.isEmpty || dlEndRequested
         dlQueue.removeAll()
         dlEndRequested = false
         dlResponseOpen = false
         dlGeneration += 1
+        if wasActive { onResponsePlaybackFinished?() }
     }
 
     // MARK: Scanning / connecting
@@ -507,6 +518,7 @@ final class BleManager: NSObject {
                     }
                     dlEndRequested = false
                     dlResponseOpen = false
+                    onResponsePlaybackFinished?()
                 }
                 return
             }
@@ -578,6 +590,7 @@ final class BleManager: NSObject {
         switch Character(UnicodeScalar(first)) {
         case "S":
             log("glasses: recording started")
+            onRecordingStarted?()
         case "E":
             log("glasses: recording ended")
         case "X":

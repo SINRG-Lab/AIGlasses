@@ -79,6 +79,8 @@ class LinkManager(context: Context) {
     // ── Callbacks (wired once by the app layer) ──
     /** PCM16 @16 kHz, seq-filtered, µ-law-decoded. Background thread — NEVER main. */
     var onMicAudio: ((ByteArray) -> Unit)? = null
+    /** The physical side button began a recording. Background BLE callback thread. */
+    var onRecordingStarted: (() -> Unit)? = null
     var onPhoto: ((ByteArray) -> Unit)? = null              // complete JPEG
     var onVisionPhoto: ((ByteArray) -> Unit)? = null
     var onBargeIn: (() -> Unit)? = null
@@ -208,6 +210,7 @@ class LinkManager(context: Context) {
         ble.onLog = { line -> log("[ble] $line") }
         ble.onStateChange = { state -> _bleState.value = state }
         ble.onMicAudio = { pcm -> onMicAudio?.invoke(pcm) }
+        ble.onRecordingStarted = { onRecordingStarted?.invoke() }
         ble.onPhoto = { jpeg -> onPhoto?.invoke(jpeg) }
         ble.onVisionPhoto = { jpeg -> onVisionPhoto?.invoke(jpeg) }
         ble.onBargeIn = { onBargeIn?.invoke() }

@@ -65,7 +65,6 @@ fun DeveloperScreen(viewModel: MainViewModel) {
     val metrics by viewModel.linkMetrics.collectAsStateWithLifecycle()
     val fwStats by viewModel.fwStats.collectAsStateWithLifecycle()
     val photoTransfers by viewModel.photoTransfers.collectAsStateWithLifecycle()
-    val model by viewModel.realtimeModel.collectAsStateWithLifecycle()
     val voice by viewModel.realtimeVoice.collectAsStateWithLifecycle()
     val effort by viewModel.realtimeEffort.collectAsStateWithLifecycle()
     val context = LocalContext.current
@@ -138,7 +137,7 @@ fun DeveloperScreen(viewModel: MainViewModel) {
         // ── App build stamp + voice engine config ──
         devSection("App") {
             DevStatRow("Version", "${BuildConfig.VERSION_NAME} (${BuildConfig.VERSION_CODE}, ${BuildConfig.BUILD_TYPE})")
-            DevStatRow("Realtime model", model)
+            DevStatRow("Realtime model", "backend managed")
             DevStatRow("Voice / effort", "$voice / $effort")
             DevStatRow(
                 "Voice state",

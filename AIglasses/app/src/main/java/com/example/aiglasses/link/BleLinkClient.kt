@@ -106,6 +106,7 @@ class BleLinkClient(private val context: Context) {
     // ── Callbacks (wired once by LinkManager; invoked on BLE/binder threads) ──
     var onStateChange: ((BleState) -> Unit)? = null
     var onMicAudio: ((ByteArray) -> Unit)? = null          // PCM16 @16 kHz
+    var onRecordingStarted: (() -> Unit)? = null           // physical button / 'S'
     var onPhoto: ((ByteArray) -> Unit)? = null             // complete JPEG
     var onVisionPhoto: ((ByteArray) -> Unit)? = null       // header flags 0x02
     var onPhotoStats: ((Int, Long) -> Unit)? = null        // (bytes, millis)
@@ -799,6 +800,7 @@ class BleLinkClient(private val context: Context) {
                 // same instant, so the next frame re-anchors the tracker.
                 micSeqValid = false
                 Log.i(TAG, "glasses: recording started")
+                onRecordingStarted?.invoke()
             }
             'E' -> Log.i(TAG, "glasses: recording ended")
             'X' -> {

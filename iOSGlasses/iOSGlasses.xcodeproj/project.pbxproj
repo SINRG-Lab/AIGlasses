@@ -7,6 +7,7 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		16A7A6C02F4A100100A10001 /* Supabase in Frameworks */ = {isa = PBXBuildFile; productRef = 16A7A6C02F4A100100A10002 /* Supabase */; };
 		544325B6328DD0B4FF803934 /* Foundation.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = A7747299ED95E52C3C5CE038 /* Foundation.framework */; };
 		782519CC38AFB3DC410FE921 /* GlassesLiveActivityWidget.swift in Sources */ = {isa = PBXBuildFile; fileRef = DF63331434CC3C0DBEDA56B0 /* GlassesLiveActivityWidget.swift */; };
 		981E0490BD4BCC76EA2EC1DA /* GlassesWidget.appex in Embed Foundation Extensions */ = {isa = PBXBuildFile; fileRef = 7DE0061CDC52724962E9EEC4 /* GlassesWidget.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
@@ -14,6 +15,13 @@
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
+		16A7A6C02F4A100100A10004 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = AA00000000000000000000AA /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = AA00000000000000000000A6;
+			remoteInfo = iOSGlasses;
+		};
 		4EEF084598450B253B26EEEC /* PBXContainerItemProxy */ = {
 			isa = PBXContainerItemProxy;
 			containerPortal = AA00000000000000000000AA /* Project object */;
@@ -38,6 +46,7 @@
 /* End PBXCopyFilesBuildPhase section */
 
 /* Begin PBXFileReference section */
+		16A7A6C02F4A100100A10005 /* iOSGlassesTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = iOSGlassesTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		3A6AD1F592C601EDD8B8C696 /* GlassesWidgetBundle.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = GlassesWidgetBundle.swift; sourceTree = "<group>"; };
 		7DE0061CDC52724962E9EEC4 /* GlassesWidget.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = GlassesWidget.appex; sourceTree = BUILT_PRODUCTS_DIR; };
 		A7747299ED95E52C3C5CE038 /* Foundation.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Foundation.framework; path = Platforms/iPhoneOS.platform/Developer/SDKs/iPhoneOS18.0.sdk/System/Library/Frameworks/Foundation.framework; sourceTree = DEVELOPER_DIR; };
@@ -46,6 +55,13 @@
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
+		16A7A6C02F4A100100A10006 /* iOSGlassesTests */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			exceptions = (
+			);
+			path = iOSGlassesTests;
+			sourceTree = "<group>";
+		};
 		AA00000000000000000000A2 /* iOSGlasses */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
 			exceptions = (
@@ -56,10 +72,18 @@
 /* End PBXFileSystemSynchronizedRootGroup section */
 
 /* Begin PBXFrameworksBuildPhase section */
+		16A7A6C02F4A100100A10007 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 		AA00000000000000000000A3 /* Frameworks */ = {
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				16A7A6C02F4A100100A10001 /* Supabase in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -96,6 +120,7 @@
 			isa = PBXGroup;
 			children = (
 				AA00000000000000000000A2 /* iOSGlasses */,
+				16A7A6C02F4A100100A10006 /* iOSGlassesTests */,
 				AA00000000000000000000A5 /* Products */,
 				0048AF514D3DCFE5E41FE203 /* Frameworks */,
 				34F23117A752DAC540C366AD /* GlassesWidget */,
@@ -107,6 +132,7 @@
 			children = (
 				AA00000000000000000000A1 /* iOSGlasses.app */,
 				7DE0061CDC52724962E9EEC4 /* GlassesWidget.appex */,
+				16A7A6C02F4A100100A10005 /* iOSGlassesTests.xctest */,
 			);
 			name = Products;
 			sourceTree = "<group>";
@@ -122,6 +148,27 @@
 /* End PBXGroup section */
 
 /* Begin PBXNativeTarget section */
+		16A7A6C02F4A100100A10008 /* iOSGlassesTests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 16A7A6C02F4A100100A10009 /* Build configuration list for PBXNativeTarget "iOSGlassesTests" */;
+			buildPhases = (
+				16A7A6C02F4A100100A1000A /* Sources */,
+				16A7A6C02F4A100100A10007 /* Frameworks */,
+				16A7A6C02F4A100100A1000B /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				16A7A6C02F4A100100A1000C /* PBXTargetDependency */,
+			);
+			fileSystemSynchronizedGroups = (
+				16A7A6C02F4A100100A10006 /* iOSGlassesTests */,
+			);
+			name = iOSGlassesTests;
+			productName = iOSGlassesTests;
+			productReference = 16A7A6C02F4A100100A10005 /* iOSGlassesTests.xctest */;
+			productType = "com.apple.product-type.bundle.unit-test";
+		};
 		63186EBEA761B36EBD15E813 /* GlassesWidget */ = {
 			isa = PBXNativeTarget;
 			buildConfigurationList = 71FAFC3BFBB2133D3968F8F3 /* Build configuration list for PBXNativeTarget "GlassesWidget" */;
@@ -157,6 +204,9 @@
 				AA00000000000000000000A2 /* iOSGlasses */,
 			);
 			name = iOSGlasses;
+			packageProductDependencies = (
+				16A7A6C02F4A100100A10002 /* Supabase */,
+			);
 			productName = iOSGlasses;
 			productReference = AA00000000000000000000A1 /* iOSGlasses.app */;
 			productType = "com.apple.product-type.application";
@@ -172,6 +222,10 @@
 				LastUpgradeCheck = 2660;
 				ORGANIZATIONNAME = Project;
 				TargetAttributes = {
+					16A7A6C02F4A100100A10008 = {
+						CreatedOnToolsVersion = 26.6;
+						TestTargetID = AA00000000000000000000A6;
+					};
 					AA00000000000000000000A6 = {
 						CreatedOnToolsVersion = 16.0;
 					};
@@ -186,6 +240,9 @@
 			);
 			mainGroup = AA00000000000000000000A4;
 			minimizedProjectReferenceProxies = 1;
+			packageReferences = (
+				16A7A6C02F4A100100A10003 /* XCRemoteSwiftPackageReference "supabase-swift" */,
+			);
 			preferredProjectObjectVersion = 77;
 			productRefGroup = AA00000000000000000000A5 /* Products */;
 			projectDirPath = "";
@@ -193,11 +250,19 @@
 			targets = (
 				AA00000000000000000000A6 /* iOSGlasses */,
 				63186EBEA761B36EBD15E813 /* GlassesWidget */,
+				16A7A6C02F4A100100A10008 /* iOSGlassesTests */,
 			);
 		};
 /* End PBXProject section */
 
 /* Begin PBXResourcesBuildPhase section */
+		16A7A6C02F4A100100A1000B /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 		61979A7C758859F442C9A8D9 /* Resources */ = {
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
@@ -215,6 +280,13 @@
 /* End PBXResourcesBuildPhase section */
 
 /* Begin PBXSourcesBuildPhase section */
+		16A7A6C02F4A100100A1000A /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 		42FDBDEA926952C771CCB21A /* Sources */ = {
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
@@ -234,6 +306,11 @@
 /* End PBXSourcesBuildPhase section */
 
 /* Begin PBXTargetDependency section */
+		16A7A6C02F4A100100A1000C /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = AA00000000000000000000A6 /* iOSGlasses */;
+			targetProxy = 16A7A6C02F4A100100A10004 /* PBXContainerItemProxy */;
+		};
 		D827FE0D3081B5A836010B7F /* PBXTargetDependency */ = {
 			isa = PBXTargetDependency;
 			name = GlassesWidget;
@@ -242,7 +319,60 @@
 		};
 /* End PBXTargetDependency section */
 
+/* Begin XCRemoteSwiftPackageReference section */
+		16A7A6C02F4A100100A10003 /* XCRemoteSwiftPackageReference "supabase-swift" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/supabase/supabase-swift.git";
+			requirement = {
+				kind = exactVersion;
+				version = 2.54.1;
+			};
+		};
+/* End XCRemoteSwiftPackageReference section */
+
+/* Begin XCSwiftPackageProductDependency section */
+		16A7A6C02F4A100100A10002 /* Supabase */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 16A7A6C02F4A100100A10003 /* XCRemoteSwiftPackageReference "supabase-swift" */;
+			productName = Supabase;
+		};
+/* End XCSwiftPackageProductDependency section */
+
 /* Begin XCBuildConfiguration section */
+		16A7A6C02F4A100100A1000D /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				CODE_SIGN_STYLE = Automatic;
+				DEVELOPMENT_TEAM = VL8G826KZR;
+				GENERATE_INFOPLIST_FILE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.sinrglab.iOSGlassesTests;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_EMIT_LOC_STRINGS = NO;
+				SWIFT_VERSION = 6.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/iOSGlasses.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/iOSGlasses";
+			};
+			name = Debug;
+		};
+		16A7A6C02F4A100100A1000E /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				CODE_SIGN_STYLE = Automatic;
+				DEVELOPMENT_TEAM = VL8G826KZR;
+				GENERATE_INFOPLIST_FILE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.sinrglab.iOSGlassesTests;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_EMIT_LOC_STRINGS = NO;
+				SWIFT_VERSION = 6.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/iOSGlasses.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/iOSGlasses";
+			};
+			name = Release;
+		};
 		82FF40FC6BD87CABE2D0A313 /* Debug */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
@@ -463,6 +593,15 @@
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
+		16A7A6C02F4A100100A10009 /* Build configuration list for PBXNativeTarget "iOSGlassesTests" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				16A7A6C02F4A100100A1000D /* Debug */,
+				16A7A6C02F4A100100A1000E /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
 		71FAFC3BFBB2133D3968F8F3 /* Build configuration list for PBXNativeTarget "GlassesWidget" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (
