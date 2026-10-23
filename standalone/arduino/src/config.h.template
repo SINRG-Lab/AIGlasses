@@ -4,6 +4,9 @@
 // Gemini API
 #define GEMINI_API_KEY      "YOUR_GEMINI_API_KEY_HERE"
 
+// Deepgram API (used by deepgram_api.cpp)
+#define DEEPGRAM_API_KEY    "YOUR_DEEPGRAM_API_KEY_HERE"
+
 // Cellular network
 #define CELL_APN            "your.apn.here"
 #define APN_USERNAME        ""   // Leave empty if not required

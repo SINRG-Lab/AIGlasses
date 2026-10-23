@@ -25,3 +25,16 @@ local.properties
 
 # Xcode per-user state
 **/xcuserdata/
+
+# Bench-rig run outputs (companion/bench-rig/HardwareTest)
+latency_log.csv
+seq_debug.csv
+
+# Standalone run outputs
+serial_log.txt
+tts_output.wav
+
+# Sliced 3D-printer output — regenerate from the STL/3MF in mechanical/
+*.ufp
+*.bgcode
+*.gcode

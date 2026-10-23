@@ -1,4 +1,4 @@
-# Walter Board - 5G AI Glasses
+# Walter Board - Standalone AI Glasses (LTE-M)
 
 ## Where We're At
 
