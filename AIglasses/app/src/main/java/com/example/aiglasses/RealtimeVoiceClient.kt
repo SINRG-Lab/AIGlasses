@@ -42,7 +42,7 @@ import java.util.concurrent.atomic.AtomicBoolean
  * completes, so the first words of a question survive a reconnect.
  */
 class RealtimeVoiceClient(
-    private val apiKey: String,
+    private val clientSecret: String,
     private val model: String,
     private val voice: String,
     private val effort: String,
@@ -71,13 +71,39 @@ class RealtimeVoiceClient(
                 .pingInterval(20, TimeUnit.SECONDS)       // detect dead links promptly
                 .build()
         }
+
+        /** CPU-heavy camera normalization; callers prepare this away from the main thread. */
+        internal fun prepareImage(jpegBytes: ByteArray): PreparedImage {
+            require(jpegBytes.isNotEmpty())
+            val base64 = try {
+                val bitmap = BitmapFactory.decodeByteArray(jpegBytes, 0, jpegBytes.size)
+                if (bitmap != null) {
+                    val out = ByteArrayOutputStream()
+                    bitmap.compress(Bitmap.CompressFormat.JPEG, 85, out)
+                    bitmap.recycle()
+                    Base64.encodeToString(out.toByteArray(), Base64.NO_WRAP)
+                } else {
+                    Base64.encodeToString(jpegBytes, Base64.NO_WRAP)
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "Image re-encode failed", e)
+                Base64.encodeToString(jpegBytes, Base64.NO_WRAP)
+            }
+            return PreparedImage(base64, jpegBytes.size)
+        }
     }
+
+    internal data class PreparedImage(val base64: String, val sourceByteCount: Int)
 
     sealed class RealtimeEvent {
         /** The session is open (server acked with session.created/updated). */
         data object Connected : RealtimeEvent()
         /** Terminal — fired at most once per client; never after [close]. */
-        data class Disconnected(val reason: String) : RealtimeEvent()
+        data class Disconnected(
+            val reason: String,
+            /** Present for an HTTP 429 WebSocket handshake; controller enforces it locally. */
+            val retryAfterSeconds: Long? = null
+        ) : RealtimeEvent()
         /** 24 kHz PCM16 LE response audio. [first] marks the first delta of a response. */
         // Plain class: a data class with a ByteArray field generates broken
         // (reference-equality) equals/hashCode; consumers only pattern-match.
@@ -109,7 +135,7 @@ class RealtimeVoiceClient(
         if (!started.compareAndSet(false, true)) return
         val request = Request.Builder()
             .url("wss://api.openai.com/v1/realtime?model=$model")
-            .header("Authorization", "Bearer $apiKey")
+            .header("Authorization", "Bearer $clientSecret")
             .build()
         val ws = httpClient.newWebSocket(request, socketListener)
         webSocket = ws
@@ -158,22 +184,14 @@ class RealtimeVoiceClient(
      * is not free.
      */
     fun sendImage(jpegBytes: ByteArray): Boolean {
-        if (jpegBytes.isEmpty() || finished.get()) return false
+        if (jpegBytes.isEmpty()) return false
+        return sendPreparedImage(prepareImage(jpegBytes))
+    }
+
+    /** Enqueue an already-normalized image without doing bitmap work on the caller's thread. */
+    internal fun sendPreparedImage(prepared: PreparedImage): Boolean {
+        if (finished.get()) return false
         val ws = webSocket ?: return false
-        val base64: String = try {
-            val bitmap = BitmapFactory.decodeByteArray(jpegBytes, 0, jpegBytes.size)
-            if (bitmap != null) {
-                val out = ByteArrayOutputStream()
-                bitmap.compress(Bitmap.CompressFormat.JPEG, 85, out)
-                bitmap.recycle()
-                Base64.encodeToString(out.toByteArray(), Base64.NO_WRAP)
-            } else {
-                Base64.encodeToString(jpegBytes, Base64.NO_WRAP)
-            }
-        } catch (e: Exception) {
-            Log.e(TAG, "Image re-encode failed", e)
-            Base64.encodeToString(jpegBytes, Base64.NO_WRAP)
-        }
         val item = JSONObject()
             .put("type", "conversation.item.create")
             .put("item", JSONObject()
@@ -181,8 +199,8 @@ class RealtimeVoiceClient(
                 .put("role", "user")
                 .put("content", JSONArray().put(JSONObject()
                     .put("type", "input_image")
-                    .put("image_url", "data:image/jpeg;base64,$base64"))))
-        Log.i(TAG, "Sending photo into realtime conversation (${jpegBytes.size} bytes JPEG)")
+                    .put("image_url", "data:image/jpeg;base64,${prepared.base64}"))))
+        Log.i(TAG, "Sending photo into realtime conversation (${prepared.sourceByteCount} bytes JPEG)")
         return ws.send(item.toString())
     }
 
@@ -217,14 +235,14 @@ class RealtimeVoiceClient(
     // ── Socket lifecycle ──
 
     /** Terminal transition — emits Disconnected exactly once. */
-    private fun finish(reason: String) {
+    private fun finish(reason: String, retryAfterSeconds: Long? = null) {
         if (!finished.compareAndSet(false, true)) return
         sessionOpen = false
         respOpen = false
         watchdog?.interrupt()
         watchdog = null
         webSocket = null
-        onEvent(RealtimeEvent.Disconnected(reason))
+        onEvent(RealtimeEvent.Disconnected(reason, retryAfterSeconds))
     }
 
     private fun describeFailure(t: Throwable, response: Response?): String {
@@ -233,9 +251,9 @@ class RealtimeVoiceClient(
         val code = response?.code
         if (code != null && code != 101) {
             return when (code) {
-                401 -> "OpenAI rejected the API key (HTTP 401) — re-paste it in Settings."
-                403 -> "OpenAI refused access (HTTP 403) — this key/org can't use $model."
-                429 -> "OpenAI rate/quota limit (HTTP 429) — check billing/credits."
+                401 -> "The short-lived assistant credential expired (HTTP 401)."
+                403 -> "The assistant service cannot access $model (HTTP 403)."
+                429 -> "The assistant service has reached its usage limit (HTTP 429)."
                 else -> "OpenAI handshake failed (HTTP $code, model $model)."
             }
         }
@@ -263,7 +281,10 @@ class RealtimeVoiceClient(
         }
 
         override fun onFailure(ws: WebSocket, t: Throwable, response: Response?) {
-            finish(describeFailure(t, response))
+            val retryAfter = if (response?.code == 429) {
+                response.header("Retry-After")?.toLongOrNull()?.coerceIn(60L, 3_600L) ?: 60L
+            } else null
+            finish(describeFailure(t, response), retryAfter)
         }
     }
 
