@@ -1,0 +1,68 @@
+==================================================
+Walter - Gemini Audio-to-Text (LTE-M Optimized)
+==================================================
+Settings: chunk=4096, delay=5ms, send_delay=0ms
+Modem OK
+Setting RAT to LTE-M...
+Waiting for LTE-M network...
+Connected on: LTEM
+Connected!
+
+Ready for Gemini audio queries!
+Attempting to load: /msg_tiny.wav
+File found: 115086 bytes
+Read 115086 bytes
+WAV: 8000Hz, 1ch, 16bit
+Base64 encoded: 153448 chars
+
+Running 1 iterations...
+
+==================================================
+Gemini Audio Query - Iteration 1/1
+==================================================
+
+--- Gemini Audio API ---
+Payload size: 153822 bytes
+Connecting to generativelanguage.googleapis.com:443...
+Connected to Gemini, sending audio...
+Sending 154073 bytes (chunk=4096, delay=0.005s)...
+Request sent (154073 bytes), waiting for response...
+  +995 bytes (total: 995)
+  +145 bytes (total: 1140)
+  +5 bytes (total: 1145)
+
+--- RESULT ---
+Gemini: George Washington was the first president of the United States of America.
+Latency: 17999 ms
+
+--- Gemini TTS API ---
+Text: George Washington was the first president of the United States of America.
+Voice: Kore
+TTS payload size: 251 bytes
+Connecting to generativelanguage.googleapis.com:443...
+Connected to Gemini TTS, sending request...
+Sending TTS request 511 bytes...
+TTS request sent, waiting for audio response...
+Rings available: 0 | no_data_count: 0
+Rings available: 0 | no_data_count: 1
+Rings available: 0 | no_data_count: 2
+Rings available: 0 | no_data_count: 3
+Rings available: 0 | no_data_count: 4
+Rings available: 0 | no_data_count: 5
+Rings available: 0 | no_data_count: 6
+Rings available: 3 | no_data_count: 7
+  Ring data_length=995, ring.length=995
+  Calling socket_receive_data for socket 1 with 995 bytes...
+  socket_receive_data returned
+  +995 bytes (total: 995)
+Rings available: 2 | no_data_count: 0
+  Ring data_length=995, ring.length=995
+  Calling socket_receive_data for socket 1 with 995 bytes...
+Task exception wasn't retrieved
+future: <Task> coro= <generator object '_queue_worker' at 3c1886a0>
+Traceback (most recent call last):
+  File "asyncio/core.py", line 1, in run_until_complete
+  File "/lib/walter_modem/core.py", line 497, in _queue_worker
+  File "/lib/walter_modem/core.py", line 593, in _process_queue_rsp
+  File "/lib/walter_modem/mixins/socket.py", line 454, in __handle_socket_ring
+ValueError: invalid syntax for integer with base 10
